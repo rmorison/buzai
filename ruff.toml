@@ -1,0 +1,5 @@
+# House style: line length 100, Python 3.11+ baseline (the trust gate runs on the
+# box's stock python3). Lint rules stay at ruff defaults; the pre-commit hooks run
+# `ruff --fix` then `ruff-format`.
+line-length = 100
+target-version = "py311"

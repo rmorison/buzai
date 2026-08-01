@@ -1,0 +1,5 @@
+# Recipients considered already-known. A send to any recipient NOT listed here is
+# treated as a new-recipient send and always-gated. Ships empty (safe-by-default:
+# every send is gated until you add trusted recipients). This file is protected —
+# edits are allowed only from an owner-tier task or one with no untrusted content.
+recipients = []

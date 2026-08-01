@@ -1,0 +1,13 @@
+#!/bin/sh
+# buzai trust-gate PreToolUse entry point.
+#
+# Runs the gate under buzai's pinned, self-contained Python — the uv-managed
+# .venv at the workspace root — never the host's system python (whose version is
+# unknown and may be older than the 3.11 the gate needs). See docs/SETUP.md step 5.
+#
+# Claude Code invokes hooks with cwd = the project dir and exports
+# CLAUDE_PROJECT_DIR; we cd there so both `.venv/bin/python` and `-m trust.hook`
+# resolve no matter where the hook fired from.
+set -eu
+cd "${CLAUDE_PROJECT_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)}"
+exec .venv/bin/python -m trust.hook

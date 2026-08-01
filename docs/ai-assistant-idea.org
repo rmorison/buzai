@@ -1,0 +1,18 @@
+* I want to build an always on AI assistant / chief of staff.
+** Features
+*** Help with schedules, todo lists, routine and specialized tasks, communications
+*** Keep a knowledge base of essential information for routine, day to day activities as well as special projects, life circumstances, hobbies, events, travels, business ventures, financial management, etc.
+*** Build up and manage the knowledge base over time and as "life goes on" and opportunities develop.
+*** Start with a baseline set of assistant skills and add specialize skills based on the user's activities and needs.
+*** Know when to move a project or activity to a dedicated space or agent.
+*** Proactively tie together and find helpful synergies for the user
+*** Add and manage connectors to applications in use by the user with appropriate safeguards and approval permissions
+*** Checkpoint knowledge regularly for review, comparison and long term memory
+** Competitive and technical issues
+*** Projects like Openclaw can do this, but at the risk of trusting critical personal information to an open source infrastructure
+*** Instead, build on the Anthropic maintained Claude Code application with built in controls, loops, approval and permission infrastructure, authentication, and a maintained release cycle.
+*** Run on a cloud or always connected computer (or container) for instant, always available access via Anthropics Claude mobile and desktop applications via remote control.
+** App observability and management
+*** The apps documents should be easily viewable via a repo, file share or similar access
+*** The app should be self-checking and self-healing, able to upgrade it's claude code base app and change or update models as they evolve.
+*** The app should expose log and exception information on request for debugging

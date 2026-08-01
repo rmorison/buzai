@@ -1,0 +1,66 @@
+# buzai assistant — Claude Code Remote Control (--user systemd unit TEMPLATE)
+#
+# Copy to ~/.config/systemd/user/claude-remote.service, edit the paths/name,
+# then:  systemctl --user daemon-reload && systemctl --user enable --now claude-remote
+#        loginctl enable-linger "$USER"     # so it runs without an active login
+# See deploy/README.md for the full install + secrets steps.
+
+[Unit]
+Description=buzai assistant — Claude Code Remote Control
+After=network-online.target
+Wants=network-online.target
+
+# If the server ever hot-loops (e.g. exits immediately on a misconfig instead of sitting
+# active-but-unregistered), surface it as a visible `failed` state rather than silent
+# ~6x/min churn: >5 restarts in 5 min trips the start limit.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# `claude remote-control` exits on SIGINT (its "Press Ctrl+C to stop"), NOT SIGTERM.
+# Without this, `systemctl stop/restart` sends SIGTERM, claude ignores it, and systemd
+# waits the full TimeoutStopSec before SIGKILL (a ~90s hang + a `failed` state). Send
+# SIGINT instead, cap the wait, and treat a SIGINT exit as success.
+KillSignal=SIGINT
+TimeoutStopSec=20s
+SuccessExitStatus=SIGINT
+
+# Where you cloned the template (the assistant's workspace).
+WorkingDirectory=%h/buzai
+
+# Secrets live OUTSIDE the repo, mode 0600, beyond any file-write tool's reach.
+# These are for LOCAL MCP connectors only. A managed-connector-only setup (all
+# connectors via claude.ai — Gmail/Calendar/Drive/Todoist/etc., whose OAuth lives in
+# ~/.claude/.credentials.json) has NONE: leave every line below commented.
+#
+# To add a local MCP connector: UNCOMMENT one line per connector you configure, and
+# match the filename to your deploy/env/*.env file. NO leading '-': a missing file
+# HARD-FAILS the unit (fail-closed) — do not add '-', which would let the service
+# start with unset secrets.
+#EnvironmentFile=%h/.config/buzai/secrets/email.env
+#EnvironmentFile=%h/.config/buzai/secrets/xero.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# Refuse to start on a miswired secrets/credentials layout (tracked secret,
+# wrong perms). Runs under the pinned, self-contained .venv Python (SETUP step 5),
+# NOT the host's system python.
+ExecStartPre=%h/buzai/.venv/bin/python %h/buzai/scripts/secrets_preflight.py
+
+# Long-lived remote-control SERVER (sessions attach on demand). Do NOT use
+# `--spawn session` here: single-session-exits-on-complete + Restart=always is the
+# silent-prompt-loss footgun (a prompt sent during the respawn window is swallowed).
+# `--spawn=same-dir` PINS the spawn mode so the first-run interactive "Spawn mode
+# [1/2]" prompt can never block a headless start. (The other first-run prompt,
+# "Enable Remote Control? (y/n)", has no flag — prime it once interactively per
+# SETUP §6 before enabling this unit, or the service starts but never registers.)
+ExecStart=%h/.local/bin/claude remote-control --name buzai-assistant --spawn=same-dir
+
+Restart=always
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

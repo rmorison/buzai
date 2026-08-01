@@ -1,0 +1,27 @@
+# Claude Code local overrides (personal, machine-specific)
+.claude/settings.local.json
+
+# Trust layer: personal config overrides, audit log, session state, provenance
+trust/config/*.local.toml
+audit/
+.buzai/
+__pycache__/
+*.pyc
+
+# Onboarding: real secrets (examples are kept) and personal hub content (scaffolds kept)
+deploy/env/*.env
+!deploy/env/*.env.example
+hubs/*.md
+!hubs/README.md
+!hubs/_example-hub.md
+
+# Self-contained Python: uv-managed interpreter/venv is per-host (the pinned
+# version in .python-version IS tracked; the materialized .venv is not).
+.venv/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+
+# Personal article/blog notes (local-only, never shipped)
+notes/

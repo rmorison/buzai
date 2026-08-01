@@ -1,0 +1,28 @@
+{
+  "_comment": "Example hook registration for the buzai trust gate. MERGE this into your workspace's .claude/settings.json (do not blindly overwrite an existing settings.json). PreToolUse: the matcher '*' routes every tool call through the gate (trust/bin/gate). UserPromptSubmit: marks each turn's provenance as owner before any tool calls (trust/bin/mark-turn), so the gate can resolve the owner tier. Both commands run under the pinned, self-contained .venv Python (see docs/SETUP.md step 5) rather than the host's system python. See trust/README.md.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/trust/bin/mark-turn",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/trust/bin/gate",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

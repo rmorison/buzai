@@ -1,0 +1,19 @@
+# High-blast-radius action classes that ALWAYS require approval, regardless of
+# trust tier or how few trifecta legs the task holds.
+#
+# Agent/Task (subagent spawn) is gated because the main-session PreToolUse hook
+# may not fire on a subagent's INTERNAL tool calls (per-subagent hook isolation),
+# so delegation could otherwise act ungated. Gating the spawn keeps delegation
+# possible but owner-approved per spawn. `Task` was renamed `Agent` in Claude Code
+# v2.1.63+; list both so the gate works across versions. See trust/README.md.
+# `delete`, `share_link`, `merge`, `publish` are the irreversible/exfiltration-shaped
+# ops the connector preset catalog binds tools to via policy.toml [classes_of].
+# Listing the class here forces approval even if the adopter promotes that class to
+# auto/notify — an irreversible op can't be promoted away.
+classes = ["money_movement", "delete", "share_link", "merge", "publish", "grant_connector_scope", "edit_trust_config", "Agent", "Task"]
+
+# Action classes that are additionally gated when the recipient is not in the
+# known-recipients list (see known-recipients.toml). `channel` covers chat connectors
+# (Slack/Discord) that post to a channel rather than a `to:` recipient.
+recipient_gated_classes = ["send_email", "send_message"]
+recipient_fields = ["to", "recipient", "recipients", "cc", "bcc", "channel"]

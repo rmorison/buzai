@@ -1,0 +1,17 @@
+# Trust tiers by channel/kind. Anything unmapped resolves to untrusted-external
+# (fail-closed). Trust is read from transport metadata only, never message content.
+#
+# Map your real owner channel id in a gitignored tiers.local.toml, e.g.:
+#   [channels]
+#   "telegram:123456789" = "owner"
+#   "cron:morning-brief" = "configured-automation"
+
+[channels]
+# none shipped — configure in tiers.local.toml
+
+# Fallback when a channel id is not explicitly mapped: tier by provenance `kind`.
+[kinds]
+owner = "owner"
+automation = "configured-automation"
+known = "known-contact"
+unknown = "untrusted-external"

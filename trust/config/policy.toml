@@ -1,0 +1,39 @@
+# Standing trust policy. Each action class is auto | notify | review.
+# Anything unmatched defaults to review (fail-closed). Promote classes to notify
+# or auto in a gitignored policy.local.toml as you build trust in them.
+
+# Map specific tools to a (coarser) action class. A tool with no mapping uses its
+# own tool name as the action class. Use real tool names — managed connectors are
+# mcp__claude_ai_<Server>__<tool>; local MCP servers are named by you. Examples:
+[classes_of]
+"mcp__sheets__append" = "sheet_append"
+# Hard-gated managed-connector ops: bound to an always-gate class so they ASK
+# regardless of tier or any promotion below (connector catalog).
+"mcp__claude_ai_Google_Calendar__delete_event" = "delete"
+"mcp__claude_ai_DropboxMCP__delete" = "delete"
+"mcp__claude_ai_DropboxMCP__create_shared_link" = "share_link"
+# "mcp__smtp__send_email"    = "send_email"      # a local mail server you add
+# (Managed Gmail has no send tool — it drafts/labels only.)
+
+[classes]
+# Read-only local inspection is auto, matching Claude Code's default of not
+# prompting for read-only tools. This is safe w.r.t. the trifecta: these calls
+# still raise the private-read leg and accumulate it, so a later call that would
+# complete the trifecta is still denied — `auto` only means the individual read
+# doesn't prompt. (Bash, Write, Edit, and all connector actions remain `review`.)
+Read = "auto"
+Grep = "auto"
+Glob = "auto"
+LS = "auto"
+NotebookRead = "auto"
+ToolSearch = "auto"   # harness deferred-tool discovery; benign, frequent
+
+# Everything else defaults to review (fail-closed). Examples a self-hoster might
+# promote in a gitignored policy.local.toml:
+#   sheet_append = "notify"
+#   create_task = "notify"
+#
+# NOTE: promoting a class to auto/notify only takes effect if the tool is mapped in
+# connector-legs.toml. An UNMAPPED tool stays gated at `ask` regardless of any
+# promotion here — the gate won't run an unclassified tool silently. Map the tool
+# first (even to zero legs), then promote it.

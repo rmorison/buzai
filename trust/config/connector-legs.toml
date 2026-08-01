@@ -1,0 +1,375 @@
+# Map tool-name patterns to the trifecta legs they touch. A trailing '*' is a
+# prefix wildcard; the most specific (longest literal prefix) rule wins. Any tool
+# matching NO rule contributes ZERO legs and is gated via the standing policy's
+# default `review` -> ask (it is NOT denied). This reverses the earlier
+# all-three-legs-then-deny default, which bricked the session on the first call to
+# any unmapped tool (see trust/README.md "Leg-state lifecycle").
+# Consequence: map real send tools explicitly so they carry external_send — an
+# unmapped send tool won't auto-trip the new-recipient gate (connector catalog).
+#
+# STANDING RULE for a connector whose read wildcard is the default (private_read): its
+# external_send overrides MUST be exhaustive over that connector's mutations. A mutation
+# tool whose exact name isn't overridden falls through to the read wildcard and carries
+# NO external_send — a silently un-gated send. When you enable a connector, cross-check
+# its full `/mcp` tool list and override every create/update/post/comment/assign/share/
+# move-into-shared op, not just the obvious ones.
+#
+# legs: any of "private_read", "untrusted_content", "external_send"
+# ingests_untrusted = true marks calls that pull in external/inbound content
+#   (an inbox read, a web fetch) and so raise the untrusted-content leg.
+
+# --- Managed connectors (claude.ai-hosted) ---
+# Live tool names are mcp__claude_ai_<Server>__<tool> — the claude.ai server prefix is
+# PART of the name. (Earlier drafts used mcp__<server>__ placeholders that match NOTHING,
+# so every managed-connector call fell to the unknown-tool path — formerly an
+# all-three-legs deny, now a zero-legs ask; either way the wrong name means the
+# connector's real legs are never applied.) Confirm your server names with /mcp.
+
+# Gmail — reads private mail and ingests untrusted message content. The managed
+# connector drafts/labels but has no send tool, so no external-send leg.
+[[rule]]
+match = "mcp__claude_ai_Gmail__*"
+legs = ["private_read"]
+ingests_untrusted = true
+
+# Google Calendar — reads are private AND ingest untrusted content: invite titles,
+# descriptions, and locations are attendee-supplied (a known prompt-injection vector),
+# so reads raise the untrusted leg like Gmail/Drive. Event mutations touch shared state
+# / notify attendees, so they carry the external-send leg (more-specific rules win).
+[[rule]]
+match = "mcp__claude_ai_Google_Calendar__*"
+legs = ["private_read"]
+ingests_untrusted = true
+
+[[rule]]
+match = "mcp__claude_ai_Google_Calendar__create_event"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_Google_Calendar__update_event"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_Google_Calendar__delete_event"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_Google_Calendar__respond_to_event"
+legs = ["external_send"]
+
+# Google Drive — reads private files that can carry untrusted content; create/copy
+# write (potentially shared) files, so those add the external-send leg. (These two keep
+# private_read alongside external_send — copy reads the source file, and it costs nothing
+# but a stricter trifecta; the send-only overrides elsewhere are for pure writes.)
+[[rule]]
+match = "mcp__claude_ai_Google_Drive__*"
+legs = ["private_read"]
+ingests_untrusted = true
+
+[[rule]]
+match = "mcp__claude_ai_Google_Drive__create_file"
+legs = ["private_read", "external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_Google_Drive__copy_file"
+legs = ["private_read", "external_send"]
+
+# Todoist — reads are private and ingest untrusted content: shared projects carry
+# collaborator-supplied task titles, comments, and assignments (untrusted inbound),
+# matching the Asana/ClickUp/monday catalog blocks below. (If you use Todoist strictly
+# solo with no shared projects, the untrusted leg is conservative — you may drop it.)
+# Ops that create/update tasks, post/edit comments, (re)assign, or touch shared-project
+# state carry the external-send leg. Own-state ops (complete, reschedule, reorder,
+# delete, labels/filters/goals/sections/reminders) stay private_read via the wildcard.
+[[rule]]
+match = "mcp__claude_ai_Todoist__*"
+legs = ["private_read"]
+ingests_untrusted = true
+
+[[rule]]
+match = "mcp__claude_ai_Todoist__add-tasks"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_Todoist__update-tasks"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_Todoist__add-comments"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_Todoist__update-comments"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_Todoist__manage-assignments"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_Todoist__project-management"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_Todoist__project-move"
+legs = ["external_send"]
+
+# Dropbox — reads private files that can carry untrusted content; create/copy/move/
+# restore/file-request/share write or expose content externally → external-send.
+# (delete and create_shared_link are ADDITIONALLY hard-gated — see always-gate.toml
+# + policy.toml; the legs here just classify the trifecta, the hard-gate forces ask.)
+[[rule]]
+match = "mcp__claude_ai_DropboxMCP__*"
+legs = ["private_read"]
+ingests_untrusted = true
+
+[[rule]]
+match = "mcp__claude_ai_DropboxMCP__create_file"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_DropboxMCP__create_folder"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_DropboxMCP__copy"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_DropboxMCP__move"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_DropboxMCP__restore_file_revision"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_DropboxMCP__restore_folder"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_DropboxMCP__create_file_request"
+legs = ["external_send"]
+
+[[rule]]
+match = "mcp__claude_ai_DropboxMCP__create_shared_link"
+legs = ["external_send"]
+
+# --- Local MCP connectors (you name these via `claude mcp add <name>`) ---
+# Example: a Sheets server you added as "sheets" → mcp__sheets__*. Adjust to your servers.
+[[rule]]
+match = "mcp__sheets__*"
+legs = ["private_read", "external_send"]
+
+[[rule]]
+match = "WebFetch*"
+legs = ["untrusted_content"]
+ingests_untrusted = true
+
+[[rule]]
+match = "Read*"
+legs = ["private_read"]
+
+# Subagent spawn (Agent/Task). The spawn call itself reads/ingests/sends nothing —
+# the risk is the subagent's internal calls, which are contained by always-gating
+# the spawn (see always-gate.toml), NOT by leg accumulation. Declared zero legs
+# explicitly (rather than leaving it to the unmapped default) so the spawn's
+# always-gate behavior is intentional and self-documented.
+[[rule]]
+match = "Agent"
+legs = []
+
+[[rule]]
+match = "Task"
+legs = []
+
+# --- Claude Code built-in tools ---
+# The matcher "*" routes built-ins through the gate too. Classifying them is no longer
+# required to avoid a deny (the unmapped default is zero-legs → ask), but it is still
+# worthwhile: it gives reads their private-read leg + `auto` allow and writes their
+# explicit zero-leg mapping, instead of every built-in falling to a generic ask.
+
+# Read-only inspection of the local workspace = private-data read.
+[[rule]]
+match = "Grep*"
+legs = ["private_read"]
+
+[[rule]]
+match = "Glob*"
+legs = ["private_read"]
+
+[[rule]]
+match = "LS"
+legs = ["private_read"]
+
+[[rule]]
+match = "NotebookRead*"
+legs = ["private_read"]
+
+# Local file writes touch no trifecta leg in themselves. The dangerous writes
+# (protected trust configs, .buzai/ trust-state) are caught by gate.py's path
+# guards regardless of the legs declared here.
+[[rule]]
+match = "Write*"
+legs = []
+
+[[rule]]
+match = "Edit*"
+legs = []
+
+[[rule]]
+match = "MultiEdit*"
+legs = []
+
+[[rule]]
+match = "NotebookEdit*"
+legs = []
+
+[[rule]]
+match = "TodoWrite*"
+legs = []
+
+# Web search pulls in external/untrusted content, like WebFetch.
+[[rule]]
+match = "WebSearch*"
+legs = ["untrusted_content"]
+ingests_untrusted = true
+
+# ToolSearch — the harness's deferred-tool loader (discovery only; reads/ingests/sends
+# nothing). Mapped to zero legs and `auto` in policy.toml so this frequent, benign
+# discovery call doesn't prompt every time. (Under the old hard-deny unknown default it
+# was denied outright, blocking the assistant from even loading a connector tool — the
+# whack-a-mole that motivated softening the default; see trust/README.md.)
+[[rule]]
+match = "ToolSearch*"
+legs = []
+
+# Bash — DECLARED BLIND SPOT. Bash is general-purpose: one command can read private
+# data, ingest untrusted content, AND exfiltrate, so static leg-classification can't
+# capture it (and per-command approval is unreliable — operations are cryptic and the
+# only promotion granularity here is the whole Bash class). Mapped to zero legs so it
+# is USABLE (defaults to policy `review` → ask, matching vanilla Claude Code), but the
+# gate does NOT meaningfully constrain Bash. Real containment is STRUCTURAL — the
+# dedicated unprivileged user, OS/network-egress limits, or sandboxing/disabling Bash
+# in a trust-sensitive config — and is a deferred design pass (see trust/README.md).
+# Do NOT rely on the gate to stop Bash-based exfiltration.
+[[rule]]
+match = "Bash*"
+legs = []
+
+# =====================================================================================
+# Directory connectors (OPT-IN — commented out by default)
+# =====================================================================================
+# These are widely-used connectors you ADD yourself (claude.ai connectors directory or
+# `claude mcp add`). They ship commented so an unused preset is never a silent trust
+# grant. To enable one:
+#   1. Add the connector to your instance, then run `/mcp` to see its REAL tool names.
+#   2. Uncomment the block below and FIX the `match` patterns to your instance's names
+#      (the `mcp__<server>__` prefix below is a best-known guess, not confirmed).
+#   3. For the hard-gate lines, add the noted `[classes_of]` entry to policy.toml
+#      (the always-gate classes delete/merge/publish/share_link already exist).
+#   4. Verify with trust/tests/smoke_substrate.md (per-connector classification check).
+# Rubric: external/shared read = private_read + ingests_untrusted; visible mutation =
+# external_send; destructive/irreversible = hard-gated.
+#
+# --- Chat ---
+# Slack — channels carry heavy untrusted content; posting reaches others.
+# [[rule]]
+# match = "mcp__slack__*"
+# legs = ["private_read"]
+# ingests_untrusted = true
+# [[rule]]
+# match = "mcp__slack__post_message"     # also reply/send_dm; → policy classes_of: "send_message"
+# legs = ["external_send"]
+# Discord — same shape as Slack (server channels are untrusted; posting reaches others).
+# [[rule]]
+# match = "mcp__discord__*"
+# legs = ["private_read"]
+# ingests_untrusted = true
+# [[rule]]
+# match = "mcp__discord__send_message"   # → policy classes_of: "send_message" (channel field)
+# legs = ["external_send"]
+#
+# --- Scheduling ---
+# Calendly — invitee data is untrusted; create/reschedule/cancel touch others.
+# [[rule]]
+# match = "mcp__calendly__*"
+# legs = ["private_read"]
+# ingests_untrusted = true
+# [[rule]]
+# match = "mcp__calendly__create_*"      # invite/reschedule; cancel_* → classes_of: "delete"
+# legs = ["external_send"]
+#
+# --- Tasks & project management ---
+# Asana / ClickUp / monday.com — team content is untrusted; create/comment/assign reach
+# others; delete is hard-gated. (One block shown; replicate per server you add.)
+# [[rule]]
+# match = "mcp__asana__*"
+# legs = ["private_read"]
+# ingests_untrusted = true
+# [[rule]]
+# match = "mcp__asana__create_*"         # also update_*/add_comment/assign → external_send
+# legs = ["external_send"]
+# # hard-gate: policy.toml [classes_of]  "mcp__asana__delete_*" = "delete"
+#
+# --- Software engineering ---
+# GitHub / GitLab — issues/PRs/MRs from anyone are untrusted; create/comment reach
+# others; merge + push-to-default + delete repo/branch are hard-gated.
+# [[rule]]
+# match = "mcp__github__*"
+# legs = ["private_read"]
+# ingests_untrusted = true
+# [[rule]]
+# match = "mcp__github__create_*"        # issue/PR/comment; also update_*/add_comment
+# legs = ["external_send"]
+# # hard-gate: policy.toml [classes_of]  "mcp__github__merge_*" = "merge",
+# #            "mcp__github__delete_*" = "delete"
+# Linear — issues/comments are untrusted; create/update/comment reach others; delete gated.
+# [[rule]]
+# match = "mcp__linear__*"
+# legs = ["private_read"]
+# ingests_untrusted = true
+# [[rule]]
+# match = "mcp__linear__create_*"        # also update_issue/comment → external_send
+# legs = ["external_send"]
+# # hard-gate: policy.toml [classes_of]  "mcp__linear__delete_*" = "delete"
+# Atlassian (Jira + Confluence) — tickets/wiki are untrusted; create/transition/comment
+# reach others; publish + delete are hard-gated.
+# [[rule]]
+# match = "mcp__atlassian__*"
+# legs = ["private_read"]
+# ingests_untrusted = true
+# [[rule]]
+# match = "mcp__atlassian__create_*"     # also transition/comment → external_send
+# legs = ["external_send"]
+# # hard-gate: policy.toml [classes_of]  "mcp__atlassian__publish_*" = "publish",
+# #            "mcp__atlassian__delete_*" = "delete"
+# Sentry — issues/stack traces carry user-supplied (untrusted) data; resolve/assign/
+# comment are team-visible. No hard-gate.
+# [[rule]]
+# match = "mcp__sentry__*"
+# legs = ["private_read"]
+# ingests_untrusted = true
+# [[rule]]
+# match = "mcp__sentry__resolve_*"       # also assign/comment → external_send
+# legs = ["external_send"]
+#
+# --- Docs & files ---
+# Notion — shared workspace content is untrusted; create/update pages reach others;
+# delete is hard-gated.
+# [[rule]]
+# match = "mcp__notion__*"
+# legs = ["private_read"]
+# ingests_untrusted = true
+# [[rule]]
+# match = "mcp__notion__create_*"        # also update_page/database → external_send
+# legs = ["external_send"]
+# # hard-gate: policy.toml [classes_of]  "mcp__notion__delete_*" = "delete"
+# Figma — design files/comments are shared (untrusted); commenting reaches others.
+# [[rule]]
+# match = "mcp__figma__*"
+# legs = ["private_read"]
+# ingests_untrusted = true
+# [[rule]]
+# match = "mcp__figma__post_comment"     # → external_send
+# legs = ["external_send"]

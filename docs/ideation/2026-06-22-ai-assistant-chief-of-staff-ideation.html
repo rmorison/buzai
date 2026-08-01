@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ideation: Always-On AI Chief of Staff on Claude Code</title>
+<style>
+  :root{
+    --bg:#fbfaf8; --surface:#ffffff; --ink:#1c1b19; --muted:#6b675f;
+    --line:#e6e2da; --accent:#7a4a1e; --accent-soft:#f5ecdf;
+    --accent-text:#6a3f18; --good:#2f6f4f; --good-soft:#e7f1ec; --good-text:#235a3f;
+    --warn:#9a5a12; --warn-soft:#f7eddb; --warn-text:#7c4a0f;
+    --info:#3a5a8a; --info-soft:#e8eef7; --info-text:#2f4a73;
+    --code:#f3f0ea;
+    --r-low:#8a6d2f;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#161513; --surface:#1f1d1a; --ink:#ece8e1; --muted:#a8a297;
+      --line:#332f29; --accent:#d6a268; --accent-soft:#2c2419; --accent-text:#e6bd8a;
+      --good:#7fc6a0; --good-soft:#1b2a22; --good-text:#9bd6b6;
+      --warn:#e0a85a; --warn-soft:#2c2316; --warn-text:#edbf7c;
+      --info:#8fb0e0; --info-soft:#1a2230; --info-text:#a9c3ea;
+      --code:#262320;
+    }
+  }
+  *{box-sizing:border-box}
+  html{font-size:16px}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"Noto Sans",sans-serif;
+    line-height:1.6; -webkit-font-smoothing:antialiased;
+  }
+  .page{max-width:920px; margin-inline:auto; padding:48px 24px 80px}
+  p,li{max-width:72ch}
+  h1{font-size:2rem; line-height:1.2; margin:0 0 .3em; letter-spacing:-.01em}
+  h2{font-size:1.4rem; margin:2.4em 0 .6em; padding-bottom:.25em; border-bottom:2px solid var(--line); letter-spacing:-.01em}
+  h3{font-size:1.15rem; margin:0 0 .2em}
+  .eyebrow{font-size:.72rem; letter-spacing:.12em; text-transform:uppercase; color:var(--accent-text); font-weight:700; margin:0 0 .5em}
+  code{background:var(--code); padding:.12em .38em; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.88em}
+  a{color:var(--accent-text)}
+  .meta{display:flex; flex-wrap:wrap; gap:.5rem 1.4rem; margin:1rem 0 0; font-size:.9rem; color:var(--muted)}
+  .meta b{color:var(--ink); font-weight:600}
+  .stats{display:flex; flex-wrap:wrap; gap:.6rem; margin:1.4rem 0 0}
+  .stat{background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:.5rem .9rem; font-size:.85rem; color:var(--muted)}
+  .stat b{display:block; font-size:1.25rem; color:var(--ink); line-height:1.1}
+  .lede{font-size:1.05rem; color:var(--ink)}
+  section{margin-top:.4em}
+  .grounding{background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:1.2rem 1.4rem}
+  .grounding h3{margin-top:1.1em; font-size:1rem}
+  .grounding h3:first-child{margin-top:0}
+  ul.axes{list-style:none; padding:0; margin:.4em 0}
+  ul.axes li{padding:.5rem .8rem; border:1px solid var(--line); border-radius:8px; margin:.4rem 0; background:var(--surface); max-width:none}
+  ul.axes li b{color:var(--accent-text)}
+  .jump{background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:.8rem 1.1rem; margin:.8em 0 1.6em}
+  .jump ol{margin:.3em 0; padding-left:1.4em}
+  .jump a{text-decoration:none}
+  .jump a:hover{text-decoration:underline}
+  article.idea{background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:1.4rem 1.5rem; margin:1.1em 0; scroll-margin-top:14px}
+  .idea-head{display:flex; align-items:baseline; gap:.6rem; flex-wrap:wrap}
+  .idnum{font-weight:800; color:var(--accent-text); font-size:1.15rem}
+  .chips{display:flex; flex-wrap:wrap; gap:.4rem; margin:.7rem 0 .2rem}
+  .chip{font-size:.74rem; font-weight:600; padding:.2rem .6rem; border-radius:999px; border:1px solid transparent}
+  .chip.axis{background:var(--info-soft); color:var(--info-text); border-color:var(--info-soft)}
+  .chip.conf-high{background:var(--good-soft); color:var(--good-text)}
+  .chip.conf-med{background:var(--warn-soft); color:var(--warn-text)}
+  .chip.cx{background:var(--code); color:var(--muted)}
+  .chip.top{background:var(--accent-soft); color:var(--accent-text)}
+  dl.fields{margin:1rem 0 0; display:grid; grid-template-columns:max-content 1fr; gap:.5rem 1rem}
+  dl.fields dt{font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); font-weight:700; padding-top:.15em}
+  dl.fields dd{margin:0}
+  .basis{border-left:3px solid var(--line); padding-left:.8rem}
+  .tag{font-family:ui-monospace,monospace; font-size:.8rem; font-weight:700; padding:.05em .35em; border-radius:4px}
+  .tag.direct{background:var(--good-soft); color:var(--good-text)}
+  .tag.external{background:var(--info-soft); color:var(--info-text)}
+  .tag.reasoned{background:var(--warn-soft); color:var(--warn-text)}
+  .down{color:var(--muted)}
+  figure{margin:1.2rem 0 .2rem; text-align:center}
+  figure svg{max-width:100%; height:auto}
+  figcaption{font-size:.8rem; color:var(--muted); margin-top:.4rem}
+  table{border-collapse:collapse; width:100%; margin:.6em 0; font-size:.92rem}
+  th,td{text-align:left; padding:.55rem .7rem; border-bottom:1px solid var(--line); vertical-align:top}
+  th{font-size:.74rem; letter-spacing:.06em; text-transform:uppercase; color:var(--muted)}
+  td.idc{font-weight:700; color:var(--muted); white-space:nowrap}
+  footer.composition-signal{margin-top:3em; padding-top:1em; border-top:1px solid var(--line); font-size:.8rem; color:var(--muted)}
+  .svgtxt{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <p class="eyebrow">Ideation</p>
+  <h1>Always-On AI Chief of Staff on Claude Code</h1>
+  <p class="lede">Seven ranked directions for building a long-lived, always-on personal assistant on the Claude Code platform — chosen and critiqued against the concept brief and the 2026 state of the art.</p>
+
+  <div class="meta">
+    <span><b>Date</b> <time datetime="2026-06-22">2026-06-22</time></span>
+    <span><b>Topic</b> ai-assistant-chief-of-staff</span>
+    <span><b>Focus</b> build an always-on AI assistant / chief of staff on Claude Code</span>
+    <span><b>Mode</b> elsewhere-software</span>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><b>37</b> raw ideas</div>
+    <div class="stat"><b>7</b> survivors</div>
+    <div class="stat"><b>15</b> cut</div>
+    <div class="stat"><b>5</b> axes covered</div>
+  </div>
+
+  <h2>Grounding Context</h2>
+  <div class="grounding">
+    <h3>Topic Context</h3>
+    <p>The concept: an always-on personal assistant / "chief of staff" that manages schedules, todos, tasks, and communications; grows a long-lived personal knowledge base (KB) across routine life, projects, hobbies, travel, business, and finances; starts with baseline skills and adds specialized ones as needs emerge; knows when to spin a project off into a dedicated space/agent; proactively finds cross-life synergies; manages app connectors with approval safeguards; and checkpoints knowledge for review and long-term memory.</p>
+    <p><b>Hard stance from the brief:</b> build on the Anthropic-maintained <b>Claude Code</b> application (its built-in controls, approval/permission infrastructure, auth, and maintained release cycle) rather than trusting critical personal data to open-source agent infrastructure (the brief names "OpenClaw" as the rejected alternative). Run always-on on a cloud/container, accessed via the Claude mobile/desktop apps over remote control. The app should be self-checking and self-healing — able to upgrade its own Claude Code base and swap models — and expose logs/exceptions on request, with documents viewable via a repo or file share.</p>
+    <h3>External Context (2026 prior art &amp; constraints)</h3>
+    <p>The exact pattern is being actively built: <a href="https://okhlopkov.com/always-on-ai-agent-server-setup/">okhlopkov's 24/7 Claude Code agent on a VPS</a> (fresh process per message, two-tier memory with a git-backed Obsidian vault, <code>CRONTAB.md</code> polled every 60s, an <code>entrypoint.sh</code> rollback gate) and <a href="https://github.com/coleam00/second-brain-starter">coleam00/second-brain-starter</a> (hook-persisted memory, a four-tier proactivity ladder Observer→Advisor→Assistant→Partner, a Python-wrapper pattern so the LLM never holds API keys) are the closest precedents. Anthropic is shipping the runtime natively — Claude Code <b>Remote Control</b>, <code>/loop</code> scheduled tasks, background sub-tasks, an auto-updating binary, Managed-Agents memory stores, and harness-enforced permissions (deny→ask→allow, PreToolUse hooks, MCP allowlists). The governing constraint is security: a personal chief-of-staff structurally holds Simon Willison's <b>"lethal trifecta"</b> (private data + untrusted content + external comms), so it can be made to exfiltrate via a single poisoned input (cf. the EchoLeak M365 Copilot CVE). The commercial "AI chief of staff" category (Lindy, Martin, Ohai.ai) is crowded but closed — the differentiator here is ownership, auditability, and Claude Code extensibility.</p>
+  </div>
+
+  <h2>Topic Axes</h2>
+  <ul class="axes">
+    <li><b>Runtime &amp; operations</b> — always-on hosting, remote-control access, self-upgrade, self-healing, observability/logs</li>
+    <li><b>Memory &amp; knowledge base</b> — long-lived personal KB, growth over time, checkpointing, retrieval architecture</li>
+    <li><b>Skill growth &amp; delegation</b> — baseline → specialized skills, knowing when to spin a project off to a dedicated agent</li>
+    <li><b>Connectors &amp; permissions</b> — app integrations, approval safeguards, the trust/security model</li>
+    <li><b>Proactivity &amp; orchestration</b> — scheduling, finding cross-life synergies, the proactivity ladder</li>
+  </ul>
+
+  <h2>Ranked Ideas</h2>
+  <nav class="jump" aria-label="Ranked ideas">
+    <ol>
+      <li><a href="#idea1">Harness-enforced trust &amp; capability model</a> — Connectors · <em>top pick</em></li>
+      <li><a href="#idea2">Compaction-proof canonical memory</a> — Memory</li>
+      <li><a href="#idea3">Deterministic supervisor loop (event-driven + observable)</a> — Runtime</li>
+      <li><a href="#idea4">Safe self-evolution: shadow-canary self-upgrade</a> — Runtime</li>
+      <li><a href="#idea5">Cross-life synergy detection</a> — Proactivity</li>
+      <li><a href="#idea6">Reversible-by-default autonomy + independent verifier</a> — Proactivity</li>
+      <li><a href="#idea7">Self-growing capability layer (skills + project graduation)</a> — Skills</li>
+    </ol>
+  </nav>
+
+  <!-- IDEA 1 -->
+  <article class="idea" id="idea1">
+    <div class="idea-head"><span class="idnum">1.</span><h3>Harness-enforced trust &amp; capability model</h3></div>
+    <div class="chips">
+      <span class="chip top">★ Top pick</span>
+      <span class="chip axis">Connectors &amp; permissions</span>
+      <span class="chip conf-high">Confidence 88%</span>
+      <span class="chip cx">Complexity: High</span>
+    </div>
+
+    <figure>
+      <svg viewBox="0 0 860 200" role="img" aria-label="An inbound message's trust is set by its channel, never its content; a capability broker then issues a short-lived scoped token only if the Rule-of-Two holds, otherwise the task is split.">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#8a6d2f"/></marker>
+        </defs>
+        <rect x="12" y="70" width="150" height="60" rx="10" fill="#f7eddb" stroke="#9a5a12"/>
+        <text class="svgtxt" x="87" y="95" text-anchor="middle" font-size="13" font-weight="700" fill="#7c4a0f">Inbound</text>
+        <text class="svgtxt" x="87" y="113" text-anchor="middle" font-size="11" fill="#7c4a0f">email · invite · DM</text>
+        <line x1="162" y1="100" x2="210" y2="100" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar)"/>
+        <rect x="212" y="60" width="180" height="80" rx="10" fill="#e8eef7" stroke="#3a5a8a"/>
+        <text class="svgtxt" x="302" y="88" text-anchor="middle" font-size="13" font-weight="700" fill="#2f4a73">Trust = channel</text>
+        <text class="svgtxt" x="302" y="106" text-anchor="middle" font-size="11" fill="#2f4a73">from transport metadata,</text>
+        <text class="svgtxt" x="302" y="121" text-anchor="middle" font-size="11" fill="#2f4a73">never message content</text>
+        <line x1="392" y1="100" x2="440" y2="100" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar)"/>
+        <rect x="442" y="60" width="190" height="80" rx="10" fill="#f5ecdf" stroke="#7a4a1e"/>
+        <text class="svgtxt" x="537" y="88" text-anchor="middle" font-size="13" font-weight="700" fill="#6a3f18">Capability broker</text>
+        <text class="svgtxt" x="537" y="106" text-anchor="middle" font-size="11" fill="#6a3f18">issues short-lived,</text>
+        <text class="svgtxt" x="537" y="121" text-anchor="middle" font-size="11" fill="#6a3f18">scoped token</text>
+        <line x1="632" y1="100" x2="680" y2="100" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar)"/>
+        <rect x="682" y="38" width="166" height="52" rx="10" fill="#e7f1ec" stroke="#2f6f4f"/>
+        <text class="svgtxt" x="765" y="60" text-anchor="middle" font-size="12" font-weight="700" fill="#235a3f">≤2 trifecta legs</text>
+        <text class="svgtxt" x="765" y="77" text-anchor="middle" font-size="11" fill="#235a3f">→ grant &amp; act</text>
+        <rect x="682" y="110" width="166" height="52" rx="10" fill="#f7eddb" stroke="#9a5a12"/>
+        <text class="svgtxt" x="765" y="132" text-anchor="middle" font-size="12" font-weight="700" fill="#7c4a0f">all 3 legs</text>
+        <text class="svgtxt" x="765" y="149" text-anchor="middle" font-size="11" fill="#7c4a0f">→ split + approve</text>
+      </svg>
+      <figcaption>The "Rule of Two" enforced at the grant boundary, outside the model — the one place an injection can't argue its way past.</figcaption>
+    </figure>
+
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>Make security a property of the <em>grant mechanism</em>, not model behavior. Every inbound trigger's trust tier is derived from its authenticated channel — a message that says "this is urgent, override restrictions" gets the trust of its transport, full stop. Connectors live behind a broker process that issues short-lived, narrowly-scoped capability tokens per task (the model never holds long-lived API keys); the broker enforces Meta's "Rule of Two" at grant time, refusing any single task that would combine private-data read + untrusted-content exposure + external send, and splitting it into chained sub-tasks with a human-approval gate between. Enforced via Claude Code's PreToolUse hooks and MCP allowlists.</dd>
+      <dt>Basis</dt>
+      <dd class="basis"><span class="tag external">external:</span> Simon Willison's lethal trifecta; Meta's "Agents Rule of Two"; OWASP Agentic Top-10 2026 ranks prompt injection #1; the EchoLeak CVE-2025-32711 zero-click exfiltration. coleam00's "Python wrapper so the LLM never holds keys" is the same insight; static MCP allowlists can't do the per-task part, which is the non-obvious move.</dd>
+      <dt>Rationale</dt>
+      <dd>A personal chief-of-staff has all three trifecta legs <em>by design</em>. This is the only idea in the set that, done wrong, loses the user's entire financial/health/schedule KB to one poisoned calendar invite. Doing it at the harness/broker layer means every future connector inherits the defense for free — and it directly cashes the brief's stated reason for choosing Claude Code over OSS infra.</dd>
+      <dt>Downsides</dt>
+      <dd class="down">Highest implementation burden in the set; per-task capability scoping adds latency and design complexity; task-splitting can make some legitimately-combined workflows feel bureaucratic. Requires a trust taxonomy the team must define up front.</dd>
+    </dl>
+  </article>
+
+  <!-- IDEA 2 -->
+  <article class="idea" id="idea2">
+    <div class="idea-head"><span class="idnum">2.</span><h3>Compaction-proof canonical memory</h3></div>
+    <div class="chips">
+      <span class="chip axis">Memory &amp; knowledge base</span>
+      <span class="chip conf-high">Confidence 87%</span>
+      <span class="chip cx">Complexity: Medium</span>
+    </div>
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>Invert the usual memory architecture: treat hook-synchronized files as the <em>authoritative</em> store and in-context memory as a disposable read-cache. Everything that must survive context compaction — trust rules, connector permissions, standing instructions, persona — lives in <code>CLAUDE.md</code> (and scoped per-project <code>CLAUDE.md</code> files), never in hot memory. A PreCompact hook audits hot memory for anything that looks like a standing instruction and migrates it to the constitutional layer before compaction runs. Long-term KB checkpoints commit to git so the personal record is human-readable and survives without the agent — and the diffs double as a queryable life-log.</dd>
+      <dt>Basis</dt>
+      <dd class="basis"><span class="tag external">external:</span> okhlopkov names this as the single most damaging production gotcha — "critical rules must live in CLAUDE.md not memory (compaction erases memory)." coleam00 uses SessionStart/PreCompact/SessionEnd hooks for exactly this persistence. <span class="tag direct">direct:</span> the brief requires "checkpoint knowledge regularly for review, comparison and long term memory."</dd>
+      <dt>Rationale</dt>
+      <dd>This is the failure that actually kills long-lived agents in the wild: a rule like "never send email without approval" lives in memory, gets compacted away after a long session, and the agent silently starts acting unsafely. Architectural separation enforced by a hook is the only reliable fix — prompt reminders are not. It is also the precondition for every other idea that stores durable state.</dd>
+      <dt>Downsides</dt>
+      <dd class="down">Requires disciplined separation of "rule" vs "note" that can blur in practice; the PreCompact migration heuristic can mis-classify; agent-vs-user git conflicts (a named prior-art gotcha) need a resolution strategy.</dd>
+    </dl>
+  </article>
+
+  <!-- IDEA 3 -->
+  <article class="idea" id="idea3">
+    <div class="idea-head"><span class="idnum">3.</span><h3>Deterministic supervisor loop: event-driven reasoning + observability</h3></div>
+    <div class="chips">
+      <span class="chip axis">Runtime &amp; operations</span>
+      <span class="chip conf-high">Confidence 84%</span>
+      <span class="chip cx">Complexity: Medium</span>
+    </div>
+
+    <figure>
+      <svg viewBox="0 0 860 210" role="img" aria-label="Cheap deterministic watchers poll connectors and only wake a full Claude process when a threshold is crossed; every run emits a heartbeat, an activity ledger, and structured fault records to the git repo.">
+        <defs>
+          <marker id="ar2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#8a6d2f"/></marker>
+        </defs>
+        <rect x="14" y="78" width="170" height="58" rx="10" fill="#e8eef7" stroke="#3a5a8a"/>
+        <text class="svgtxt" x="99" y="101" text-anchor="middle" font-size="12" font-weight="700" fill="#2f4a73">Deterministic watchers</text>
+        <text class="svgtxt" x="99" y="119" text-anchor="middle" font-size="11" fill="#2f4a73">cron / diff / thresholds</text>
+        <line x1="184" y1="107" x2="232" y2="107" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar2)"/>
+        <polygon points="234,107 320,75 406,107 320,139" fill="#f7eddb" stroke="#9a5a12"/>
+        <text class="svgtxt" x="320" y="103" text-anchor="middle" font-size="12" font-weight="700" fill="#7c4a0f">threshold</text>
+        <text class="svgtxt" x="320" y="119" text-anchor="middle" font-size="12" font-weight="700" fill="#7c4a0f">crossed?</text>
+        <text class="svgtxt" x="415" y="96" font-size="10" fill="#6b675f">no → sleep (≈$0)</text>
+        <line x1="406" y1="107" x2="470" y2="107" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar2)"/>
+        <text class="svgtxt" x="438" y="98" text-anchor="middle" font-size="10" fill="#6b675f">yes</text>
+        <rect x="472" y="78" width="172" height="58" rx="10" fill="#f5ecdf" stroke="#7a4a1e"/>
+        <text class="svgtxt" x="558" y="101" text-anchor="middle" font-size="12" font-weight="700" fill="#6a3f18">Wake Claude process</text>
+        <text class="svgtxt" x="558" y="119" text-anchor="middle" font-size="11" fill="#6a3f18">reason over fetched data</text>
+        <line x1="644" y1="107" x2="692" y2="107" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar2)"/>
+        <rect x="694" y="62" width="152" height="90" rx="10" fill="#e7f1ec" stroke="#2f6f4f"/>
+        <text class="svgtxt" x="770" y="84" text-anchor="middle" font-size="12" font-weight="700" fill="#235a3f">Emit to git repo</text>
+        <text class="svgtxt" x="770" y="103" text-anchor="middle" font-size="11" fill="#235a3f">heartbeat</text>
+        <text class="svgtxt" x="770" y="120" text-anchor="middle" font-size="11" fill="#235a3f">activity ledger</text>
+        <text class="svgtxt" x="770" y="137" text-anchor="middle" font-size="11" fill="#235a3f">fault records</text>
+      </svg>
+      <figcaption>The model is the exception handler, not the loop — so cost scales with events, and every wake leaves a legible, auditable trail.</figcaption>
+    </figure>
+
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>Replace an always-reasoning heartbeat with a cheap deterministic supervisory layer: cron/threshold watchers (plain Bash/Python the agent writes and self-tunes) poll connectors and only wake a full Claude process when something crosses a threshold. The same layer makes the system <em>legible</em>: every wake emits a queryable health heartbeat (uptime, last sync, pending approvals), a human-readable daily activity ledger ("what I did, what broke, what I skipped"), and structured fault records — all committed to the git repo, so a stale heartbeat means "your assistant may be offline" on mobile, and any failure is a first-class artifact the user (or the agent's own self-heal pass) can reason over.</dd>
+      <dt>Basis</dt>
+      <dd class="basis"><span class="tag external">external:</span> okhlopkov's fresh-process-per-message is the empirical version of "LLM as exception handler, not loop"; the runtime is buildable on <code>/loop</code> scheduled tasks, hooks, and background sub-tasks. <span class="tag direct">direct:</span> the brief's whole "App observability and management" section — "self-checking and self-healing," "expose log and exception information on request," "documents easily viewable via a repo or file share."</dd>
+      <dt>Rationale</dt>
+      <dd>Two brief requirements collapse into one architecture. An always-reasoning loop is both expensive and opaque; deterministic-watch + LLM-on-event makes always-on economically real <em>and</em> produces the audit trail that lets a user trust an autonomous agent touching their money and comms. A silent-death failure mode (container dies at 2am, user finds nothing at 8am) is exactly what the heartbeat converts into actionable signal.</dd>
+      <dt>Downsides</dt>
+      <dd class="down">Watcher taxonomy is real design work and can miss events that need judgement to notice; ledger/fault volume needs its own retention discipline; push-notification plumbing for liveness alerts depends on Remote Control maturity.</dd>
+    </dl>
+  </article>
+
+  <!-- IDEA 4 -->
+  <article class="idea" id="idea4">
+    <div class="idea-head"><span class="idnum">4.</span><h3>Safe self-evolution: shadow-canary self-upgrade</h3></div>
+    <div class="chips">
+      <span class="chip axis">Runtime &amp; operations</span>
+      <span class="chip conf-high">Confidence 83%</span>
+      <span class="chip cx">Complexity: High</span>
+    </div>
+
+    <figure>
+      <svg viewBox="0 0 860 180" role="img" aria-label="A new binary or model runs in a shadow instance that replays recent real decisions; its judgment is compared to production, and it is promoted only on agreement plus a passing smoke test, otherwise rolled back.">
+        <defs>
+          <marker id="ar3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#8a6d2f"/></marker>
+        </defs>
+        <rect x="14" y="64" width="150" height="56" rx="10" fill="#e8eef7" stroke="#3a5a8a"/>
+        <text class="svgtxt" x="89" y="87" text-anchor="middle" font-size="12" font-weight="700" fill="#2f4a73">New binary /</text>
+        <text class="svgtxt" x="89" y="104" text-anchor="middle" font-size="12" font-weight="700" fill="#2f4a73">model</text>
+        <line x1="164" y1="92" x2="208" y2="92" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar3)"/>
+        <rect x="210" y="56" width="186" height="72" rx="10" fill="#f5ecdf" stroke="#7a4a1e"/>
+        <text class="svgtxt" x="303" y="80" text-anchor="middle" font-size="12" font-weight="700" fill="#6a3f18">Shadow instance</text>
+        <text class="svgtxt" x="303" y="98" text-anchor="middle" font-size="11" fill="#6a3f18">replays last N real</text>
+        <text class="svgtxt" x="303" y="113" text-anchor="middle" font-size="11" fill="#6a3f18">decisions + smoke test</text>
+        <line x1="396" y1="92" x2="440" y2="92" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar3)"/>
+        <polygon points="442,92 528,58 614,92 528,126" fill="#f7eddb" stroke="#9a5a12"/>
+        <text class="svgtxt" x="528" y="88" text-anchor="middle" font-size="12" font-weight="700" fill="#7c4a0f">judgment</text>
+        <text class="svgtxt" x="528" y="104" text-anchor="middle" font-size="12" font-weight="700" fill="#7c4a0f">agrees?</text>
+        <line x1="614" y1="92" x2="660" y2="76" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar3)"/>
+        <line x1="614" y1="92" x2="660" y2="120" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar3)"/>
+        <rect x="662" y="50" width="184" height="40" rx="10" fill="#e7f1ec" stroke="#2f6f4f"/>
+        <text class="svgtxt" x="754" y="74" text-anchor="middle" font-size="12" font-weight="700" fill="#235a3f">yes → promote</text>
+        <rect x="662" y="102" width="184" height="40" rx="10" fill="#f7eddb" stroke="#9a5a12"/>
+        <text class="svgtxt" x="754" y="126" text-anchor="middle" font-size="12" font-weight="700" fill="#7c4a0f">no → auto-rollback</text>
+      </svg>
+      <figcaption>Gate the upgrade on behavior, not just liveness — the agent's own decision log is the regression set.</figcaption>
+    </figure>
+
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>Reframe self-upgrade from in-place mutation to a shadow-canary promotion. Before adopting a new Claude Code binary, model, or skill set, spin an isolated instance on it, replay the last N real decisions through it, and diff its judgment against production. Promote only if the canary agrees within tolerance <em>and</em> passes a smoke test (heartbeat ping, synthetic task, permission dry-run); otherwise auto-rollback to the pinned prior version and file an exception. On success, announce the upgrade as a plain-language capability diff ("I updated to v2.1.4; I can now run your weekly finance review without blocking chat").</dd>
+      <dt>Basis</dt>
+      <dd class="basis"><span class="tag direct">direct:</span> the brief requires the app be "able to upgrade its own Claude Code base and change or update models as they evolve" and be "self-checking and self-healing." <span class="tag external">external:</span> okhlopkov's <code>entrypoint.sh</code> rollback-on-failed-import is the prior art — but it only catches crashes; <span class="tag reasoned">reasoned:</span> an import gate passes a model that is subtly <em>worse</em> at your finances, so the gate must compare judgment, and the decision log is the regression set that makes that possible.</dd>
+      <dt>Rationale</dt>
+      <dd>Self-upgrading a system that touches money and communications is only safe if upgrades are judged on behavior, not liveness — the difference between "it still boots" and "it still thinks correctly." This is what makes the brief's "Anthropic-maintained release cycle" advantage safe to actually consume automatically rather than fear.</dd>
+      <dt>Downsides</dt>
+      <dd class="down">Requires storing a decision log (a design + privacy commitment) and defining "agreement" quantitatively; running a shadow instance doubles compute during upgrades; replay fidelity for stateful actions is hard.</dd>
+    </dl>
+  </article>
+
+  <!-- IDEA 5 -->
+  <article class="idea" id="idea5">
+    <div class="idea-head"><span class="idnum">5.</span><h3>Cross-life synergy detection</h3></div>
+    <div class="chips">
+      <span class="chip axis">Proactivity &amp; orchestration</span>
+      <span class="chip conf-high">Confidence 82%</span>
+      <span class="chip cx">Complexity: Medium</span>
+    </div>
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>Give each reasoning wake a dedicated synergy pass: over recent activity across <em>all</em> life domains (travel, business, calendar, finances, social, hobbies), surface non-obvious connections — a business trip overlapping a friend's city → a lunch suggestion; a hobby-spend pattern near a financial review → a discretionary-spend flag. Surfaced synergies are low-friction confirmations (Advisor-tier: surface, don't act), not automated actions.</dd>
+      <dt>Basis</dt>
+      <dd class="basis"><span class="tag direct">direct:</span> "proactively tie together and find helpful synergies for the user" is named verbatim in the brief. <span class="tag external">external:</span> closed-SaaS comps (Lindy, Martin) compete on <em>reactive</em> scheduling and structurally lack the full cross-domain KB; coleam00's proactivity ladder maps the escalation.</dd>
+      <dt>Rationale</dt>
+      <dd>This is the feature that justifies "chief of staff" over "smart calendar app." By 2026 reactive assistants are commoditized; cross-life synergy is the only output that <em>requires</em> the owned, full-life KB the brief is built around — without it, the system is expensive todo infrastructure; with it, it is a compounding personal advantage no closed tool can replicate.</dd>
+      <dt>Downsides</dt>
+      <dd class="down">High false-positive risk early (noisy or creepy suggestions erode trust); "what counts as a good synergy" is hard to specify; quality depends entirely on KB richness, so value lags adoption.</dd>
+    </dl>
+  </article>
+
+  <!-- IDEA 6 -->
+  <article class="idea" id="idea6">
+    <div class="idea-head"><span class="idnum">6.</span><h3>Reversible-by-default autonomy + independent verifier</h3></div>
+    <div class="chips">
+      <span class="chip axis">Proactivity &amp; orchestration</span>
+      <span class="chip conf-med">Confidence 78%</span>
+      <span class="chip cx">Complexity: Medium</span>
+    </div>
+
+    <figure>
+      <svg viewBox="0 0 860 175" role="img" aria-label="A proposed action is routed by impact: reversible actions execute and report; irreversible ones must pass an independent fresh-context verifier and then land in an async decision inbox the user clears on their own schedule.">
+        <defs>
+          <marker id="ar4" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#8a6d2f"/></marker>
+        </defs>
+        <rect x="14" y="62" width="150" height="54" rx="10" fill="#e8eef7" stroke="#3a5a8a"/>
+        <text class="svgtxt" x="89" y="85" text-anchor="middle" font-size="12" font-weight="700" fill="#2f4a73">Proposed action</text>
+        <text class="svgtxt" x="89" y="102" text-anchor="middle" font-size="11" fill="#2f4a73">(assistant never asks)</text>
+        <line x1="164" y1="89" x2="206" y2="89" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar4)"/>
+        <polygon points="208,89 286,57 364,89 286,121" fill="#f7eddb" stroke="#9a5a12"/>
+        <text class="svgtxt" x="286" y="86" text-anchor="middle" font-size="12" font-weight="700" fill="#7c4a0f">reversible?</text>
+        <line x1="364" y1="89" x2="408" y2="70" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar4)"/>
+        <text class="svgtxt" x="384" y="62" text-anchor="middle" font-size="10" fill="#6b675f">yes</text>
+        <rect x="410" y="48" width="184" height="40" rx="10" fill="#e7f1ec" stroke="#2f6f4f"/>
+        <text class="svgtxt" x="502" y="72" text-anchor="middle" font-size="12" font-weight="700" fill="#235a3f">act now → report</text>
+        <line x1="364" y1="89" x2="408" y2="110" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar4)"/>
+        <text class="svgtxt" x="384" y="124" text-anchor="middle" font-size="10" fill="#6b675f">no</text>
+        <rect x="410" y="100" width="184" height="44" rx="10" fill="#f5ecdf" stroke="#7a4a1e"/>
+        <text class="svgtxt" x="502" y="120" text-anchor="middle" font-size="11" font-weight="700" fill="#6a3f18">independent verifier</text>
+        <text class="svgtxt" x="502" y="135" text-anchor="middle" font-size="10" fill="#6a3f18">fresh, un-poisoned context</text>
+        <line x1="594" y1="122" x2="638" y2="122" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar4)"/>
+        <rect x="640" y="100" width="206" height="44" rx="10" fill="#e8eef7" stroke="#3a5a8a"/>
+        <text class="svgtxt" x="743" y="120" text-anchor="middle" font-size="11" font-weight="700" fill="#2f4a73">async decision inbox</text>
+        <text class="svgtxt" x="743" y="135" text-anchor="middle" font-size="10" fill="#2f4a73">user clears on own schedule</text>
+      </svg>
+      <figcaption>"Never interrupt to ask" forces reversibility-by-default; a second un-poisoned context is the structural guard on the irreversible.</figcaption>
+    </figure>
+
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>Adopt the constraint that the assistant may never block on a clarifying question, and design the system that survives it. Every action is shaped as reversible-by-default (drafts not sends, holds not bookings); actions route by impact — reversible ones act-and-report, irreversible/high-blast-radius ones (large payments, contract sends, mass deletes, broad new grants) must first pass an <em>independent verifier</em>: a freshly-spawned agent with no shared context that must concur the action is correct and uncompromised, then the action lands in a single async "decision inbox" the user clears on their own schedule.</dd>
+      <dt>Basis</dt>
+      <dd class="basis"><span class="tag reasoned">reasoned:</span> always-on + mobile remote control means the user is usually <em>not</em> watching, so a question-blocking assistant is useless unattended; "never ask" forces reversibility, which is also the right trifecta-safe default. <span class="tag external">external:</span> the threat is a single poisoned context (EchoLeak, the trifecta), so the structurally-fitting defense is a second context that wasn't poisoned — the aviation/nuclear "two-person rule" and finance's maker-checker converge on independent concurrence for irreversible acts.</dd>
+      <dt>Rationale</dt>
+      <dd>Human approval alone fails when the agent <em>frames</em> a malicious action persuasively (the EchoLeak class). An isolated verifier breaks the attacker's single-input assumption and is the strongest available defense for the truly irreversible tier — while the async inbox makes 24/7 autonomy tolerable instead of a stream of interruptions. Complements idea 1 (pre-action fences) as a verification layer.</dd>
+      <dt>Downsides</dt>
+      <dd class="down">A second agent per irreversible action adds cost and latency; "reversible vs irreversible" classification is itself a judgement that can be gamed; an async inbox can accumulate unactioned decisions if not well-designed.</dd>
+    </dl>
+  </article>
+
+  <!-- IDEA 7 -->
+  <article class="idea" id="idea7">
+    <div class="idea-head"><span class="idnum">7.</span><h3>Self-growing capability layer: skill pipeline + project graduation</h3></div>
+    <div class="chips">
+      <span class="chip axis">Skill growth &amp; delegation</span>
+      <span class="chip conf-med">Confidence 74%</span>
+      <span class="chip cx">Complexity: High</span>
+    </div>
+
+    <figure>
+      <svg viewBox="0 0 860 150" role="img" aria-label="A recurring manual request is detected and drafted into a proposed skill, sandbox-tested on safe data, then promoted to trusted with a regression fixture; separately, a project that crosses span-of-control thresholds graduates into a dedicated agent.">
+        <defs>
+          <marker id="ar5" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#8a6d2f"/></marker>
+        </defs>
+        <rect x="10" y="40" width="150" height="50" rx="10" fill="#f7eddb" stroke="#9a5a12"/>
+        <text class="svgtxt" x="85" y="61" text-anchor="middle" font-size="11" font-weight="700" fill="#7c4a0f">recurring request</text>
+        <text class="svgtxt" x="85" y="77" text-anchor="middle" font-size="10" fill="#7c4a0f">detected (3×+)</text>
+        <line x1="160" y1="65" x2="196" y2="65" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar5)"/>
+        <rect x="198" y="40" width="138" height="50" rx="10" fill="#e8eef7" stroke="#3a5a8a"/>
+        <text class="svgtxt" x="267" y="61" text-anchor="middle" font-size="11" font-weight="700" fill="#2f4a73">proposed/</text>
+        <text class="svgtxt" x="267" y="77" text-anchor="middle" font-size="10" fill="#2f4a73">drafted SKILL.md</text>
+        <line x1="336" y1="65" x2="372" y2="65" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar5)"/>
+        <rect x="374" y="40" width="138" height="50" rx="10" fill="#f5ecdf" stroke="#7a4a1e"/>
+        <text class="svgtxt" x="443" y="61" text-anchor="middle" font-size="11" font-weight="700" fill="#6a3f18">sandbox/</text>
+        <text class="svgtxt" x="443" y="77" text-anchor="middle" font-size="10" fill="#6a3f18">tested on safe data</text>
+        <line x1="512" y1="65" x2="548" y2="65" stroke="#8a6d2f" stroke-width="2" marker-end="url(#ar5)"/>
+        <rect x="550" y="40" width="150" height="50" rx="10" fill="#e7f1ec" stroke="#2f6f4f"/>
+        <text class="svgtxt" x="625" y="61" text-anchor="middle" font-size="11" font-weight="700" fill="#235a3f">trusted/</text>
+        <text class="svgtxt" x="625" y="77" text-anchor="middle" font-size="10" fill="#235a3f">+ regression fixture</text>
+        <path d="M625,90 C625,118 443,118 443,92" fill="none" stroke="#9a5a12" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#ar5)"/>
+        <text class="svgtxt" x="534" y="132" text-anchor="middle" font-size="10" fill="#7c4a0f">fixture fails → auto-demote</text>
+      </svg>
+      <figcaption>Skills are born from observed usage and earn trust through a deploy-style pipeline; the regression fixture catches a self-written skill that silently drifts.</figcaption>
+    </figure>
+
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>Make the assistant grow its own capabilities safely, on two scales. <b>Skills:</b> a background pass watches the activity ledger for recurring manual requests (same ask 3×+) and proposes authoring a reusable <code>SKILL.md</code>; self-authored skills move through <code>proposed/ → sandbox/ → trusted/</code> stages, each promotion explicitly approved, each trusted skill paired with a regression fixture re-run at SessionStart so a skill that drifts (e.g., a changed calendar API) is auto-demoted before it corrupts real data. <b>Projects:</b> when a domain crosses span-of-control thresholds (task volume, distinct connector surface, context size), the assistant proposes graduating it into a dedicated agent with its own scoped <code>CLAUDE.md</code>, memory, and permissions, leaving a summary stub in the main KB.</dd>
+      <dt>Basis</dt>
+      <dd class="basis"><span class="tag direct">direct:</span> the brief names both moves — "start with a baseline set of assistant skills and add specialized skills based on the user's activities" and "know when to move a project or activity to a dedicated space or agent." <span class="tag external">external:</span> Claude Code skills are author-able markdown; Managed Agents + background sub-tasks are the graduation substrate; okhlopkov's rollback-on-validation is the promotion-gate precedent.</dd>
+      <dt>Rationale</dt>
+      <dd>This is what makes "adds specialized skills" a feature rather than a liability: skills that emerge from observed real usage are inherently personalized, and a self-modifying agent that runs unvalidated self-written code on real data is a safety problem the staged pipeline solves. Project graduation keeps the main context cost-bounded and uncontaminated as life complexity grows — exactly when a chief of staff matters most.</dd>
+      <dt>Downsides</dt>
+      <dd class="down">Broadest survivor — two related mechanisms that each need their own design; recurrence detection and graduation thresholds risk both over- and under-firing; a regression-fixture harness is non-trivial to build and maintain per skill.</dd>
+    </dl>
+  </article>
+
+  <h2>Rejection Summary</h2>
+  <table>
+    <thead><tr><th>#</th><th>Idea considered</th><th>Reason cut</th></tr></thead>
+    <tbody>
+      <tr><td class="idc">R1</td><td>Typed knowledge-graph KB over flat markdown</td><td>No native graph store; remedy ungrounded in Claude Code primitives — flat-markdown-with-hooks is what prior art ships.</td></tr>
+      <tr><td class="idc">R2</td><td>Git-diffable life-log changelog</td><td>Folded into idea&nbsp;2 as a checkpoint extension rather than promoted separately.</td></tr>
+      <tr><td class="idc">R3</td><td>Branchable KB timeline for counterfactual planning</td><td>Not in the brief; high git/branch operational burden, speculative payoff.</td></tr>
+      <tr><td class="idc">R4</td><td>Archival appraisal + provenance + retention schedule</td><td>Security half folded into idea&nbsp;1; retention half overlaps idea&nbsp;2 — not distinct enough to stand alone.</td></tr>
+      <tr><td class="idc">R5</td><td>Multi-principal / household-family KB ledger</td><td>Scope expansion beyond the single-user brief; defer until family use is in scope.</td></tr>
+      <tr><td class="idc">R6</td><td>SBAR fixed-schema session handoff</td><td>Folded into idea&nbsp;2's canonical-memory discipline (same problem, same hook).</td></tr>
+      <tr><td class="idc">R7</td><td>Reverse-interview onboarding bootstrap</td><td>Obvious UX (a prompt sequence), not an architectural decision — below the meeting-test floor.</td></tr>
+      <tr><td class="idc">R8</td><td>Compartmentalized need-to-know domain cells</td><td>Sound, but folded into idea&nbsp;1's trust spine and idea&nbsp;7's project graduation.</td></tr>
+      <tr><td class="idc">R9</td><td>Fiduciary suitability + disclosure approval gate</td><td>A richer approval prompt — prompt engineering, not architecture; ~30-second greenlight, no meeting value.</td></tr>
+      <tr><td class="idc">R10</td><td>Versioned MCP connector permission "constitution"</td><td>Partially folded into idea&nbsp;1 (the broker's allowlist is the auditable record).</td></tr>
+      <tr><td class="idc">R11</td><td>SRE error-budget + blameless postmortems</td><td>Duplicates ideas&nbsp;3/4 with no SLA stakeholder; postmortems-into-KB have no reader.</td></tr>
+      <tr><td class="idc">R12</td><td>Tiered heartbeat with per-tier cost budgets</td><td>Load-bearing on a single-source $0.05/$0.38 cost figure; the fetch-then-reason pattern survives folded into idea&nbsp;3.</td></tr>
+      <tr><td class="idc">R13</td><td>Tenure-based per-domain proactivity promotion</td><td>Strong runner-up; folded into idea&nbsp;6's proactivity ladder rather than promoted separately.</td></tr>
+      <tr><td class="idc">R14</td><td>Board-of-directors multi-agent deliberation</td><td>Duplicates idea&nbsp;5's synergy goal at higher cost; assumes divergent priors Claude subagents don't have.</td></tr>
+      <tr><td class="idc">R15</td><td>Self-optimizing schedule (prune ignored tasks)</td><td>Requires an action-tracking feedback signal Claude Code doesn't expose today; mechanism underspecified.</td></tr>
+    </tbody>
+  </table>
+  <p class="down" style="font-size:.9rem">Axis coverage: all five axes carry at least one survivor (Connectors 1, Memory 1, Runtime 2, Proactivity 2, Skills 1) — no deliberate gaps.</p>
+
+  <footer class="composition-signal">Composed 2026-06-22 by ce-ideate · source: user concept brief <code>ai-assistant-idea.org</code> · 37 raw ideas from a 5-frame fleet + 1 recovery pass, fresh-context basis verification, 7 survivors.</footer>
+
+</div>
+</body>
+</html>

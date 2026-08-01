@@ -1,0 +1,20 @@
+# Example personal tier overrides. Copy to tiers.local.toml (gitignored) and edit.
+#
+# YOU DO NOT NEED THIS FILE FOR THE OWNER CASE. The per-turn provenance writer
+# (trust/bin/mark-turn) marks interactive turns as {"kind":"owner"}, and the shipped
+# tiers.toml already maps the `owner` kind to the owner tier. So a single-principal
+# instance resolves OWNER with zero config here.
+#
+# Add this file only when you introduce OTHER trigger sources — a scheduler/cron, an
+# inbound-message bridge, known contacts — and want them tiered. Those sources write
+# their OWN provenance (a stable `channel` id, or a different `kind`); map them here.
+
+[channels]
+# Map a stable, authenticated channel id to a tier. Examples:
+#   "cron:morning-brief"     = "configured-automation"
+#   "telegram:123456789"     = "owner"            # if you drive it from a chat bridge
+#   "email:alice@example.com" = "known-contact"
+
+[kinds]
+# Fallback when a channel id is not explicitly mapped. The shipped tiers.toml already
+# maps owner/automation/known/unknown; override here only to change that default.

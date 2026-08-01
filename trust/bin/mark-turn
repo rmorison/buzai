@@ -1,0 +1,11 @@
+#!/bin/sh
+# buzai per-turn provenance writer — the UserPromptSubmit hook entry point.
+#
+# Runs under buzai's pinned, self-contained .venv Python (docs/SETUP.md step 5),
+# exactly like trust/bin/gate — never the host's system python. Claude Code fires
+# UserPromptSubmit with cwd = the project dir and exports CLAUDE_PROJECT_DIR; we cd
+# there so the writer lands .buzai/provenance.json in the workspace and
+# `-m trust.mark_turn` resolves.
+set -eu
+cd "${CLAUDE_PROJECT_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)}"
+exec .venv/bin/python -m trust.mark_turn

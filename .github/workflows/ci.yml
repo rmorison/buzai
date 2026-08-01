@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: read-only token, no secrets exposed to fork PRs.
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Create pinned venv
+        run: make venv
+
+      - name: Install pre-commit
+        run: pipx install pre-commit
+
+      - name: Hooks (hygiene, ruff, gitleaks, publish gate)
+        run: pre-commit run --all-files --show-diff-on-failure
+
+      - name: Tests
+        run: make test
