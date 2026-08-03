@@ -16,15 +16,24 @@ curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | su
 From a clone, `make bootstrap` runs the same thing. Override the account name with
 `BUZAI_USER=<name>`.)
 
-The root phase is **idempotent** — re-running it changes nothing already in place. It:
+The root phase is **idempotent** — re-running it changes nothing already in place.
+It is also the **only time root is used**: everything after it, setup and normal
+operation alike, runs inside the unprivileged `buzai` account. It:
 
-1. **Creates the `buzai` account** (`useradd -m -s /bin/bash`; password left **locked**
-   on purpose — you never log in with a password, you switch in via `sudo -u buzai -i`).
+1. **Creates the `buzai` account** (`useradd -m -s /bin/bash`; no sudo, no extra
+   groups, password left **locked** on purpose — access is by ssh key or `sudo -u`,
+   never a password).
 2. **Enables linger** (`loginctl enable-linger`) — lets the account's `systemctl --user`
    services start at boot and keep running after logout; what makes "always-on" real.
-3. **Wires `XDG_RUNTIME_DIR` into the account's `.bashrc`** — without it a fresh login
-   can't reach the per-user systemd bus (*"Failed to connect to bus"*, the #1 trip-up).
-4. **Verifies both failure modes separately**: (a) the per-user systemd *manager* runs
+3. **Wires `XDG_RUNTIME_DIR` into the account's `.bashrc`** — so the `sudo -u buzai -i`
+   fallback path can reach the per-user systemd bus (*"Failed to connect to bus"*,
+   the classic trip-up; a real ssh login gets this from `pam_systemd` natively).
+4. **Copies your `authorized_keys` to the account** — so `ssh buzai@host` works
+   directly, which is the primary path for setup and every day-2 session. Key-only
+   (the password stays locked), and access-equivalent: anyone holding those keys
+   already has your sudo. Opt out with `BUZAI_COPY_SSH_KEYS=0`; skipped
+   automatically when the invoking account has no `authorized_keys`.
+5. **Verifies both failure modes separately**: (a) the per-user systemd *manager* runs
    (linger problem if not), and (b) a fresh *login* is correctly wired (`.bashrc`
    problem if not). It fails loudly naming which one broke.
 
@@ -35,15 +44,27 @@ the assistant's workspace, hubs, secrets, and Claude credentials from your perso
 account — the trust gate's blast radius stops at this user — and gives a clean home for
 `~/.claude/.credentials.json`, `~/.config/buzai/secrets/`, and `~/buzai`.
 
-## Next: switch in and run the user phase
+## Next: log in as `buzai` and run the user phase
+
+```bash
+# from your workstation — bootstrap copied your key to the account
+ssh buzai@<host>
+curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | bash
+```
+
+No key on the account (password-auth admin, opted out, or a restrictive
+`sshd_config` `AllowUsers`/`AllowGroups`)? Switch in from your sudo account
+instead — it always works:
 
 ```bash
 sudo -u buzai -i
 curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | bash
 ```
 
-The user phase fetches the repo into `~/buzai` and hands off to `make setup`
-(see [`SETUP.md`](SETUP.md)).
+Either way the user phase fetches the repo into `~/buzai` and hands off to
+`make setup` (see [`SETUP.md`](SETUP.md)). It refuses to run inside a
+sudo-capable account (the forgot-`sudo`-in-step-1 footgun) — override with
+`BUZAI_ALLOW_ADMIN_INSTALL=1` only if you truly mean to.
 
 ## Heads-up: Claude.ai auth is per-account
 
@@ -66,6 +87,10 @@ sudo -u buzai tee -a /home/buzai/.bashrc >/dev/null <<'EOF'
 # wire the per-user systemd bus for `systemctl --user`
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 EOF
+
+# ssh access — copy your keys so `ssh buzai@host` works (key-only; password stays locked)
+sudo install -d -m 700 -o buzai -g buzai /home/buzai/.ssh
+sudo install -m 600 -o buzai -g buzai ~/.ssh/authorized_keys /home/buzai/.ssh/authorized_keys
 
 # verify (a) — manager up (tests linger, not your login env):
 sudo -u buzai XDG_RUNTIME_DIR=/run/user/$(id -u buzai) systemctl --user is-system-running   # → running

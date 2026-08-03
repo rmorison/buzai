@@ -37,17 +37,27 @@ LIVE).
 ## Run setup as the `buzai` user — not your personal account
 
 **Every step below runs as the dedicated `buzai` user.** That isolation *is* the trust
-gate's blast radius — running setup as yourself defeats the point. If you provisioned the
-account via [`HOST-BOOTSTRAP.md`](HOST-BOOTSTRAP.md), switch in now and stay there for the
-rest of this guide:
+gate's blast radius — running setup as yourself defeats the point (the installer's user
+phase refuses to run inside a sudo-capable account for exactly this reason). If you
+provisioned the account via [`HOST-BOOTSTRAP.md`](HOST-BOOTSTRAP.md), it copied your
+`authorized_keys` over, so the normal way in — now and for every day-2 session — is a
+plain ssh login from your workstation:
+
+```bash
+ssh buzai@<host>
+```
+
+No key on the account (password-auth admin, `BUZAI_COPY_SSH_KEYS=0`, or a restrictive
+`sshd_config`)? Switch in from your sudo account on the server instead:
 
 ```bash
 sudo -u buzai -i
 ```
 
-Prefer SSH? Add your public key to `buzai`'s `~/.ssh/authorized_keys` and `ssh
-buzai@host` instead — any path that lands you in a `buzai` **login session** (with
-`systemctl --user` working) is fine. Everything from step 1 on happens in that session.
+Any path that lands you in a `buzai` **login session** (with `systemctl --user`
+working) is fine — ssh gets that wiring natively from `pam_systemd`; the `sudo -u`
+fallback relies on the `.bashrc` line bootstrap wrote. Everything from step 1 on
+happens in that session.
 
 ## 1. Clone
 

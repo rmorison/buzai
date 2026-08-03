@@ -5,9 +5,11 @@
 #   ROOT phase (host bootstrap; run with sudo on a fresh host):
 #       curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | sudo bash
 #     Creates the dedicated unprivileged user (default: buzai), enables linger,
-#     wires XDG_RUNTIME_DIR into its .bashrc, and verifies the per-user systemd
-#     manager — the steps documented in docs/HOST-BOOTSTRAP.md. Idempotent:
-#     re-running changes nothing that's already in place.
+#     wires XDG_RUNTIME_DIR into its .bashrc, copies the invoking admin's
+#     authorized_keys so `ssh buzai@host` works directly (opt out:
+#     BUZAI_COPY_SSH_KEYS=0), and verifies the per-user systemd manager — the
+#     steps documented in docs/HOST-BOOTSTRAP.md. Idempotent: re-running
+#     changes nothing that's already in place.
 #
 #   USER phase (run inside the service account, after `sudo -u buzai -i`):
 #       curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | bash
@@ -19,9 +21,11 @@
 # repo and run `make bootstrap` (root steps) / `make setup` (user steps) yourself.
 #
 # Options (env vars):
-#   BUZAI_USER=<name>    service account for the root phase   (default: buzai)
-#   BUZAI_REPO=<url>     repo to fetch in the user phase      (default: https://github.com/rmorison/buzai)
-#   BUZAI_WORKDIR=<dir>  workspace for the user phase         (default: $HOME/buzai)
+#   BUZAI_USER=<name>              service account for the root phase   (default: buzai)
+#   BUZAI_REPO=<url>               repo to fetch in the user phase      (default: https://github.com/rmorison/buzai)
+#   BUZAI_WORKDIR=<dir>            workspace for the user phase         (default: $HOME/buzai)
+#   BUZAI_COPY_SSH_KEYS=0          root phase: don't copy the admin's authorized_keys
+#   BUZAI_ALLOW_ADMIN_INSTALL=1    user phase: allow install into a sudo-capable account
 #
 # Update/upgrade of an existing install is out of scope for now: the user phase
 # refuses to overwrite an existing non-empty workspace that isn't a git checkout.
@@ -73,6 +77,37 @@ EOF
     say "   XDG_RUNTIME_DIR wired into .bashrc"
   fi
 
+  # 1d. ssh access — copy the invoking admin's authorized_keys so `ssh buzai@host`
+  #     works directly (key-only; the password stays locked, so this adds no access
+  #     the admin's sudo didn't already grant). Direct ssh is the primary day-2 path:
+  #     a real login session gets XDG_RUNTIME_DIR from pam_systemd natively.
+  local ssh_ready="" admin_home admin_keys
+  if [ "${BUZAI_COPY_SSH_KEYS:-1}" != "1" ]; then
+    say "   ssh key copy: skipped (BUZAI_COPY_SSH_KEYS=${BUZAI_COPY_SSH_KEYS}) — switch in with: sudo -u $user -i"
+  elif [ -z "${SUDO_USER:-}" ] || [ "$SUDO_USER" = "$user" ] || [ "$SUDO_USER" = "root" ]; then
+    say "   ssh key copy: no invoking admin to copy from (direct root shell?) — switch in with: sudo -u $user -i"
+  else
+    admin_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    admin_keys="$admin_home/.ssh/authorized_keys"
+    if [ -s "$admin_keys" ]; then
+      install -d -m 700 -o "$user" -g "$user" "$home/.ssh"
+      touch "$home/.ssh/authorized_keys"
+      # append only keys not already present, so re-runs stay idempotent
+      while IFS= read -r key; do
+        case "$key" in ''|\#*) continue ;; esac
+        grep -qxF "$key" "$home/.ssh/authorized_keys" \
+          || printf '%s\n' "$key" >>"$home/.ssh/authorized_keys"
+      done <"$admin_keys"
+      chown "$user:$user" "$home/.ssh/authorized_keys"
+      chmod 600 "$home/.ssh/authorized_keys"
+      ssh_ready=1
+      say "   ssh key copy: '$SUDO_USER' keys copied — you can now:  ssh $user@<this-host>"
+      say "   (key-only, password stays locked; didn't want this? BUZAI_COPY_SSH_KEYS=0 on a re-run, or edit $home/.ssh/authorized_keys)"
+    else
+      say "   ssh key copy: '$SUDO_USER' has no authorized_keys (password-auth ssh?) — switch in with: sudo -u $user -i"
+    fi
+  fi
+
   # verify (a): is the per-user systemd MANAGER running? (tests linger, not login env)
   # The manager can take a moment to come up right after enable-linger.
   local state="" i
@@ -97,9 +132,13 @@ EOF
   fi
 
   say ""
-  say "Host bootstrap complete. Next, switch into the account and run the user phase:"
+  say "Host bootstrap complete. Next, log in as the service account and run the user phase:"
   say ""
-  say "    sudo -u $user -i"
+  if [ -n "$ssh_ready" ]; then
+    say "    ssh $user@<this-host>     # from your workstation — your key was copied above"
+  else
+    say "    sudo -u $user -i          # no ssh key on the account — switch in from here"
+  fi
   say "    curl -fsSL ${BUZAI_REPO}/raw/main/install.sh | bash"
   say ""
   say "(or: git clone ${BUZAI_REPO}.git ~/buzai && cd ~/buzai && make setup)"
@@ -107,7 +146,20 @@ EOF
 
 # ------------------------------------------------------------------ user phase
 user_phase() {
-  say "== buzai install (user phase) — workspace: $BUZAI_WORKDIR =="
+  say "== buzai install (user phase) — account: $(id -un), workspace: $BUZAI_WORKDIR =="
+
+  # Guard the #1 footgun: running the bootstrap one-liner WITHOUT sudo doesn't
+  # error — uid selection would land here and install the whole stack into your
+  # personal admin account, defeating the isolation the dedicated user exists for.
+  if [ "${BUZAI_ALLOW_ADMIN_INSTALL:-0}" != "1" ] && id -nG | grep -qwE 'sudo|wheel|admin'; then
+    fail "account '$(id -un)' is sudo-capable (member of sudo/wheel/admin) — refusing the user phase.
+buzai belongs in its own unprivileged account. You probably meant one of:
+
+    curl -fsSL ${BUZAI_REPO}/raw/main/install.sh | sudo bash    # bootstrap (note: sudo)
+    ssh ${BUZAI_USER}@<host>   # then re-run this one-liner there (or: sudo -u ${BUZAI_USER} -i)
+
+Really install into '$(id -un)'? Re-run with BUZAI_ALLOW_ADMIN_INSTALL=1."
+  fi
 
   # Already inside a checkout? (running ./install.sh from the repo root)
   if [ -f Makefile ] && [ -d trust ] && [ -d scripts ]; then
