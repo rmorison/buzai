@@ -5,7 +5,7 @@
 #   ROOT phase (host bootstrap; run with sudo on a fresh host):
 #       curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | sudo bash
 #     Creates the dedicated unprivileged user (default: buzai), enables linger,
-#     wires XDG_RUNTIME_DIR into its .bashrc, copies the invoking admin's
+#     wires XDG_RUNTIME_DIR into its .profile, copies the invoking admin's
 #     authorized_keys so `ssh buzai@host` works directly (opt out:
 #     BUZAI_COPY_SSH_KEYS=0), and verifies the per-user systemd manager — the
 #     steps documented in docs/HOST-BOOTSTRAP.md. Idempotent: re-running
@@ -62,19 +62,22 @@ root_phase() {
     say "   linger enabled"
   fi
 
-  # 1c. persist XDG_RUNTIME_DIR — without it a fresh login can't reach the per-user
-  #     systemd bus ("Failed to connect to bus", the #1 trip-up). Quoted heredoc keeps
-  #     $(id -u) literal so it evaluates at each login.
-  if grep -q 'XDG_RUNTIME_DIR=/run/user' "$home/.bashrc" 2>/dev/null; then
-    say "   XDG_RUNTIME_DIR already wired in .bashrc"
+  # 1c. persist XDG_RUNTIME_DIR — without it the sudo -u path can't reach the per-user
+  #     systemd bus ("Failed to connect to bus", the classic trip-up). Target ~/.profile,
+  #     NOT ~/.bashrc: the stock skel .bashrc returns early for non-interactive shells,
+  #     so a .bashrc line never runs for `su -l -c`/scripted logins; .profile is read by
+  #     every bash login shell. Quoted heredoc keeps $(id -u) literal so it evaluates at
+  #     each login.
+  if grep -q 'XDG_RUNTIME_DIR=/run/user' "$home/.profile" 2>/dev/null; then
+    say "   XDG_RUNTIME_DIR already wired in .profile"
   else
-    tee -a "$home/.bashrc" >/dev/null <<'EOF'
+    tee -a "$home/.profile" >/dev/null <<'EOF'
 
 # wire the per-user systemd bus for `systemctl --user`
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 EOF
-    chown "$user:$user" "$home/.bashrc"
-    say "   XDG_RUNTIME_DIR wired into .bashrc"
+    chown "$user:$user" "$home/.profile"
+    say "   XDG_RUNTIME_DIR wired into .profile"
   fi
 
   # 1d. ssh access — copy the invoking admin's authorized_keys so `ssh buzai@host`
@@ -124,11 +127,11 @@ EOF
 
   # verify (b): is a fresh LOGIN correctly wired? (proves 1c persisted AND is sourced)
   # Accept running|degraded exactly like probe (a) — is-system-running exits nonzero on
-  # degraded, and a failed user unit must not be misdiagnosed as broken .bashrc wiring.
+  # degraded, and a failed user unit must not be misdiagnosed as broken .profile wiring.
   if su - "$user" -c 'test -n "$XDG_RUNTIME_DIR" && case "$(systemctl --user is-system-running 2>/dev/null)" in running|degraded) exit 0 ;; *) exit 1 ;; esac'; then
     say "   login-wiring probe: ok"
   else
-    fail "fresh login for '$user' can't reach the user bus — .bashrc wiring (step 1c) didn't take; see docs/HOST-BOOTSTRAP.md"
+    fail "fresh login for '$user' can't reach the user bus — .profile wiring (step 1c) didn't take; see docs/HOST-BOOTSTRAP.md"
   fi
 
   say ""

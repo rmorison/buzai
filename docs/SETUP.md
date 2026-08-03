@@ -56,7 +56,7 @@ sudo -u buzai -i
 
 Any path that lands you in a `buzai` **login session** (with `systemctl --user`
 working) is fine — ssh gets that wiring natively from `pam_systemd`; the `sudo -u`
-fallback relies on the `.bashrc` line bootstrap wrote. Everything from step 1 on
+fallback relies on the `.profile` line bootstrap wrote. Everything from step 1 on
 happens in that session.
 
 ## 1. Clone
