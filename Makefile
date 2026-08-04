@@ -32,7 +32,7 @@ help: ## Show this help
 # --- build / setup ------------------------------------------------------------
 
 bootstrap: ## Host bootstrap (root phase of install.sh): create service user, linger, XDG wiring — needs sudo
-	sudo BUZAI_USER=$(or $(BUZAI_USER),buzai) bash install.sh
+	sudo $(if $(BUZAI_COPY_SSH_KEYS),BUZAI_COPY_SSH_KEYS=$(BUZAI_COPY_SSH_KEYS)) BUZAI_USER=$(or $(BUZAI_USER),buzai) bash install.sh
 
 setup: ## Drive the whole setup; probes skip done steps, pauses only at the 3 manual ones (re-run to resume)
 	bash install.sh --setup

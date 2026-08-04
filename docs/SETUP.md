@@ -56,8 +56,9 @@ sudo -u buzai -i
 
 Any path that lands you in a `buzai` **login session** (with `systemctl --user`
 working) is fine — ssh gets that wiring natively from `pam_systemd`; the `sudo -u`
-fallback relies on the `.profile` line bootstrap wrote. Everything from step 1 on
-happens in that session.
+fallback relies on the `XDG_RUNTIME_DIR` line bootstrap wrote into the account's
+login init file (the first existing of `.bash_profile`/`.bash_login`/`.profile`).
+Everything from step 1 on happens in that session.
 
 ## 1. Clone
 
@@ -449,14 +450,14 @@ Update in place instead. Normal case — as the `buzai` user, pull directly:
 git -C ~/buzai pull --ff-only origin main     # only touches TRACKED files
 ```
 
-*Fallback* — only if `buzai` can't reach the remote directly (e.g. `origin` is a local
-path on another account), pull from a `sudo` account and fix ownership after:
+*Fallback* — updating from your `sudo` account instead (you're not in a `buzai`
+session right now): run git **as `buzai`**, never as root — root-run git inside a
+buzai-writable repo can execute buzai-controlled hooks/config as root, and it
+leaves root-owned files behind:
 
 ```bash
-# sudo account
-sudo git config --global --add safe.directory /home/buzai/buzai   # let root operate on a buzai-owned repo
-sudo git -C /home/buzai/buzai pull                                  # only touches TRACKED files
-sudo chown -R buzai:buzai /home/buzai/buzai                         # fix ownership of files git wrote as root
+# sudo account — git runs as buzai: no safe.directory entry, no chown-after needed
+sudo -u buzai git -C /home/buzai/buzai pull --ff-only origin main   # only touches TRACKED files
 ```
 
 Either way, `git pull` leaves all the untracked state above intact, so your gate stays

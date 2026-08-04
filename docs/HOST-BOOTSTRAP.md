@@ -25,18 +25,24 @@ operation alike, runs inside the unprivileged `buzai` account. It:
    never a password).
 2. **Enables linger** (`loginctl enable-linger`) — lets the account's `systemctl --user`
    services start at boot and keep running after logout; what makes "always-on" real.
-3. **Wires `XDG_RUNTIME_DIR` into the account's `.profile`** — so the `sudo -u buzai -i`
+3. **Wires `XDG_RUNTIME_DIR` into the account's login init file** — so the `sudo -u buzai -i`
    fallback path can reach the per-user systemd bus (*"Failed to connect to bus"*,
    the classic trip-up; a real ssh login gets this from `pam_systemd` natively).
-   `.profile`, not `.bashrc`: the stock `.bashrc` returns early in non-interactive
-   shells, so a line there silently never runs for scripted logins.
+   The target is the **first existing** of `.bash_profile` / `.bash_login` /
+   `.profile` — bash login shells read only the first one, and Debian skel ships
+   `.profile` while RHEL-family skel ships `.bash_profile` — never `.bashrc`: the
+   stock `.bashrc` returns early in non-interactive shells, so a line there
+   silently never runs for scripted logins.
 4. **Copies your `authorized_keys` to the account** — so `ssh buzai@host` works
    directly, which is the primary path for setup and every day-2 session. Key-only
    (the password stays locked), and access-equivalent: anyone holding those keys
-   already has your sudo. Opt out with `BUZAI_COPY_SSH_KEYS=0`; skipped
-   automatically when the invoking account has no `authorized_keys`.
+   already has your sudo. The copy is a **point-in-time snapshot**: revoking a key
+   on your admin account later does *not* revoke its buzai access — remove it from
+   `/home/buzai/.ssh/authorized_keys` too. Opt out with the var after `sudo`:
+   `curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | sudo BUZAI_COPY_SSH_KEYS=0 bash`;
+   skipped automatically when the invoking account has no `authorized_keys`.
 5. **Verifies both failure modes separately**: (a) the per-user systemd *manager* runs
-   (linger problem if not), and (b) a fresh *login* is correctly wired (`.profile`
+   (linger problem if not), and (b) a fresh *login* is correctly wired (login-file
    problem if not). It fails loudly naming which one broke.
 
 ## Why a dedicated account
@@ -84,15 +90,22 @@ If you'd rather run the steps yourself:
 ```bash
 sudo useradd -m -s /bin/bash buzai
 sudo loginctl enable-linger buzai
+# append to the account's LOGIN init file — bash reads only the first existing of
+# .bash_profile / .bash_login / .profile, so on a RHEL-family host (whose skel ships
+# .bash_profile and no .profile) target /home/buzai/.bash_profile instead
 sudo -u buzai tee -a /home/buzai/.profile >/dev/null <<'EOF'
 
 # wire the per-user systemd bus for `systemctl --user`
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 EOF
 
-# ssh access — copy your keys so `ssh buzai@host` works (key-only; password stays locked)
+# ssh access — copy your keys so `ssh buzai@host` works (key-only; password stays
+# locked). Append rather than install, so an existing authorized_keys is preserved —
+# and remember the copy is a snapshot: revoke keys on the buzai account separately.
 sudo install -d -m 700 -o buzai -g buzai /home/buzai/.ssh
-sudo install -m 600 -o buzai -g buzai ~/.ssh/authorized_keys /home/buzai/.ssh/authorized_keys
+sudo tee -a /home/buzai/.ssh/authorized_keys <~/.ssh/authorized_keys >/dev/null
+sudo chown buzai:buzai /home/buzai/.ssh/authorized_keys
+sudo chmod 600 /home/buzai/.ssh/authorized_keys
 
 # verify (a) — manager up (tests linger, not your login env):
 sudo -u buzai XDG_RUNTIME_DIR=/run/user/$(id -u buzai) systemctl --user is-system-running   # → running
@@ -100,5 +113,7 @@ sudo -u buzai XDG_RUNTIME_DIR=/run/user/$(id -u buzai) systemctl --user is-syste
 sudo -u buzai -i bash -c 'echo "$XDG_RUNTIME_DIR"; systemctl --user is-system-running'      # → non-empty + running
 ```
 
-If (a) runs but (b) says *"Failed to connect to bus"*, the `.profile` write is missing
-for this user — standing up a *second* account is the usual place it gets skipped.
+If (a) runs but (b) says *"Failed to connect to bus"*, the login-file write is missing
+for this user (or landed in a file the login shell never reads — check which of
+`.bash_profile`/`.bash_login`/`.profile` exists) — standing up a *second* account is
+the usual place it gets skipped.

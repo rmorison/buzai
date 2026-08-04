@@ -189,6 +189,13 @@ legs = ["external_send"]
 match = "mcp__claude_ai_Dropbox__create_shared_link"
 legs = ["external_send"]
 
+# download_link mints a single-use temporary PUBLIC download URL — content exposure
+# like create_shared_link, so it carries external_send and is hard-gated the same
+# way (policy.toml [classes_of] → share_link) instead of falling to the read wildcard.
+[[rule]]
+match = "mcp__claude_ai_Dropbox__download_link"
+legs = ["external_send"]
+
 # Xero — every tool in the managed connector is read-only (get_*/show_*): financial
 # reports, invoices, contacts. Reads are private AND ingest untrusted content —
 # invoice line text, references, and contact fields are counterparty-supplied.
@@ -208,6 +215,14 @@ ingests_untrusted = true
 match = "mcp__sheets__*"
 legs = ["private_read", "external_send"]
 
+# WebFetch/WebSearch — DECLARED BLIND SPOT (accepted, alongside Bash below). These
+# carry the untrusted-content leg but NO external_send, so a web fetch can never be
+# the leg that completes the trifecta — private_read + untrusted_content + WebFetch
+# never trips Rule-of-Two, even though a crafted URL's path/query string can carry
+# private data out to the server it hits. Deliberately left as-is: adding
+# external_send here would make every research turn (private file + any web page)
+# a trifecta ask/deny, changing enforcement behavior on a live deployment. Revisit
+# alongside the structural Bash-containment pass (see trust/README.md).
 [[rule]]
 match = "WebFetch*"
 legs = ["untrusted_content"]
@@ -276,7 +291,8 @@ legs = []
 match = "TodoWrite*"
 legs = []
 
-# Web search pulls in external/untrusted content, like WebFetch.
+# Web search pulls in external/untrusted content, like WebFetch (and shares the
+# same declared no-external_send blind spot — see the WebFetch rule above).
 [[rule]]
 match = "WebSearch*"
 legs = ["untrusted_content"]

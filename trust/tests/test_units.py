@@ -112,6 +112,26 @@ class TestClassify(unittest.TestCase):
             classify.classify("mcp__claude_ai_DropboxMCP__move", {}, self.cfg), {Leg.EXTERNAL_SEND}
         )
 
+    def test_standard_dropbox_read_ingests_untrusted(self):
+        # the standard Dropbox connector mirrors DropboxMCP: shared folders and
+        # shared-link fetches carry untrusted content
+        self.assertEqual(
+            classify.classify("mcp__claude_ai_Dropbox__list_folder", {}, self.cfg),
+            {Leg.PRIVATE_READ, Leg.UNTRUSTED_CONTENT},
+        )
+
+    def test_standard_dropbox_mutation_is_send(self):
+        legs = classify.classify("mcp__claude_ai_Dropbox__create_file", {}, self.cfg)
+        self.assertIn(Leg.EXTERNAL_SEND, legs)
+
+    def test_xero_read_ingests_untrusted(self):
+        # invoice line text, references, and contact fields are counterparty-supplied
+        # → untrusted, like Gmail/Drive
+        self.assertEqual(
+            classify.classify("mcp__claude_ai_Xero__get_invoices", {}, self.cfg),
+            {Leg.PRIVATE_READ, Leg.UNTRUSTED_CONTENT},
+        )
+
 
 class TestLegState(unittest.TestCase):
     def setUp(self):
@@ -198,8 +218,8 @@ class TestRedact(unittest.TestCase):
         self.assertEqual(out["authorization"].get("_redacted"), "secret-field")
 
     def test_path_reduced_to_basename(self):
-        out = redact.redact({"file_path": "/home/rod/org/hubs/finance-and-tax.md"})
-        self.assertEqual(out["file_path"].get("ref"), "finance-and-tax.md")
+        out = redact.redact({"file_path": "/home/user/org/hubs/example-hub.md"})
+        self.assertEqual(out["file_path"].get("ref"), "example-hub.md")
 
     def test_plain_text_untouched(self):
         self.assertEqual(redact.redact("good morning"), "good morning")

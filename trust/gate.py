@@ -30,6 +30,8 @@ PROTECTED_CONFIG_NAMES = {
     "known-recipients.local.toml",
     "tiers.toml",
     "tiers.local.toml",
+    "connector-legs.toml",
+    "connector-legs.local.toml",
 }
 _WRITE_TOOL = re.compile(r"(?i)(write|edit|update|delete|remove|create|put|patch|move)")
 

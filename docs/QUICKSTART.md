@@ -7,8 +7,8 @@ Steps only — every pause links its reference section in [`SETUP.md`](SETUP.md)
 subscription (Pro/Max/Team/Enterprise), and a browser on any machine.
 
 **Two accounts are involved.** Your **admin account** (any sudo-capable user) is
-used once — step 1 runs three root actions: create the `buzai` user, enable
-linger, copy your ssh keys over. The **`buzai` account** — unprivileged, no sudo,
+used once — step 1 runs four root actions: create the `buzai` user, enable
+linger, wire the login environment, copy your ssh keys over. The **`buzai` account** — unprivileged, no sudo,
 password locked — is where everything else runs, during setup and forever after.
 You reach it with plain `ssh buzai@<host>` from step 2 on.
 
@@ -20,8 +20,9 @@ curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | su
 ```
 
 Creates the dedicated `buzai` user, enables linger, wires the systemd user bus,
-copies your `authorized_keys` so you can ssh straight in (opt out:
-`BUZAI_COPY_SSH_KEYS=0`), and verifies it all. Idempotent — and if you forget
+copies your `authorized_keys` so you can ssh straight in (opt out — the var goes
+after `sudo`: `curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | sudo BUZAI_COPY_SSH_KEYS=0 bash`),
+and verifies it all. Idempotent — and if you forget
 `sudo`, it refuses loudly instead of installing into your own account.
 ([HOST-BOOTSTRAP.md](HOST-BOOTSTRAP.md))
 
