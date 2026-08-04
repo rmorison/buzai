@@ -32,7 +32,7 @@ help: ## Show this help
 # --- build / setup ------------------------------------------------------------
 
 bootstrap: ## Host bootstrap (root phase of install.sh): create service user, linger, XDG wiring — needs sudo
-	sudo BUZAI_USER=$(or $(BUZAI_USER),buzai) bash install.sh
+	sudo $(if $(BUZAI_COPY_SSH_KEYS),BUZAI_COPY_SSH_KEYS=$(BUZAI_COPY_SSH_KEYS)) BUZAI_USER=$(or $(BUZAI_USER),buzai) bash install.sh
 
 setup: ## Drive the whole setup; probes skip done steps, pauses only at the 3 manual ones (re-run to resume)
 	bash install.sh --setup
@@ -105,7 +105,7 @@ doctor: ## Aggregate health check: prereqs, venv, secrets, liveness (information
 	@echo "== liveness =="; if $(PY) scripts/liveness.py; then :; else echo "  not live (exit $$?) — a traceback above means the probe itself errored, not just idle"; fi
 
 smoke: ## SC0 preflight for the 8-point smoke test (see docs/SMOKE-TEST.md)
-	$(PY) scripts/smoke_test.py
+	$(PY) -m scripts.smoke_test
 
 env-url: ## Print the owner-equivalent reconnect deep-link (TTY only — refuses to be redirected)
 	$(PY) scripts/env_url.py

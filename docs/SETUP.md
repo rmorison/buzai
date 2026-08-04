@@ -37,17 +37,28 @@ LIVE).
 ## Run setup as the `buzai` user — not your personal account
 
 **Every step below runs as the dedicated `buzai` user.** That isolation *is* the trust
-gate's blast radius — running setup as yourself defeats the point. If you provisioned the
-account via [`HOST-BOOTSTRAP.md`](HOST-BOOTSTRAP.md), switch in now and stay there for the
-rest of this guide:
+gate's blast radius — running setup as yourself defeats the point (the installer's user
+phase refuses to run inside a sudo-capable account for exactly this reason). If you
+provisioned the account via [`HOST-BOOTSTRAP.md`](HOST-BOOTSTRAP.md), it copied your
+`authorized_keys` over, so the normal way in — now and for every day-2 session — is a
+plain ssh login from your workstation:
+
+```bash
+ssh buzai@<host>
+```
+
+No key on the account (password-auth admin, `BUZAI_COPY_SSH_KEYS=0`, or a restrictive
+`sshd_config`)? Switch in from your sudo account on the server instead:
 
 ```bash
 sudo -u buzai -i
 ```
 
-Prefer SSH? Add your public key to `buzai`'s `~/.ssh/authorized_keys` and `ssh
-buzai@host` instead — any path that lands you in a `buzai` **login session** (with
-`systemctl --user` working) is fine. Everything from step 1 on happens in that session.
+Any path that lands you in a `buzai` **login session** (with `systemctl --user`
+working) is fine — ssh gets that wiring natively from `pam_systemd`; the `sudo -u`
+fallback relies on the `XDG_RUNTIME_DIR` line bootstrap wrote into the account's
+login init file (the first existing of `.bash_profile`/`.bash_login`/`.profile`).
+Everything from step 1 on happens in that session.
 
 ## 1. Clone
 
@@ -439,14 +450,14 @@ Update in place instead. Normal case — as the `buzai` user, pull directly:
 git -C ~/buzai pull --ff-only origin main     # only touches TRACKED files
 ```
 
-*Fallback* — only if `buzai` can't reach the remote directly (e.g. `origin` is a local
-path on another account), pull from a `sudo` account and fix ownership after:
+*Fallback* — updating from your `sudo` account instead (you're not in a `buzai`
+session right now): run git **as `buzai`**, never as root — root-run git inside a
+buzai-writable repo can execute buzai-controlled hooks/config as root, and it
+leaves root-owned files behind:
 
 ```bash
-# sudo account
-sudo git config --global --add safe.directory /home/buzai/buzai   # let root operate on a buzai-owned repo
-sudo git -C /home/buzai/buzai pull                                  # only touches TRACKED files
-sudo chown -R buzai:buzai /home/buzai/buzai                         # fix ownership of files git wrote as root
+# sudo account — git runs as buzai: no safe.directory entry, no chown-after needed
+sudo -u buzai git -C /home/buzai/buzai pull --ff-only origin main   # only touches TRACKED files
 ```
 
 Either way, `git pull` leaves all the untracked state above intact, so your gate stays

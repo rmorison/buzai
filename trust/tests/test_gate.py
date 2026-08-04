@@ -382,6 +382,31 @@ class TestConnectorHardGate(GateTestBase):
         self.assertEqual(res.decision, Decision.ASK)
         self.assertIn("always-gate", res.reason)
 
+    def test_standard_dropbox_delete_is_hard_gated(self):
+        # The standard Dropbox connector mirrors DropboxMCP's hard-gate bindings.
+        self.set_provenance({"kind": "owner", "turn_id": 1})
+        res = self.run_call(self.cfg(), "hg5", "mcp__claude_ai_Dropbox__delete", {"path": "/x"})
+        self.assertEqual(res.decision, Decision.ASK)
+        self.assertIn("always-gate", res.reason)
+
+    def test_standard_dropbox_share_link_is_hard_gated(self):
+        self.set_provenance({"kind": "owner", "turn_id": 1})
+        res = self.run_call(
+            self.cfg(), "hg6", "mcp__claude_ai_Dropbox__create_shared_link", {"path": "/x"}
+        )
+        self.assertEqual(res.decision, Decision.ASK)
+        self.assertIn("always-gate", res.reason)
+
+    def test_standard_dropbox_download_link_is_hard_gated(self):
+        # download_link mints a temporary PUBLIC download URL — bound to the
+        # share_link always-gate class like create_shared_link.
+        self.set_provenance({"kind": "owner", "turn_id": 1})
+        res = self.run_call(
+            self.cfg(), "hg7", "mcp__claude_ai_Dropbox__download_link", {"path": "/x"}
+        )
+        self.assertEqual(res.decision, Decision.ASK)
+        self.assertIn("always-gate", res.reason)
+
     def test_nondestructive_mutation_not_hard_gated(self):
         # A Dropbox move carries external_send but is NOT a hard-gate class → ordinary
         # policy review ASK, proving the hard-gate is scoped to the destructive ops.

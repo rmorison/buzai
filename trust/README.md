@@ -47,7 +47,7 @@ the package directly, you can use any Python 3.11+ on your PATH.
 
 1. Resolve tier from provenance (metadata only).
 2. Classify this call's legs; accumulate across the **turn** (leg-state is keyed on the provenance `turn_id` and resets each turn; untrusted-content stays sticky *within* the turn).
-3. Edit to a protected config (`policy` / `always-gate` / `known-recipients` / `tiers`)? → allowed only from owner tier or a task with no untrusted-content leg.
+3. Edit to a protected config (`policy` / `always-gate` / `known-recipients` / `tiers` / `connector-legs`)? → allowed only from owner tier or a task with no untrusted-content leg.
 4. On the always-gate list (incl. sends to a new recipient)? → ask.
 5. All three legs accumulated this turn? → at **owner tier**, a loud ASK naming the three legs (the owner is the present human backstop, individually gating every send); at **non-owner tiers**, deny with a decompose-and-reapprove reason. Owner approvals here carry a `trifecta_warning` audit marker.
 6. Otherwise the standing policy tier: `review` → ask, `notify` → allow then report with undo, `auto` → allow.
