@@ -12,6 +12,8 @@
 "mcp__claude_ai_Google_Calendar__delete_event" = "delete"
 "mcp__claude_ai_DropboxMCP__delete" = "delete"
 "mcp__claude_ai_DropboxMCP__create_shared_link" = "share_link"
+"mcp__claude_ai_Dropbox__delete" = "delete"
+"mcp__claude_ai_Dropbox__create_shared_link" = "share_link"
 # "mcp__smtp__send_email"    = "send_email"      # a local mail server you add
 # (Managed Gmail has no send tool — it drafts/labels only.)
 
