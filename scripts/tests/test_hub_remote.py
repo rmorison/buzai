@@ -1,0 +1,588 @@
+import io
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+from scripts.hub_remote import (
+    DENIED,
+    INDETERMINATE,
+    LOCAL_ONLY,
+    PRIVATE,
+    PUBLIC,
+    READABLE,
+    UNKNOWN,
+    CacheEntry,
+    GitResult,
+    anonymous_env,
+    anonymous_urls,
+    cache_is_usable,
+    check,
+    classify,
+    config_url,
+    decide,
+    default_cache_path,
+    default_git_runner,
+    main,
+    origin_credential_violations,
+    read_cache,
+    redact,
+    url_credential_problem,
+    verify,
+    write_cache,
+)
+
+NOW = datetime(2026, 8, 5, 12, 0, 0, tzinfo=UTC)
+SSH_URL = "git@github.com:owner/hubs.git"
+HTTPS_URL = "https://github.com/owner/hubs.git"
+
+# Real stderr shapes, so the classifier is pinned against what git actually emits.
+PRIVATE_HTTPS = GitResult(
+    128, "", "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+)
+PRIVATE_SSH = GitResult(
+    128,
+    "",
+    "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.",
+)
+PUBLIC_READ = GitResult(0, "e83c516\tHEAD\n", "")
+UNREACHABLE = GitResult(
+    128, "", "fatal: unable to access 'https://github.com/owner/hubs.git/': Could not resolve host"
+)
+TIMED_OUT = GitResult(124, "", "timed out after 20s", timed_out=True)
+
+
+def anon_call(args: list[str]) -> bool:
+    """True when this argv is the credential-suppressed probe (its marker is the -c reset)."""
+    return "credential.helper=" in args
+
+
+class ScriptedGit:
+    """Fake git runner. Records every call so tests can assert what was (not) run."""
+
+    def __init__(self, *, remote_url=None, remote_name="origin", anon=None, auth=None, helpers=()):
+        self.remote_url = remote_url
+        self.remote_name = remote_name
+        self.anon = anon or {}
+        self.auth = auth or PUBLIC_READ
+        self.helpers = list(helpers)
+        self.calls: list[tuple[list[str], dict, float]] = []
+
+    @property
+    def probes(self) -> list[list[str]]:
+        return [args for args, _, _ in self.calls if "ls-remote" in args]
+
+    def __call__(self, args, env, timeout):
+        args = list(args)
+        self.calls.append((args, dict(env), timeout))
+        if "config" in args:
+            if "remote.origin.url" in args:
+                return GitResult(0, "https://github.com/rmorison/buzai.git\n", "")
+            if not self.helpers:
+                return GitResult(1, "", "")
+            return GitResult(0, "".join(f"{h}\n" for h in self.helpers), "")
+        if "get-url" in args:
+            return GitResult(0, f"{self.remote_url}\n", "")
+        if args[-1] == "remote":
+            if self.remote_url is None:
+                return GitResult(0, "", "")
+            return GitResult(0, f"{self.remote_name}\n", "")
+        if anon_call(args):
+            url = args[args.index("ls-remote") + 1]
+            if isinstance(self.anon, GitResult):
+                return self.anon
+            return self.anon.get(url, PRIVATE_HTTPS)
+        return self.auth
+
+
+class HubTempCase(unittest.TestCase):
+    """Everything runs in a tempdir: never the real ~/hubs, never the network."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.hub = self.root / "hubs"
+        (self.hub / ".git").mkdir(parents=True)
+        self.repo = self.root / "checkout"
+        self.repo.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def verify(self, git, *, now=NOW, use_cache=True, **kw):
+        return verify(self.hub, runner=git, now=now, use_cache=use_cache, **kw)
+
+
+# --- URL handling ----------------------------------------------------------------
+
+
+class TestAnonymousUrls(unittest.TestCase):
+    def test_https_is_probed_as_is(self):
+        self.assertEqual(anonymous_urls(HTTPS_URL), [HTTPS_URL])
+
+    def test_embedded_credentials_are_stripped_before_probing(self):
+        # probing WITH the token would authenticate, and a private repo would read as public
+        self.assertEqual(
+            anonymous_urls("https://user:ghp_secret@github.com/owner/hubs.git"), [HTTPS_URL]
+        )
+
+    def test_scp_style_ssh_also_probes_the_https_endpoint(self):
+        # public readability is exposed over https, never over ssh — probing only ssh
+        # would report "private" for every repo on earth
+        self.assertEqual(
+            anonymous_urls(SSH_URL), [HTTPS_URL.removesuffix(".git") + ".git", SSH_URL]
+        )
+
+    def test_ssh_scheme_url_drops_the_ssh_port(self):
+        self.assertEqual(
+            anonymous_urls("ssh://git@example.test:2222/owner/hubs.git"),
+            ["https://example.test/owner/hubs.git", "ssh://example.test:2222/owner/hubs.git"],
+        )
+
+    def test_git_protocol_is_already_anonymous(self):
+        self.assertEqual(
+            anonymous_urls("git://example.test/owner/hubs.git"),
+            ["git://example.test/owner/hubs.git"],
+        )
+
+    def test_local_path_has_no_anonymous_endpoint(self):
+        self.assertEqual(anonymous_urls("/srv/git/hubs.git"), [])
+        self.assertEqual(anonymous_urls("file:///srv/git/hubs.git"), [])
+        self.assertEqual(anonymous_urls(""), [])
+
+
+class TestUrlCredentialProblem(unittest.TestCase):
+    def test_token_in_url_is_a_violation(self):
+        problem = url_credential_problem("https://x:ghp_secret@github.com/owner/hubs.git")
+        self.assertIsNotNone(problem)
+        self.assertNotIn("ghp_secret", problem)  # the refusal must not leak it either
+
+    def test_ssh_urls_are_clean(self):
+        self.assertIsNone(url_credential_problem(SSH_URL))
+        self.assertIsNone(url_credential_problem("ssh://git@github.com/owner/hubs.git"))
+
+    def test_plain_https_is_clean(self):
+        self.assertIsNone(url_credential_problem(HTTPS_URL))
+
+
+class TestRedact(unittest.TestCase):
+    def test_credentials_never_reach_a_printable_url(self):
+        self.assertEqual(redact("https://user:ghp_secret@github.com/owner/hubs.git"), HTTPS_URL)
+
+    def test_clean_urls_are_untouched(self):
+        self.assertEqual(redact(SSH_URL), SSH_URL)
+
+
+# --- the anonymity of the anonymous probe ----------------------------------------
+
+
+class TestAnonymousEnv(unittest.TestCase):
+    """If the probe can authenticate, it reports a PUBLIC repo as private — the one
+    failure mode that matters. Every suppression below is load-bearing."""
+
+    ENV = anonymous_env("/tmp/neutral")
+
+    def test_agent_and_askpass_are_removed_not_merely_unused(self):
+        for name in ("SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS"):
+            self.assertIsNone(self.ENV[name], name)
+            self.assertIn(name, self.ENV)  # explicitly unset, not just absent
+
+    def test_git_never_prompts(self):
+        self.assertEqual(self.ENV["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_user_and_system_config_are_bypassed(self):
+        self.assertEqual(self.ENV["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(self.ENV["GIT_CONFIG_SYSTEM"], os.devnull)
+
+    def test_ssh_cannot_offer_a_key(self):
+        ssh = self.ENV["GIT_SSH_COMMAND"]
+        for opt in ("BatchMode=yes", "IdentitiesOnly=yes", "IdentityAgent=none", "IdentityFile="):
+            self.assertIn(opt, ssh)
+
+    def test_repo_local_config_cannot_be_discovered(self):
+        self.assertEqual(self.ENV["GIT_CEILING_DIRECTORIES"], "/tmp/neutral")
+
+
+class TestAnonymousProbeArgs(HubTempCase):
+    def test_probe_resets_the_credential_helper_list(self):
+        git = ScriptedGit(remote_url=HTTPS_URL, anon=PRIVATE_HTTPS)
+        self.verify(git, use_cache=False)
+        anon = [args for args in git.probes if anon_call(args)]
+        self.assertTrue(anon)
+        for args in anon:
+            self.assertEqual(args[args.index("-c") + 1], "credential.helper=")
+
+
+# --- classification and the three-way decision -----------------------------------
+
+
+class TestClassify(unittest.TestCase):
+    def test_success_is_readable(self):
+        self.assertEqual(classify(PUBLIC_READ), READABLE)
+
+    def test_auth_required_is_denied(self):
+        self.assertEqual(classify(PRIVATE_HTTPS), DENIED)
+        self.assertEqual(classify(PRIVATE_SSH), DENIED)
+        self.assertEqual(classify(GitResult(128, "", "remote: Repository not found.")), DENIED)
+        self.assertEqual(
+            classify(
+                GitResult(
+                    128,
+                    "",
+                    "fatal: unable to access 'https://x/': The requested URL returned error: 403",
+                )
+            ),
+            DENIED,
+        )
+
+    def test_unreachable_is_unknown(self):
+        self.assertEqual(classify(UNREACHABLE), UNKNOWN)
+        self.assertEqual(classify(GitResult(128, "", "Host key verification failed.")), UNKNOWN)
+
+    def test_timeout_is_unknown(self):
+        self.assertEqual(classify(TIMED_OUT), UNKNOWN)
+
+    def test_unrecognized_failure_is_unknown_not_denied(self):
+        # the permissive-default guard: silence must never read as "denied" (=private)
+        self.assertEqual(classify(GitResult(1, "", "")), UNKNOWN)
+
+
+class TestDecide(unittest.TestCase):
+    """The pure core. A permissive default here is the whole privacy story failing."""
+
+    def test_denied_everywhere_plus_authenticated_read_is_private(self):
+        verdict, _ = decide([(HTTPS_URL, DENIED), (SSH_URL, DENIED)], READABLE)
+        self.assertEqual(verdict, PRIVATE)
+
+    def test_any_anonymous_read_is_public(self):
+        verdict, _ = decide([(HTTPS_URL, READABLE), (SSH_URL, DENIED)], READABLE)
+        self.assertEqual(verdict, PUBLIC)
+
+    def test_public_wins_even_when_the_authenticated_probe_failed(self):
+        verdict, _ = decide([(HTTPS_URL, READABLE)], UNKNOWN)
+        self.assertEqual(verdict, PUBLIC)
+
+    def test_unreachable_everywhere_is_indeterminate_not_private(self):
+        verdict, _ = decide([(HTTPS_URL, UNKNOWN), (SSH_URL, UNKNOWN)], UNKNOWN)
+        self.assertEqual(verdict, INDETERMINATE)
+
+    def test_denied_anonymously_but_authenticated_probe_failed_is_indeterminate(self):
+        # cannot tell "private" from "the host is down" — refuse rather than assume
+        verdict, _ = decide([(HTTPS_URL, DENIED)], UNKNOWN)
+        self.assertEqual(verdict, INDETERMINATE)
+
+    def test_one_inconclusive_anonymous_probe_blocks_a_private_verdict(self):
+        verdict, _ = decide([(HTTPS_URL, UNKNOWN), (SSH_URL, DENIED)], READABLE)
+        self.assertEqual(verdict, INDETERMINATE)
+
+    def test_no_anonymous_endpoint_is_indeterminate(self):
+        verdict, _ = decide([], READABLE)
+        self.assertEqual(verdict, INDETERMINATE)
+
+
+# --- verification end to end (fake runner, no network) ---------------------------
+
+
+class TestVerifyHappyPath(HubTempCase):
+    def setUp(self):
+        super().setUp()
+        self.git = ScriptedGit(remote_url=SSH_URL, anon=PRIVATE_HTTPS, auth=PUBLIC_READ)
+        self.result = self.verify(self.git)
+
+    def test_verified_private_and_push_permitted(self):
+        self.assertEqual(self.result.verdict, PRIVATE)
+        self.assertTrue(self.result.push_allowed)
+        self.assertEqual(self.result.source, "probe")
+
+    def test_both_endpoints_were_probed_anonymously(self):
+        anon = [a for a in self.git.probes if anon_call(a)]
+        self.assertEqual(len(anon), 2)
+
+    def test_verdict_is_cached(self):
+        entry = read_cache(default_cache_path(self.hub))
+        self.assertEqual((entry.verdict, entry.url), (PRIVATE, SSH_URL))
+
+
+class TestVerifyRefusals(HubTempCase):
+    def test_public_remote_is_refused_and_named(self):
+        git = ScriptedGit(remote_url=HTTPS_URL, anon=PUBLIC_READ, auth=PUBLIC_READ)
+        result = self.verify(git)
+        self.assertEqual(result.verdict, PUBLIC)
+        self.assertFalse(result.push_allowed)
+        self.assertIn(HTTPS_URL, result.detail)
+
+    def test_public_verdict_is_never_cached(self):
+        git = ScriptedGit(remote_url=HTTPS_URL, anon=PUBLIC_READ)
+        self.verify(git)
+        self.assertIsNone(read_cache(default_cache_path(self.hub)))
+
+    def test_host_unreachable_refuses_rather_than_assuming_private(self):
+        git = ScriptedGit(remote_url=SSH_URL, anon=UNREACHABLE, auth=UNREACHABLE)
+        result = self.verify(git)
+        self.assertEqual(result.verdict, INDETERMINATE)
+        self.assertFalse(result.push_allowed)
+
+    def test_no_remote_is_local_only_not_public(self):
+        result = self.verify(ScriptedGit(remote_url=None))
+        self.assertEqual(result.verdict, LOCAL_ONLY)
+        self.assertNotEqual(result.verdict, PUBLIC)
+        self.assertFalse(result.push_allowed)
+
+    def test_unreadable_repo_is_indeterminate_not_local_only(self):
+        # a failed `git remote` means "not a usable repo", which must not be quietly
+        # reported as the benign "configured, but no remote yet"
+        def broken(args, env, timeout):
+            return GitResult(128, "", "fatal: not a git repository")
+
+        result = self.verify(broken)
+        self.assertEqual(result.verdict, INDETERMINATE)
+        self.assertFalse(result.push_allowed)
+
+    def test_token_in_the_remote_url_refuses_even_when_private(self):
+        git = ScriptedGit(
+            remote_url="https://x:ghp_secret@github.com/owner/hubs.git", anon=PRIVATE_HTTPS
+        )
+        result = self.verify(git)
+        self.assertEqual(result.verdict, PRIVATE)
+        self.assertTrue(result.violations)
+        self.assertFalse(result.push_allowed)
+        self.assertNotIn("ghp_secret", result.detail + " ".join(result.violations))
+
+
+class TestVerifyCacheAndTtl(HubTempCase):
+    """The TOCTOU case: a URL-keyed-only cache never notices a flip to public."""
+
+    def setUp(self):
+        super().setUp()
+        self.git = ScriptedGit(remote_url=SSH_URL, anon=PRIVATE_HTTPS, auth=PUBLIC_READ)
+        self.assertEqual(self.verify(self.git).verdict, PRIVATE)
+
+    def test_fresh_cache_short_circuits_the_probes(self):
+        later = ScriptedGit(remote_url=SSH_URL, anon=PUBLIC_READ)
+        result = self.verify(later, now=NOW + timedelta(minutes=5))
+        self.assertEqual(result.source, "cache")
+        self.assertEqual([a for a in later.probes if anon_call(a)], [])
+
+    def test_flip_to_public_with_an_unchanged_url_is_caught_after_ttl_expiry(self):
+        flipped = ScriptedGit(remote_url=SSH_URL, anon=PUBLIC_READ, auth=PUBLIC_READ)
+        result = self.verify(flipped, now=NOW + timedelta(days=2))
+        self.assertEqual(result.verdict, PUBLIC)
+        self.assertFalse(result.push_allowed)
+        self.assertEqual(result.source, "probe")
+
+    def test_expired_cache_that_cannot_be_reverified_refuses(self):
+        offline = ScriptedGit(remote_url=SSH_URL, anon=UNREACHABLE, auth=UNREACHABLE)
+        result = self.verify(offline, now=NOW + timedelta(days=2))
+        self.assertEqual(result.verdict, INDETERMINATE)
+        self.assertFalse(result.push_allowed)
+
+    def test_changed_url_ignores_the_cache(self):
+        moved = ScriptedGit(remote_url=HTTPS_URL, anon=PUBLIC_READ, auth=PUBLIC_READ)
+        result = self.verify(moved, now=NOW + timedelta(minutes=5))
+        self.assertEqual(result.verdict, PUBLIC)
+
+    def test_public_verdict_evicts_a_stale_private_entry(self):
+        flipped = ScriptedGit(remote_url=SSH_URL, anon=PUBLIC_READ, auth=PUBLIC_READ)
+        self.verify(flipped, now=NOW + timedelta(days=2))
+        self.assertIsNone(read_cache(default_cache_path(self.hub)))
+
+
+class TestCacheIsUsable(unittest.TestCase):
+    ENTRY = CacheEntry(SSH_URL, PRIVATE, NOW)
+
+    def test_fresh_private_entry_for_the_same_url(self):
+        self.assertTrue(cache_is_usable(self.ENTRY, SSH_URL, NOW + timedelta(minutes=1), 3600))
+
+    def test_expired(self):
+        self.assertFalse(cache_is_usable(self.ENTRY, SSH_URL, NOW + timedelta(hours=9), 3600))
+
+    def test_different_url(self):
+        self.assertFalse(cache_is_usable(self.ENTRY, HTTPS_URL, NOW, 3600))
+
+    def test_missing_entry(self):
+        self.assertFalse(cache_is_usable(None, SSH_URL, NOW, 3600))
+
+    def test_non_private_verdict_is_never_reusable(self):
+        entry = CacheEntry(SSH_URL, PUBLIC, NOW)
+        self.assertFalse(cache_is_usable(entry, SSH_URL, NOW, 3600))
+
+    def test_timestamp_from_the_future_is_not_trusted(self):
+        # a clock jump must not extend the window indefinitely
+        self.assertFalse(cache_is_usable(self.ENTRY, SSH_URL, NOW - timedelta(days=1), 3600))
+
+
+class TestCacheIo(HubTempCase):
+    def test_round_trip(self):
+        path = default_cache_path(self.hub)
+        self.assertTrue(write_cache(path, CacheEntry(SSH_URL, PRIVATE, NOW)))
+        self.assertEqual(read_cache(path), CacheEntry(SSH_URL, PRIVATE, NOW))
+
+    def test_missing_file_reads_as_no_entry(self):
+        self.assertIsNone(read_cache(self.hub / "absent.json"))
+
+    def test_corrupt_cache_reads_as_no_entry_not_as_verified(self):
+        path = default_cache_path(self.hub)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json")
+        self.assertIsNone(read_cache(path))
+
+    def test_naive_timestamp_is_rejected(self):
+        path = default_cache_path(self.hub)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"url": SSH_URL, "verdict": PRIVATE, "verified_at": "2026-08-05T12:00:00"})
+        )
+        self.assertIsNone(read_cache(path))
+
+    def test_never_creates_a_git_directory_for_a_non_repo(self):
+        bare = self.root / "not-a-repo"
+        bare.mkdir()
+        self.assertFalse(write_cache(default_cache_path(bare), CacheEntry(SSH_URL, PRIVATE, NOW)))
+        self.assertFalse((bare / ".git").exists())
+
+
+# --- the public origin must stay unable to push ----------------------------------
+
+
+class TestOriginCredentialViolations(HubTempCase):
+    def test_configured_helper_is_reported(self):
+        git = ScriptedGit(helpers=["store"])
+        problems = origin_credential_violations(self.repo, git, 5)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("store", problems[0])
+
+    def test_no_helper_is_clean(self):
+        self.assertEqual(origin_credential_violations(self.repo, ScriptedGit(), 5), [])
+
+    def test_empty_reset_value_is_not_a_violation(self):
+        # `credential.helper=` is git's idiom for clearing the list, not for adding one
+        self.assertEqual(origin_credential_violations(self.repo, ScriptedGit(helpers=[""]), 5), [])
+
+    def test_scp_style_origin_is_normalized_for_urlmatch(self):
+        # git's own `host:path` syntax is NOT a URL; unnormalized, urlmatch exits 128 and
+        # this whole check silently passes on the very repo it guards
+        self.assertEqual(
+            config_url("git@github.com:rmorison/buzai.git"),
+            "ssh://github.com/rmorison/buzai.git",
+        )
+        self.assertEqual(config_url(HTTPS_URL), HTTPS_URL)
+
+    def test_urlmatch_error_falls_back_instead_of_reporting_clean(self):
+        def flaky(args, env, timeout):
+            if "remote.origin.url" in args:
+                return GitResult(0, "git@github.com:rmorison/buzai.git\n", "")
+            if "--get-urlmatch" in args:
+                return GitResult(128, "", "fatal: invalid URL scheme name")
+            return GitResult(0, "store\n", "")
+
+        problems = origin_credential_violations(self.repo, flaky, 5)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("store", problems[0])
+
+    def test_an_unevaluable_check_is_reported_not_swallowed(self):
+        def broken(args, env, timeout):
+            if "remote.origin.url" in args:
+                return GitResult(0, "git@github.com:rmorison/buzai.git\n", "")
+            return GitResult(128, "", "fatal: not a git repository")
+
+        problems = origin_credential_violations(self.repo, broken, 5)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("unverified", problems[0])
+
+
+# --- timeout bounding ------------------------------------------------------------
+
+
+class TestTimeoutBounding(HubTempCase):
+    def test_a_hung_probe_is_killed_rather_than_blocking(self):
+        started = time.monotonic()
+        result = default_git_runner(
+            ["-c", "import time; time.sleep(60)"], {}, 1.0, git_bin=sys.executable
+        )
+        self.assertTrue(result.timed_out)
+        self.assertEqual(classify(result), UNKNOWN)
+        self.assertLess(time.monotonic() - started, 20)
+
+    def test_an_unrunnable_git_returns_a_result_rather_than_raising(self):
+        result = default_git_runner(["--version"], {}, 5.0, git_bin="buzai-not-a-git-binary")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(classify(result), UNKNOWN)
+
+    def test_every_probe_carries_the_timeout(self):
+        git = ScriptedGit(remote_url=SSH_URL, anon=PRIVATE_HTTPS)
+        self.verify(git, use_cache=False, timeout=7.0)
+        self.assertTrue(git.calls)
+        self.assertEqual({timeout for _, _, timeout in git.calls}, {7.0})
+
+
+# --- the verb --------------------------------------------------------------------
+
+
+class TestCheck(HubTempCase):
+    def run_check(self, git, **kw):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = check(self.hub, self.repo, runner=git, now=NOW, **kw)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_private_remote_exits_zero(self):
+        git = ScriptedGit(remote_url=SSH_URL, anon=PRIVATE_HTTPS, auth=PUBLIC_READ)
+        rc, out, _ = self.run_check(git)
+        self.assertEqual(rc, 0)
+        self.assertIn("PRIVATE", out)
+
+    def test_public_remote_exits_one_and_names_it(self):
+        git = ScriptedGit(remote_url=HTTPS_URL, anon=PUBLIC_READ, auth=PUBLIC_READ)
+        rc, _, err = self.run_check(git)
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-remote FAIL", err)
+        self.assertIn(HTTPS_URL, err)
+
+    def test_unreachable_exits_one(self):
+        git = ScriptedGit(remote_url=SSH_URL, anon=UNREACHABLE, auth=UNREACHABLE)
+        rc, _, err = self.run_check(git)
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-remote FAIL", err)
+
+    def test_local_only_warns_without_failing(self):
+        # a durability condition, not a privacy one — it must not become an outage
+        rc, out, _ = self.run_check(ScriptedGit(remote_url=None))
+        self.assertEqual(rc, 0)
+        self.assertIn("local-only", out)
+
+    def test_public_origin_credential_helper_is_a_violation(self):
+        git = ScriptedGit(
+            remote_url=SSH_URL, anon=PRIVATE_HTTPS, auth=PUBLIC_READ, helpers=["store"]
+        )
+        rc, _, err = self.run_check(git)
+        self.assertEqual(rc, 1)
+        self.assertIn("credential helper", err)
+
+
+class TestMain(unittest.TestCase):
+    """main() targets the REAL hub location, so only the pre-probe refusal may run."""
+
+    def test_refused_hub_path_exits_one_before_probing(self):
+        previous = os.environ.get("BUZAI_HUBS_DIR")
+        self.addCleanup(
+            lambda: (
+                os.environ.__setitem__("BUZAI_HUBS_DIR", previous)
+                if previous is not None
+                else os.environ.pop("BUZAI_HUBS_DIR", None)
+            )
+        )
+        os.environ["BUZAI_HUBS_DIR"] = str(Path(__file__).resolve().parents[2])  # the checkout
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main([])
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-remote FAIL", err.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()
