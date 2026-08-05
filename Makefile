@@ -21,8 +21,8 @@ UNIT    := $(SYSTEMD_USER)/claude-remote.service
 
 # `audit` MUST be .PHONY — a live workspace has an `audit/` directory, and without this
 # Make would treat the target as a satisfied file and skip the recipe.
-.PHONY: help bootstrap setup claude-install venv test trust-install trust-check liveness \
-        audit doctor smoke env-url auth prime-consent service-install service-start \
+.PHONY: help bootstrap setup claude-install venv test trust-install trust-check hub-init \
+        liveness audit doctor smoke env-url auth prime-consent service-install service-start \
         service-stop service-restart service-status lint dev
 
 help: ## Show this help
@@ -58,6 +58,9 @@ trust-install: ## Merge the trust-gate hooks into .claude/settings.json + lock a
 
 trust-check: ## Validate trust-gate config parses + the gate self-test passes
 	$(PY) scripts/trust_check.py
+
+hub-init: ## Create + seed the private hub repo outside the checkout (idempotent; stops before the remote)
+	$(PY) scripts/hub_init.py
 
 # --- service ------------------------------------------------------------------
 
