@@ -43,9 +43,22 @@ WorkingDirectory=%h/buzai
 #EnvironmentFile=%h/.config/buzai/secrets/xero.env
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
-# Refuse to start on a miswired secrets/credentials layout (tracked secret,
-# wrong perms). Runs under the pinned, self-contained .venv Python (SETUP step 5),
-# NOT the host's system python.
+# Where the private hub repo lives. %h/hubs is the default, so this line is only needed
+# if your store is somewhere else — but if it IS somewhere else, it MUST be set HERE.
+# A `--user` unit sources neither ~/.profile nor ~/.bashrc, so an export in a shell
+# profile reaches your ssh session and never reaches the service: the assistant would
+# read and write a different store than the one you inspect by hand, silently, with
+# both looking correct. The preflight below prints the path it resolved on every start
+# — compare it against `make hub-init` output if anything looks missing.
+#Environment=BUZAI_HUBS_DIR=%h/hubs
+
+# Refuse to start on a layout that can leak personal state: a real .env or personal hub
+# content inside the checkout, a hub deploy key with loose perms or tracked by any repo,
+# a credential helper on the public origin, or a hub path inside the checkout. Durability
+# conditions (no remote, unpushed backlog, dirty hub tree) print WARN and DO NOT block
+# start — with StartLimitBurst=5 above, failing on those would turn "knowledge is not
+# backed up" into "the assistant is gone". Runs under the pinned, self-contained .venv
+# Python (SETUP step 5), NOT the host's system python.
 ExecStartPre=%h/buzai/.venv/bin/python %h/buzai/scripts/secrets_preflight.py
 
 # Long-lived remote-control SERVER (sessions attach on demand). Do NOT use

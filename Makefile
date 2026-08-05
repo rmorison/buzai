@@ -117,10 +117,15 @@ liveness: ## LIVE / NOT-LIVE — is the remote-control server holding a relay so
 audit: ## Show the last trust-gate decisions (verify the gate is firing; pass N=… to change count)
 	$(PY) scripts/audit_tail.py -n $(or $(N),15)
 
-doctor: ## Aggregate health check: prereqs, venv, secrets, liveness (informational)
+# The preflight is the same binary systemd runs as ExecStartPre, so `doctor` shows
+# exactly what service start will see. It prints the resolved hub path, `WARN:` lines for
+# durability conditions (no remote / unpushed backlog / dirty hub tree — these exit 0 and
+# never block start) and `FAIL:` lines for leak conditions (which do). Both streams are
+# left unredirected so the WARN lines surface here too.
+doctor: ## Aggregate health check: prereqs, venv, secrets + personal-state layout, liveness
 	@echo "== prereqs =="; command -v claude >/dev/null && claude --version || echo "  claude: MISSING (see SETUP step 2)"
 	@echo "== venv ==";    test -x $(PY) && echo "  $$($(PY) --version)" || echo "  .venv: MISSING (run: make venv)"
-	@echo "== secrets =="; if $(PY) scripts/secrets_preflight.py; then :; else echo "  secrets-preflight reported a problem (exit $$?)"; fi
+	@echo "== secrets + personal-state layout =="; if $(PY) scripts/secrets_preflight.py; then :; else echo "  secrets-preflight FAILED (exit $$?) — the service will REFUSE TO START until this is fixed; WARN lines above are durability-only and do not block start"; fi
 	@echo "== liveness =="; if $(PY) scripts/liveness.py; then :; else echo "  not live (exit $$?) — a traceback above means the probe itself errored, not just idle"; fi
 
 smoke: ## SC0 preflight for the 8-point smoke test (see docs/SMOKE-TEST.md)
