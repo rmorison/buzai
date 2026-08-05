@@ -22,7 +22,7 @@ UNIT    := $(SYSTEMD_USER)/claude-remote.service
 # `audit` MUST be .PHONY — a live workspace has an `audit/` directory, and without this
 # Make would treat the target as a satisfied file and skip the recipe.
 .PHONY: help bootstrap setup claude-install venv test trust-install trust-check hub-init \
-        hub-remote-check liveness audit doctor smoke env-url auth prime-consent \
+        hub-remote-check hub-push liveness audit doctor smoke env-url auth prime-consent \
         service-install service-start service-stop service-restart service-status lint dev
 
 help: ## Show this help
@@ -64,6 +64,11 @@ hub-init: ## Create + seed the private hub repo outside the checkout (idempotent
 
 hub-remote-check: ## Prove the hub remote is PRIVATE (anonymous readability probe) before anything is pushed
 	$(PY) scripts/hub_remote.py
+
+# Run this at service start: an expired token or an offline box leaves commits durable
+# locally but not off-box, and the backlog is only drained by a write or by this verb.
+hub-push: ## Retry pushing any hub commits that never reached the private remote
+	$(PY) scripts/hub_commit.py --retry-push
 
 # --- service ------------------------------------------------------------------
 
