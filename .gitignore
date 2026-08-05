@@ -10,12 +10,24 @@ audit/
 __pycache__/
 *.pyc
 
-# Onboarding: real secrets (examples are kept) and personal hub content (scaffolds kept)
+# Onboarding: real secrets (examples are kept). Real values belong at
+# ~/.config/buzai/secrets/*.env — the preflight FAILS service start on a real .env here.
 deploy/env/*.env
 !deploy/env/*.env.example
-hubs/*.md
+
+# hubs/ is a template directory: the two tracked scaffolds and nothing else. Real hub
+# content lives in a private repo OUTSIDE this checkout ($BUZAI_HUBS_DIR, default ~/hubs)
+# and the preflight fails start if any turns up here — this is belt-and-braces, not the
+# barrier. Ignore everything (not just *.md): a hub that outgrew one file becomes a
+# folder, and hubs/<domain>/<topic>.md was neither tracked nor ignored, so `git add -A`
+# would have staged it.
+hubs/*
 !hubs/README.md
 !hubs/_example-hub.md
+
+# Nothing else needs an entry for the hub write path: the lock, the push backlog, and the
+# remote-privacy verdict cache all live under <hub>/.git/buzai/ — inside the hub repo's
+# git directory, outside this checkout, and never committed by construction.
 
 # Self-contained Python: uv-managed interpreter/venv is per-host (the pinned
 # version in .python-version IS tracked; the materialized .venv is not).

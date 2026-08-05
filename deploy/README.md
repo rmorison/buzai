@@ -9,8 +9,28 @@ non-Linux run, see the manual CLI invocation in `docs/SETUP.md`.
 > (Gmail/Calendar/Drive/Todoist/Dropbox/etc.), you have **no local secrets** —
 > their OAuth lives in `~/.claude/.credentials.json`. **Skip this whole step**,
 > leave the `EnvironmentFile=` lines in the unit commented (their default), and go
-> to step 2. `secrets_preflight.py` treats "no local secret files" as fine (it only
-> fails on loose perms or a tracked secret), so the service starts cleanly.
+> to step 2. `secrets_preflight.py` treats "no local secret files" as fine — it fails
+> on an unsafe *layout* (loose perms, a tracked secret, personal state inside the
+> checkout), never on the mere absence of secrets — so the service starts cleanly.
+
+**`~/.config/buzai/secrets/*.env` is the only place real values live.** Not "the
+preferred place" — the only one. `deploy/env/` inside the checkout holds **tracked
+`*.env.example` scaffolds and nothing else**, and `secrets_preflight.py` now **fails
+service start** if it finds a real `deploy/env/*.env` there, naming the file. That is
+deliberate: a secret committed once survives its own deletion, and in a public repo it
+is world-mirrored and cannot be un-published, so `.gitignore` alone is not a barrier
+worth resting on. Secrets are the never-versioned tier — they belong at a path with no
+git repository anywhere above them (see `docs/decisions/private-versioned-hubs.md`).
+
+Upgrading an instance that already has real values under `deploy/env/`? One-time move,
+then confirm:
+
+```bash
+mkdir -p ~/.config/buzai/secrets && chmod 700 ~/.config/buzai/secrets
+mv deploy/env/*.env ~/.config/buzai/secrets/     # NOT the *.env.example scaffolds
+chmod 600 ~/.config/buzai/secrets/*.env
+make doctor                                      # must report secrets-preflight OK
+```
 
 Only if you run **local MCP connectors** (e.g. a local Sheets/IMAP/SMTP server),
 their secrets must live **outside the workspace tree**, so the assistant's own
@@ -64,6 +84,12 @@ populated **before** the first push — every git invocation on this path runs
 non-interactively (`GIT_TERMINAL_PROMPT=0`, ssh `BatchMode=yes`), so an unknown
 host key fails fast rather than hanging a TTY-less service.
 
+The key is a secret like any other, and the preflight treats it as one: `~/.ssh/buzai-hub`
+must be **0600** and **untracked by any git repo** — a dotfiles repo at `~` that tracks it
+publishes write access to your knowledge base. Both are fatal at service start. The path is
+not configurable; a second supported location would be a second thing to check and a second
+thing to get wrong.
+
 **A token embedded in the remote URL is forbidden.** Not discouraged — forbidden,
 and `scripts/hub_remote.py` refuses to push when it sees one. Git echoes the
 remote URL on failure and the unit sends stderr to the journal, so
@@ -100,9 +126,25 @@ on demand) — not `--spawn session`, which exits on completion and, with
 `Restart=always`, swallows prompts during the respawn window. The
 `EnvironmentFile=` lines ship **commented** (a managed-only setup needs none); any
 you **uncomment** have **no** `-` prefix, so a missing secrets file makes the unit
-fail to start (fail-closed). `ExecStartPre` runs `scripts/secrets_preflight.py` to
-refuse a miswired layout (loose perms or a git-tracked secret) — it passes when
-there are simply no local secrets.
+fail to start (fail-closed). The commented `Environment=BUZAI_HUBS_DIR=` line is where
+a non-default hub location goes — a `--user` unit sources no shell profile, so setting
+it only in `~/.profile` would point the assistant at a different store than the one you
+inspect by hand.
+
+`ExecStartPre` runs `scripts/secrets_preflight.py`, which prints the hub path it
+resolved and then splits its findings two ways:
+
+- **`FAIL:` — leak conditions block start.** Loose perms or a git-tracked secret (as
+  before), plus: a real `.env` under `deploy/env/`, personal hub content inside the
+  checkout's `hubs/`, a hub path inside or containing the checkout, a hub deploy key
+  that is not 0600 or is tracked, and a credential helper configured for the **public**
+  origin.
+- **`WARN:` — durability conditions exit 0 and never block start.** A hub store with no
+  remote past its grace period, unpushed commits, a dirty hub working tree, a git repo
+  nested above the hub directory. With `StartLimitBurst=5` above, failing on those would
+  turn "knowledge is not backed up" into "the assistant is gone".
+
+It passes cleanly when there are simply no local secrets and no hub store yet.
 
 ## 3. Survive reboot (linger)
 
