@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import subprocess
 import tempfile
@@ -857,8 +858,12 @@ class TestInspectHub(unittest.TestCase):
 # line from `assess()`'s `fatal_problems(...)` call and the matching test fails.
 
 
-class TestAssessComposition(unittest.TestCase):
-    """A whole fake instance in a tempdir: never the real home, checkout, or secrets."""
+class AssessCompositionCase(unittest.TestCase):
+    """A whole fake instance in a tempdir: never the real home, checkout, or secrets.
+
+    The fixture is a base class rather than the test class so a plant can be added in a
+    subclass without re-running every test that already lives on it.
+    """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -924,6 +929,8 @@ class TestAssessComposition(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"secrets-preflight FAIL: {findings.fatal[0]}", err)
 
+
+class TestAssessComposition(AssessCompositionCase):
     # --- the clean and warning-only baselines --------------------------------------
 
     def test_a_clean_instance_passes(self):
@@ -1132,6 +1139,155 @@ class TestTimeoutsDegradeInTheDirectionTheCheckDemands(unittest.TestCase):
             code = report(HubTarget(hub, str(hub)), Findings(warnings=tuple(warns)))
         self.assertEqual(code, 0)
         self.assertIn("secrets-preflight WARN", err.getvalue())
+
+
+class TestANaiveStoredTimestampCannotBlockStart(AssessCompositionCase):
+    """PLANT: a real hub store whose two stored timestamps have no UTC offset.
+
+    `.buzai/remote-expected` and `.git/buzai/push-backlog.json` are plain files inside the
+    owner's own repo. Hand-edited, restored from an older format, or written by a future
+    code path, either can end up naive — and both are subtracted from an aware `now`
+    inside WARNING-path checks (`stale_remote_warning`, `backlog_warning`) that
+    `ExecStartPre` runs on every service start. Naive minus aware raises `TypeError`,
+    which nothing on that path catches: the preflight died, `ExecStartPre` failed, and
+    with `StartLimitBurst=5` the unit was left permanently `failed` — a *durability*
+    condition, which cannot leak anything, taking the whole assistant offline. That is
+    the exact inversion of the fatal/warning split this module exists to enforce.
+
+    Fixed at the boundary in both readers (`hub_init.parse_marker` raises `ValueError`,
+    `hub_commit.read_backlog` drops the entry), which is why this asserts on WHERE the
+    save happened: the backstop in `durability_report` must not be what caught it.
+
+    Verified against the unfixed version: `main()` raised `TypeError: can't subtract
+    offset-naive and offset-aware datetimes` out of `assess`, so `ExecStartPre` failed.
+    """
+
+    def plant_naive_store(self):
+        hub = make_repo(self.home / "hubs")
+        (hub / "home.md").write_text("# Home\n")
+        marker = hub / ".buzai" / "remote-expected"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"# created\n{(self.now - timedelta(days=40)).replace(tzinfo=None)}\n")
+        commit_all(hub, "first hub entry")
+        backlog = hub / ".git" / "buzai" / "push-backlog.json"
+        backlog.parent.mkdir(parents=True, exist_ok=True)
+        backlog.write_text(
+            '{"pending": [{"commit": "deadbee", "recorded_at": "2026-08-05T12:00:00"}], '
+            '"last_error": "offline", "last_attempt": "2026-08-05T12:00:00"}'
+        )
+        return hub
+
+    def test_the_planted_timestamps_really_are_naive(self):
+        # without this the class would pass against a store that never carried the fault
+        hub = self.plant_naive_store()
+        self.assertNotIn("+00:00", (hub / ".buzai" / "remote-expected").read_text())
+        self.assertIsNone(
+            datetime.fromisoformat(
+                json.loads((hub / ".git" / "buzai" / "push-backlog.json").read_text())["pending"][
+                    0
+                ]["recorded_at"]
+            ).tzinfo
+        )
+
+    def test_service_start_is_not_blocked(self):
+        self.plant_naive_store()
+        code, out, err = self.run_main()
+        self.assertEqual(code, 0, err)
+        self.assertIn("secrets-preflight OK", out)
+
+    def test_the_boundary_caught_it_not_the_backstop(self):
+        # the backstop is defence in depth; if it is doing this job, the readers are not
+        self.plant_naive_store()
+        _, _, err = self.run_main()
+        self.assertNotIn("durability checks could not be completed", err)
+
+    def test_the_garbled_marker_is_reported_as_a_warning(self):
+        self.plant_naive_store()
+        warnings = self.findings().warnings
+        self.assertTrue(any("unreadable" in w for w in warnings), warnings)
+        self.assertTrue(any("grace period cannot be judged" in w for w in warnings), warnings)
+
+    def test_the_naive_backlog_entry_is_dropped_rather_than_reported(self):
+        self.plant_naive_store()
+        self.assertFalse(any("not reached the remote" in w for w in self.findings().warnings))
+
+    def test_an_aware_backlog_entry_is_still_warned_about(self):
+        # the guard: dropping must not become "the backlog warning never fires"
+        hub = self.plant_naive_store()
+        (hub / ".git" / "buzai" / "push-backlog.json").write_text(
+            '{"pending": [{"commit": "deadbee", "recorded_at": "2026-08-05T12:00:00+00:00"}], '
+            '"last_error": "offline", "last_attempt": null}'
+        )
+        self.assertTrue(
+            any("not reached the remote" in w for w in self.findings().warnings),
+            self.findings().warnings,
+        )
+
+
+class TestAnUnexpectedDurabilityFailureDegradesToAWarning(AssessCompositionCase):
+    """PLANT: a durability reader that raises an exception nothing on that path catches.
+
+    Defence in depth behind the two boundary fixes above. Every anticipated failure — a
+    hung git, an unparseable marker — already degrades correctly and has its own test;
+    this is the backstop for the *unanticipated* one, which is what a naive stored
+    timestamp was until it was found. `ExecStartPre` failure blocks service start and
+    `StartLimitBurst=5` makes five of them permanent, so no bug on the durability path
+    may be able to reach that outcome: nothing there can leak, so nothing there is worth
+    ending the assistant over.
+
+    The runner raises only for calls targeting the hub store, so the FATAL path — which
+    uses the same runner against the checkout — is untouched and can still be asserted on.
+
+    Verified against the unfixed version (no try/except in `assess`): `main()` propagated
+    `RuntimeError` and `ExecStartPre` failed.
+    """
+
+    def exploding_runner(self, hub):
+        def runner(args, env, timeout):
+            if str(hub) in " ".join(args):
+                raise RuntimeError("the hub reader blew up")
+            return real_git(args, env, timeout)
+
+        return runner
+
+    def planted(self):
+        hub = make_repo(self.home / "hubs")
+        (hub / "home.md").write_text("# Home\n")
+        commit_all(hub, "first hub entry")
+        return hub, self.exploding_runner(hub)
+
+    def test_it_warns_and_exits_zero(self):
+        _, runner = self.planted()
+        code, out, err = self.run_main(runner=runner)
+        self.assertEqual(code, 0, err)
+        self.assertIn("durability checks could not be completed", err)
+        self.assertIn("RuntimeError", err)
+        self.assertIn("secrets-preflight OK", out)
+
+    def test_it_is_a_warning_and_never_a_fatal(self):
+        _, runner = self.planted()
+        findings = self.findings(runner=runner)
+        self.assertEqual(findings.fatal, ())
+        self.assertFalse(findings.blocks_start)
+        self.assertEqual(len(findings.warnings), 1, findings.warnings)
+
+    def test_a_planted_leak_still_blocks_start_alongside_it(self):
+        # the guard: the backstop must not have softened the FATAL half
+        _, runner = self.planted()
+        (self.hubs / "finance-and-tax.md").write_text("# Finance\n")
+        code, _, err = self.run_main(runner=runner)
+        self.assertEqual(code, 1)
+        self.assertIn("secrets-preflight FAIL", err)
+        self.assertIn("finance-and-tax.md", err)
+        self.assertIn("durability checks could not be completed", err)
+
+    def test_a_leak_check_that_cannot_answer_is_still_fatal(self):
+        # the other half of the guard: "cannot tell" on the leak side never reads as clean
+        self.hub_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+        os.chmod(self.hub_key, 0o600)
+        findings = self.findings(is_tracked=lambda p: "git could not say")
+        self.assertTrue(findings.blocks_start)
+        self.assertTrue(any("unverified rather than clean" in f for f in findings.fatal))
 
 
 if __name__ == "__main__":

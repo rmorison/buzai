@@ -127,6 +127,14 @@ policy change with the clone URL unchanged. So the verdict is cached with a TTL
 An expired cache means refuse-and-queue, never push. Only *private* verdicts are
 cached, and a later non-private verdict evicts the entry.
 
+"At service start" is a wire, not an aspiration: `deploy/claude-remote.service.template`
+runs this module as an `ExecStartPre=-` line — `main()` -> `check(use_cache=False)`, a
+fresh probe that rewrites or evicts the entry — ordered *before* the `ExecStartPost=`
+pushes, so a restart can never push against a verdict nobody re-checked. The leading `-`
+is what keeps a privacy answer from being able to block start: "do not push" and "do not
+run the assistant" are different conclusions, and only the leak conditions in
+`secrets_preflight` earn the second one.
+
 The cache lives at `<hub>/.git/buzai/remote-verified.json` — durable, per-instance, and
 inside the git directory so it is never committed and never dirties the hub working
 tree (U2's `.buzai/remote-expected` marker is committed precisely because it *should*
@@ -636,6 +644,28 @@ def config_url(url: str) -> str:
     return url
 
 
+def helper_shape(helper: str) -> str:
+    """A credential helper's SHAPE, safe to print. Pure. Never its configured value.
+
+    Git accepts an *inline shell* helper — `credential.helper = !f() { echo
+    password=$MY_TOKEN; }; f` — which is a documented idiom and can legitimately contain a
+    token verbatim. The finding below is printed to stderr and the unit sends stderr to
+    the journal, so echoing the configured value would write a credential to the logs in
+    plaintext: the check meant to protect the public origin would itself become the leak.
+
+    The first whitespace-delimited token identifies the helper for every remedy the
+    message names (`store`, `cache`, `osxkeychain`, a path to a binary) and carries no
+    secret; arguments after it might (`--token=…`), so they are dropped. Anything starting
+    with `!` is a shell fragment whose first token is meaningless anyway, and it is
+    replaced wholesale rather than trimmed — there is no prefix of a shell program that is
+    known not to contain a secret.
+    """
+    text = helper.strip()
+    if text.startswith("!"):
+        return "<inline shell helper>"
+    return text.split()[0] if text.split() else "<empty>"
+
+
 def origin_credential_violations(
     repo_root: Path, runner: GitRunner, timeout: float = PROBE_TIMEOUT_SECONDS
 ) -> list[str]:
@@ -683,10 +713,12 @@ def origin_credential_violations(
                 f"— treated as unverified rather than clean: {detail}"
             ]
     # An empty value is git's idiom for *clearing* the helper list, not for adding one.
+    # Only the helper's SHAPE is reported — see `helper_shape`: an inline shell helper can
+    # carry a token, and this message goes to the journal.
     helpers = [line.strip() for line in found.stdout.splitlines() if line.strip()]
     return [
-        f"a git credential helper ({helper!r}) is configured for {where} — this instance "
-        f"must have no way to push to the public repo; remove it with "
+        f"a git credential helper ({helper_shape(helper)}) is configured for {where} — this "
+        f"instance must have no way to push to the public repo; remove it with "
         f"`git -C {repo_root} config --unset-all credential.helper`"
         for helper in helpers
     ]
@@ -721,6 +753,19 @@ def write_cache(path: Path, entry: CacheEntry) -> bool:
 
     Refuses to create the `.git` directory itself: a stray `.git` would turn a plain
     directory into a repo git then reports as broken.
+
+    The temp name carries the **pid**, which is what makes the write atomic *between
+    sessions* and not merely against a reader. Two Claude sessions in the same directory
+    verify the same hub concurrently — `--spawn=same-dir` is what the unit runs — and with
+    one fixed temp name the second writer overwrites the first's temp file before the
+    first has replaced: the first's `replace()` then fails on a file that is gone, so it
+    reports success-by-return-value while the cache holds the *other* session's entry.
+    A lost or torn verdict is not cosmetic here; it is the record of whether a push is
+    permitted.
+
+    This mirrors `hub_commit.atomic_write` by construction rather than by import:
+    `hub_commit` imports this module, so importing it back is a cycle that fails at
+    interpreter start. The two must stay in step.
     """
     if not path.parent.parent.is_dir():
         return False
@@ -729,7 +774,7 @@ def write_cache(path: Path, entry: CacheEntry) -> bool:
         "verdict": entry.verdict,
         "verified_at": entry.verified_at.isoformat(timespec="seconds"),
     }
-    temp = path.with_suffix(".tmp")
+    temp = path.with_name(f"{path.name}.buzai-tmp.{os.getpid()}")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp.write_text(json.dumps(payload, indent=2) + "\n")

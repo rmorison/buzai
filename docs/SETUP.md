@@ -486,8 +486,11 @@ It reports **PRIVATE** (push permitted), **PUBLICLY READABLE** (refused), **coul
 confirmed private** (refused and queued — unreachable, timed out, or an unrecognized
 error; never assumed private), or **no remote** (local-only, which exits 0 because it is a
 durability condition, not a leak). The verdict is cached inside the hub repo at
-`.git/buzai/remote-verified.json` for an hour and re-checked at service start, so a repo
-flipped to public later — same clone URL — is caught rather than trusted forever.
+`.git/buzai/remote-verified.json` for an hour and re-checked at service start — the unit
+runs `scripts/hub_remote.py` as an `ExecStartPre=-` line, before anything pushes — so a
+repo flipped to public later, same clone URL, is caught rather than trusted forever. That
+line cannot block start: a remote that must not be pushed to is not a reason to take the
+assistant off the air.
 
 **c. Seed and use it.** This is a **post-setup step you can drive entirely from the Claude
 app over Remote Control** — ask the assistant to record something and it goes through
@@ -519,6 +522,12 @@ or by hand:
 ```bash
 make hub-push              # retries unpushed commits, then the review dispositions ref
 ```
+
+"At service start" is an `ExecStartPost=-` line in the unit running exactly what
+`make hub-push` runs, chained the same way: the notes ref only goes if the commits went.
+It runs *after* the server is up and cannot fail the unit, so `systemctl --user restart
+claude-remote` is a legitimate way to drain a backlog once the network or the deploy key
+is fixed. `journalctl --user -u claude-remote` shows what it did.
 
 If it keeps failing, the deploy key or token has most likely expired (fine-grained tokens
 do, routinely) — see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md). `make doctor` prints a

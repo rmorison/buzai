@@ -31,6 +31,7 @@ from scripts.hub_commit import (
     record_unpushed,
 )
 from scripts.hub_commit import detail_of as commit_detail_of
+from scripts.hub_init import BOOTSTRAP_SOURCE
 from scripts.hub_init import commit_message as hub_init_commit_message
 from scripts.hub_remote import INDETERMINATE, LOCAL_ONLY, PRIVATE, GitResult, Verification
 from scripts.hub_remote import default_git_runner as real_git
@@ -1064,10 +1065,17 @@ class TestLegacyReconcileCommitsStayRejectable(ReviewRepoCase):
 
 
 class TestTheHubInitSeedIsNotAReviewItem(ReviewRepoCase):
-    """`hub_init`'s initial commit carries `instruction-source: owner-directed` — the owner
-    really did run `make hub-init` — so the source filter alone leaves the store's own
-    bootstrap as the first thing every fresh instance asks its owner to review. It is not
+    """`hub_init`'s initial commit carries an `instruction-source` trailer, and the source
+    filter here does not drop it — so without the root-commit exclusion the store's own
+    bootstrap is the first thing every fresh instance asks its owner to review. It is not
     assistant-recorded knowledge at all.
+
+    The seed's source is now `hub_init.BOOTSTRAP_SOURCE` rather than `owner-directed`
+    (previously it claimed the same source as knowledge recorded at the owner's request).
+    That is deliberately *additive*: `reviewable()` filters only `owner-correction`, so a
+    new source value changes nothing here and the root-commit exclusion is still what
+    keeps the seed out of the queue. This class is the proof of that, which is why it
+    asserts the seed is reviewable-by-source first.
 
     Verified against the unfixed version: `Initialize hub store` was item 1 of the listing
     on a brand-new hub.
@@ -1083,7 +1091,8 @@ class TestTheHubInitSeedIsNotAReviewItem(ReviewRepoCase):
     def test_the_seed_really_carries_an_instruction_source(self):
         # without this the class would pass against a seed the source filter already drops
         change = find_change(self.hub, self.seed)
-        self.assertEqual(change.source, OWNER_DIRECTED)
+        self.assertEqual(change.source, BOOTSTRAP_SOURCE)
+        self.assertNotEqual(BOOTSTRAP_SOURCE, OWNER_DIRECTED)
         self.assertTrue(reviewable(change), "the source filter alone does not exclude it")
 
     def test_the_root_commit_is_excluded(self):

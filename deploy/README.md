@@ -120,8 +120,9 @@ the remote. If that read *succeeds*, the repo is publicly readable and the push 
 refused. Unreachable, timed out or otherwise inconclusive also refuses: the check
 distinguishes public / private / indeterminate and never assumes private. The
 verdict is cached inside the hub repo at `.git/buzai/remote-verified.json` with a
-one-hour TTL and re-verified at service start, so a repo flipped to public later —
-same clone URL — is caught rather than trusted forever.
+one-hour TTL and re-verified at service start — the unit runs this same check as an
+`ExecStartPre=-` line, ahead of the pushes (see step 2) — so a repo flipped to public
+later, same clone URL, is caught rather than trusted forever.
 
 ## 2. Install the unit
 
@@ -142,6 +143,29 @@ fail to start (fail-closed). The commented `Environment=BUZAI_HUBS_DIR=` line is
 a non-default hub location goes — a `--user` unit sources no shell profile, so setting
 it only in `~/.profile` would point the assistant at a different store than the one you
 inspect by hand.
+
+The unit runs four things around `ExecStart`, in this order:
+
+| line | command | may it block start? |
+| --- | --- | --- |
+| `ExecStartPre=` | `scripts/secrets_preflight.py` | **yes** — leak conditions only |
+| `ExecStartPre=-` | `scripts/hub_remote.py` | no (`-`) — re-verifies/evicts the privacy verdict |
+| `ExecStart=` | `claude remote-control …` | the server itself |
+| `ExecStartPost=-` | `hub_commit.py --retry-push && hub_review.py --push-notes` | no (`-`) |
+
+The two `-` lines are the "retried at service start" and "re-verified at service start"
+guarantees, wired. The privacy re-verification comes **first** — a cached `PRIVATE`
+verdict is an hour old at most, but a repository can be flipped to public through a web
+UI with the clone URL unchanged, so a restart must re-probe before anything pushes. The
+pushes come **last**, after the assistant is already serving, and are chained with `&&`
+exactly like `make hub-push`: if the commits could not be pushed, the dispositions notes
+ref must not go either. Every one of these commands is internally timeout-bounded (20s
+per privacy probe, 60s per push, 30s per local git call), and `TimeoutStartSec=600s`
+gives the whole sequence room so a slow network cannot get a *running* assistant killed.
+
+Nothing on those two lines can fail the unit: `-` tells systemd to ignore the exit
+status. "This must not be pushed" and "this must not run" are different conclusions, and
+only the fatal half of the preflight below earns the second one.
 
 `ExecStartPre` runs `scripts/secrets_preflight.py`, which prints the hub path it
 resolved and then splits its findings two ways:

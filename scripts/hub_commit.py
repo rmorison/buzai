@@ -953,18 +953,37 @@ def default_backlog_path(hub: Path) -> Path:
 
 
 def read_backlog(path: Path) -> Backlog:
-    """The recorded backlog, or an empty one. Every malformed state reads as empty."""
+    """The recorded backlog, or an empty one. Every malformed state reads as empty.
+
+    A timestamp with **no UTC offset** is one of those malformed states, and the entry
+    carrying it is dropped — the rule `hub_remote.read_cache` already applies to its own
+    stored timestamp. `write_backlog` always writes an offset, but this is plain JSON
+    inside the owner's own repo: a hand-edit, a restore from an older format, or a future
+    writer can leave one naive. Every consumer subtracts it from an aware `now`
+    (`Backlog.oldest_age_seconds`, read by `secrets_preflight.backlog_warning` on the
+    systemd `ExecStartPre` path), and mixing naive with aware raises `TypeError` — which
+    is not among the exceptions a *durability* check's callers handle. It would escape
+    `ExecStartPre` and, with `StartLimitBurst=5`, leave the unit `failed`: a stray
+    timestamp would end the assistant.
+
+    Dropping rather than fataling is the same trade the rest of this reader makes.
+    Understating the backlog by one commit is corrected by the next write or by
+    `--retry-push`; keeping the entry arms an exception in a check that must never be
+    able to block service start.
+    """
     try:
         data = json.loads(path.read_text())
         pending = tuple(
-            (str(item["commit"]), datetime.fromisoformat(item["recorded_at"]))
+            (str(item["commit"]), at)
             for item in data.get("pending", [])
+            if (at := datetime.fromisoformat(item["recorded_at"])).tzinfo is not None
         )
         attempt = data.get("last_attempt")
+        last = datetime.fromisoformat(attempt) if attempt else None
         return Backlog(
             pending,
             str(data.get("last_error", "")),
-            datetime.fromisoformat(attempt) if attempt else None,
+            last if last is not None and last.tzinfo is not None else None,
         )
     except (OSError, ValueError, TypeError, KeyError):
         return Backlog()

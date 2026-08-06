@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import signal
 import subprocess
@@ -918,6 +919,70 @@ class TestPushEnvironmentIsolation(HubRepoCase):
             self.assertNotIn(name, self.env, name)
         self.assertEqual(self.env["GIT_TERMINAL_PROMPT"], "0")
         self.assertIn("BatchMode=yes", self.env["GIT_SSH_COMMAND"])
+
+
+class TestBacklogTimestampsMustCarryAnOffset(HubRepoCase):
+    """PLANT: a backlog file whose `recorded_at` has no UTC offset.
+
+    `write_backlog` always writes one, but this is plain JSON inside the owner's own repo
+    — hand-edited, restored from an older format, or written by a future code path. Its
+    consumer is `Backlog.oldest_age_seconds`, which subtracts it from an aware `now`, and
+    `secrets_preflight.backlog_warning` calls that on the systemd `ExecStartPre` line.
+    Naive-minus-aware raises `TypeError`, which is not among the exceptions the durability
+    path catches: it escaped `ExecStartPre` and blocked service start, and with
+    `StartLimitBurst=5` that leaves the unit permanently `failed` — a leak-free durability
+    condition taking the whole assistant down.
+
+    Dropping the entry rather than fataling matches every other malformed state this
+    reader handles, and matches `hub_remote.read_cache`'s rule for its own timestamp.
+
+    Verified against the unfixed version: `read_backlog` returned the naive entry and
+    `oldest_age_seconds(NOW)` raised `TypeError: can't subtract offset-naive and
+    offset-aware datetimes`.
+    """
+
+    AWARE = "2026-08-05T12:00:00+00:00"
+    NAIVE = "2026-08-05T12:00:00"
+
+    def plant(self, *pending, last_attempt=None):
+        path = default_backlog_path(self.hub)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "pending": [{"commit": sha, "recorded_at": at} for sha, at in pending],
+                    "last_error": "offline",
+                    "last_attempt": last_attempt,
+                }
+            )
+        )
+        return read_backlog(path)
+
+    def test_a_naive_entry_is_dropped(self):
+        backlog = self.plant(("deadbee", self.NAIVE))
+        self.assertEqual(backlog.count, 0)
+
+    def test_the_aware_entries_around_it_survive(self):
+        # dropping the whole file would understate a real backlog as "nothing to push"
+        backlog = self.plant(("aaaa111", self.AWARE), ("bbbb222", self.NAIVE))
+        self.assertEqual([sha for sha, _ in backlog.pending], ["aaaa111"])
+        self.assertEqual(backlog.last_error, "offline")
+
+    def test_the_age_arithmetic_no_longer_raises(self):
+        # the observable end state: the call that used to explode on the ExecStartPre path
+        backlog = self.plant(("aaaa111", self.AWARE), ("bbbb222", self.NAIVE))
+        self.assertEqual(backlog.oldest_age_seconds(NOW + timedelta(hours=1)), 3600.0)
+
+    def test_a_naive_last_attempt_reads_as_no_attempt(self):
+        self.assertIsNone(self.plant(last_attempt=self.NAIVE).last_attempt)
+
+    def test_an_aware_last_attempt_is_kept(self):
+        self.assertIsNotNone(self.plant(last_attempt=self.AWARE).last_attempt)
+
+    def test_a_well_formed_backlog_is_unaffected(self):
+        # the guard: the drop must not become "every backlog reads as empty"
+        backlog = self.plant(("aaaa111", self.AWARE), ("bbbb222", self.AWARE))
+        self.assertEqual(backlog.count, 2)
 
 
 class TestPushBacklog(HubRepoCase):

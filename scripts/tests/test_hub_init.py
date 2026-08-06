@@ -9,12 +9,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.hub_init import (
+    BOOTSTRAP_SOURCE,
     MARKER,
     SCAFFOLDS,
     TIMEOUT_RETURNCODE,
     HubInitError,
     commit_count,
     commit_message,
+    detail_of,
+    git_ok,
     initialize,
     main,
     owner_instructions,
@@ -23,6 +26,7 @@ from scripts.hub_init import (
     plan_seed,
     remotes,
     render_marker,
+    resume_message,
     tracked_paths,
 )
 from scripts.hub_init import git as git_call
@@ -236,7 +240,7 @@ class TestInitializeHappyPath(HubTempCase):
     def test_commit_message_carries_the_instruction_source(self):
         body = git("-C", str(self.hub), "log", "-1", "--pretty=%B")
         self.assertIn("Initialize hub store", body)
-        self.assertIn("instruction-source: owner-directed", body)
+        self.assertIn(f"instruction-source: {BOOTSTRAP_SOURCE}", body)
 
 
 class TestSecondRun(HubTempCase):
@@ -571,6 +575,118 @@ class TestCommitMessage(unittest.TestCase):
         message = commit_message(["finance-and-tax.md"])
         self.assertIn("Moved 1 existing hub file(s)", message)
         self.assertIn("finance-and-tax.md", message)
+
+
+class TestMarkerRejectsANaiveTimestamp(unittest.TestCase):
+    """PLANT: a marker file whose timestamp carries no UTC offset.
+
+    The documented format requires one and `render_marker` always writes one, but this is
+    plain text inside the owner's own repo — hand-edited, restored from an older format,
+    or written by a future code path. Its only consumer subtracts it from an aware `now`
+    inside `secrets_preflight.stale_remote_warning`, a WARNING-path check on the systemd
+    `ExecStartPre` line, and naive-minus-aware raises `TypeError`. That is not among the
+    exceptions `read_marker` catches, so it escaped `ExecStartPre` and blocked service
+    start; with `StartLimitBurst=5` a marker typo ended the assistant.
+
+    Verified against the unfixed version: `parse_marker` returned the naive datetime and
+    `stale_remote_warning` raised `TypeError: can't subtract offset-naive and
+    offset-aware datetimes`.
+    """
+
+    NAIVE = "# buzai hub store\n2026-08-05T12:30:00\n"
+
+    def test_a_naive_timestamp_is_a_value_error(self):
+        with self.assertRaises(ValueError) as caught:
+            parse_marker(self.NAIVE)
+        self.assertIn("no UTC offset", str(caught.exception))
+
+    def test_it_cannot_be_subtracted_from_an_aware_now(self):
+        # the failure the ValueError exists to pre-empt, stated so it cannot be forgotten
+        with self.assertRaises(TypeError):
+            datetime.now(UTC) - datetime.fromisoformat("2026-08-05T12:30:00")
+
+    def test_an_offset_bearing_timestamp_is_still_accepted(self):
+        # the guard must not refuse what the format actually produces
+        self.assertEqual(parse_marker(render_marker(NOW)), NOW)
+        self.assertEqual(parse_marker("2026-08-05T12:30:00+02:00").utcoffset().seconds, 7200)
+
+    def test_garbage_is_still_a_value_error(self):
+        with self.assertRaises(ValueError):
+            parse_marker("# only comments\n")
+        with self.assertRaises(ValueError):
+            parse_marker("not a timestamp\n")
+
+
+class TestTheSeedIsNotStampedLikeRecordedKnowledge(unittest.TestCase):
+    """The seed commit's `instruction-source` says what it IS, not who ran it.
+
+    `owner-directed` was true — the owner ran `make hub-init` — and useless: by source
+    alone the store's own scaffolding was indistinguishable from knowledge the assistant
+    recorded at the owner's request, which is why `hub_review` had to exclude it by
+    detecting the parentless commit instead.
+
+    The resume commit deliberately keeps `owner-directed`: it migrates the owner's REAL
+    hub content out of the public checkout, and that content should be reviewable.
+    """
+
+    def test_the_seed_carries_the_bootstrap_source(self):
+        self.assertIn(f"instruction-source: {BOOTSTRAP_SOURCE}", commit_message([]))
+
+    def test_the_bootstrap_source_is_distinct_from_owner_directed(self):
+        self.assertNotEqual(BOOTSTRAP_SOURCE, "owner-directed")
+        self.assertNotIn("owner-directed", commit_message(["finance-and-tax.md"]))
+
+    def test_the_resume_commit_stays_owner_directed_and_reviewable(self):
+        # the guard: migrating real content is not bootstrapping, and must not be relabelled
+        self.assertIn("instruction-source: owner-directed", resume_message(["finance-and-tax.md"]))
+        self.assertNotIn(BOOTSTRAP_SOURCE, resume_message(["finance-and-tax.md"]))
+
+
+class TestDetailOf(unittest.TestCase):
+    """One copy of the git-detail expression in this module, not three inlined ones.
+
+    It is not `hub_commit.detail_of`: `hub_commit` imports `hub_init`, so importing it
+    back is a cycle, and that function is typed over `hub_remote.GitResult` while
+    everything here is a `subprocess.CompletedProcess`.
+    """
+
+    def result(self, code=1, out="", err=""):
+        return subprocess.CompletedProcess(["git"], code, out, err)
+
+    def test_the_last_line_of_stderr_wins(self):
+        detail = self.result(err="warning: something\nfatal: the real reason\n")
+        self.assertEqual(detail_of(detail), "fatal: the real reason")
+
+    def test_stdout_is_the_fallback(self):
+        self.assertEqual(detail_of(self.result(out="said this\n")), "said this")
+
+    def test_silence_falls_back_to_the_exit_code(self):
+        self.assertEqual(detail_of(self.result(code=128)), "exit 128")
+
+    def test_it_has_not_drifted_from_hub_commits_copy(self):
+        # the obligation the docstring takes on, made checkable: two functions that must
+        # produce the same sentence, over the shapes git actually emits
+        from scripts.hub_commit import detail_of as commit_detail_of
+        from scripts.hub_remote import GitResult
+
+        for code, out, err in (
+            (1, "", "warning: something\nfatal: the real reason\n"),
+            (1, "said this\n", ""),
+            (128, "", ""),
+            (1, "out\n", "err\n"),
+        ):
+            with self.subTest(code=code, out=out, err=err):
+                self.assertEqual(
+                    detail_of(self.result(code, out, err)),
+                    commit_detail_of(GitResult(code, out, err)),
+                )
+
+    def test_git_ok_reports_through_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HubInitError) as caught:
+                git_ok(["-C", tmp, "rev-parse", "--verify", "HEAD"], "git", "reading HEAD")
+        self.assertNotIn("\n", str(caught.exception))
+        self.assertIn("reading HEAD failed:", str(caught.exception))
 
 
 class TestMain(unittest.TestCase):

@@ -36,7 +36,12 @@ safely off-box. Nothing is leaking, and the assistant still works:
     directory is version-controlled.
 
 Making any of those fatal converts degraded knowledge into a total assistant outage,
-which is the trade this design explicitly refuses.
+which is the trade this design explicitly refuses. That refusal is enforced rather than
+intended: `durability_report` wraps the whole warning half in a catch-all, so an
+*unexpected* exception on that path — the class of bug a stored naive timestamp used to
+be — degrades to a warning and exit 0 instead of propagating out of `ExecStartPre`. The
+fatal half is pointedly left outside that wrapper: a leak check that cannot answer must
+stay unverified-and-fatal, never be softened into a warning.
 
 Not a no-op, by construction
 ----------------------------
@@ -596,6 +601,44 @@ def inspect_hub(
     )
 
 
+def durability_report(
+    target: HubTarget,
+    runner: GitRunner,
+    now: datetime,
+    grace_seconds: float = REMOTE_GRACE_SECONDS,
+) -> tuple[list[str], list[str]]:
+    """(notes, warnings) for the WARNING half of the split. **Never raises.**
+
+    The catch-all is the point, and it is deliberately not a `try` around the whole of
+    `assess()`. Each individual reader below already degrades correctly for the failures
+    it anticipates — a git that hangs, a marker that will not parse — and every one of
+    those has a test. This is the backstop for the failure nobody anticipated: an
+    exception type the readers do not catch, raised somewhere on the durability path.
+    `ExecStartPre` failure blocks service start and `StartLimitBurst=5` makes five of
+    those permanent, so the class of bug that reaches here — a `TypeError` from a stored
+    timestamp, an unexpected `AttributeError` in a future reader — would convert
+    "knowledge is not backed up" into "the assistant is gone". That is the exact trade
+    the fatal/warning split exists to refuse, and it must not be reachable by accident.
+
+    The fatal path gets **no** such treatment, and must not: `fatal_problems`,
+    `hub_checkout_problems` and `origin_credential_violations` stay outside it, so a leak
+    check that cannot answer is still an unverified-and-therefore-fatal finding rather
+    than a warning. Failing open on durability is safe; failing open on a leak is the one
+    thing this module exists to prevent.
+    """
+    hub = target.path if target.path and not target.problem else None
+    try:
+        state = inspect_hub(hub, runner) if hub is not None else HubState()
+        return notes_for(hub, state), warnings_for(hub, state, now, grace_seconds)
+    except Exception as e:  # noqa: BLE001 — see the docstring: this is the backstop
+        return [], [
+            f"the durability checks could not be completed ({type(e).__name__}: {e}) — this "
+            f"is a bug, and it is reported as a warning on purpose: nothing here can leak, "
+            f"so it must not be able to block service start. The backup state of "
+            f"{hub or 'the hub store'} is UNKNOWN until it is fixed; run `make doctor`"
+        ]
+
+
 def assess(
     now: datetime,
     runner: GitRunner = default_git_runner,
@@ -635,18 +678,13 @@ def assess(
 
     # A refused hub path is not inspected: the warnings describe a store that must not
     # be used at all, and reading it would only bury the fatal finding in noise.
-    state = inspect_hub(target.path, runner) if target.path and not target.problem else HubState()
-    notes = notes_for(target.path if not target.problem else None, state)
+    notes, warnings = durability_report(target, runner, now)
     if not secret_files:
         notes.append(
             f"no local secret files in {secrets_dir} — fine for a managed-connector-only "
             f"setup; credentials.json perms are still checked"
         )
-    return target, Findings(
-        tuple(fatal),
-        tuple(warnings_for(target.path, state, now)),
-        tuple(notes),
-    )
+    return target, Findings(tuple(fatal), tuple(warnings), tuple(notes))
 
 
 def report(target: HubTarget, findings: Findings) -> int:

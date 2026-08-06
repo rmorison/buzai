@@ -1,0 +1,151 @@
+"""The systemd unit template is a contract, and these tests hold it to it.
+
+Four modules and the setup docs all state that the push backlog and the review
+dispositions ref are "retried at service start", and that the remote's PRIVATE verdict is
+"re-verified at service start". None of it was wired: the unit ran only
+`secrets_preflight.py`, which is read-only and WARN-only. The real retry was the next
+successful hub write or a hand-run `make hub-push`, and a cached PRIVATE verdict survived
+a restart unrefreshed — so a repository flipped to public through a web UI, clone URL
+unchanged, could be pushed to for an hour after a restart that was supposed to re-check.
+
+A documented guarantee nothing implements is worse than no guarantee: it is the reason
+nobody goes looking. So the wiring is asserted here, against the real template file, and
+so is the thing a string match would miss — that the flags the unit passes are flags
+those scripts actually accept.
+
+Verified against the unfixed template: every test in
+`TestTheServiceStartGuaranteesAreWired` failed, because the file contained exactly one
+`ExecStartPre=` line and no `ExecStartPost=` line at all.
+"""
+
+import unittest
+from pathlib import Path
+
+from scripts.hub_commit import build_parser as commit_parser
+from scripts.hub_review import build_parser as review_parser
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TEMPLATE = REPO_ROOT / "deploy" / "claude-remote.service.template"
+
+# systemd's default. The start job now spans a preflight, a privacy probe and two
+# pushes, so a unit that keeps the default can have a *running* assistant killed for
+# being slow — which is the opposite of what these lines are for.
+SYSTEMD_DEFAULT_START_TIMEOUT = 90
+
+
+def directives(name: str) -> list[str]:
+    """Every value of `name=` in the unit, in file order, comments excluded."""
+    return [
+        line.split("=", 1)[1].strip()
+        for line in TEMPLATE.read_text().splitlines()
+        if line.strip().startswith(f"{name}=")
+    ]
+
+
+class TestTheServiceStartGuaranteesAreWired(unittest.TestCase):
+    def setUp(self):
+        self.pre = directives("ExecStartPre")
+        self.post = directives("ExecStartPost")
+
+    # --- the privacy verdict is refreshed, and before anything pushes --------------
+
+    def test_the_preflight_still_runs_first_and_can_still_block_start(self):
+        # the guard: the fatal leak gate must not have been softened by the new lines
+        self.assertTrue(self.pre[0].endswith("scripts/secrets_preflight.py"), self.pre)
+        self.assertFalse(self.pre[0].startswith("-"), "the leak gate must be able to fail start")
+
+    def test_the_privacy_verdict_is_re_verified(self):
+        self.assertTrue(
+            any(p.endswith("scripts/hub_remote.py") for p in self.pre),
+            f"nothing re-verifies the remote at start: {self.pre}",
+        )
+
+    def test_the_re_verification_cannot_block_start(self):
+        refresh = next(p for p in self.pre if p.endswith("scripts/hub_remote.py"))
+        self.assertTrue(refresh.startswith("-"), "a 'do not push' answer must not end the service")
+
+    def test_it_is_an_ExecStartPre_so_it_precedes_every_push(self):
+        # ordering is the whole point: a push must never run against an unrefreshed verdict
+        self.assertTrue(any("hub_remote.py" in p for p in self.pre))
+        self.assertFalse(any("hub_remote.py" in p for p in self.post))
+
+    # --- the backlogs are drained -------------------------------------------------
+
+    def test_the_push_backlog_is_retried(self):
+        self.assertTrue(
+            any("hub_commit.py --retry-push" in p for p in self.post),
+            f"nothing drains the push backlog at start: {self.post}",
+        )
+
+    def test_the_notes_ref_is_pushed(self):
+        self.assertTrue(
+            any("hub_review.py --push-notes" in p for p in self.post),
+            f"nothing pushes the review dispositions at start: {self.post}",
+        )
+
+    def test_the_notes_push_is_chained_behind_the_commit_push(self):
+        # `make hub-push` chains with && deliberately: a note must never reach the remote
+        # ahead of the correction commit it refers to
+        line = next(p for p in self.post if "--retry-push" in p)
+        self.assertIn("--push-notes", line, "the two pushes must be one chained command")
+        self.assertLess(line.index("--retry-push"), line.index("--push-notes"))
+        self.assertIn("&&", line)
+
+    def test_no_push_can_fail_the_unit(self):
+        for line in self.post:
+            self.assertTrue(line.startswith("-"), f"ExecStartPost without '-': {line}")
+
+    # --- the start job has room for what it now does ------------------------------
+
+    def test_the_start_timeout_is_raised_above_the_default(self):
+        values = directives("TimeoutStartSec")
+        self.assertEqual(len(values), 1, values)
+        seconds = int(values[0].rstrip("s"))
+        self.assertGreater(seconds, SYSTEMD_DEFAULT_START_TIMEOUT)
+
+
+class TestTheUnitOnlyNamesThingsThatExist(unittest.TestCase):
+    """A string match in the template proves nothing on its own — these calls have to be
+    real. A renamed flag would otherwise leave the unit silently doing nothing again."""
+
+    def commands(self) -> list[str]:
+        return directives("ExecStartPre") + directives("ExecStartPost") + directives("ExecStart")
+
+    def scripts_named(self) -> set[str]:
+        found = set()
+        for line in self.commands():
+            for token in line.split():
+                if token.endswith(".py"):
+                    found.add(token.rsplit("/", 1)[-1])
+        return found
+
+    def test_every_script_the_unit_runs_exists(self):
+        named = self.scripts_named()
+        self.assertTrue(named)
+        for name in named:
+            self.assertTrue((REPO_ROOT / "scripts" / name).is_file(), name)
+
+    def test_retry_push_is_a_flag_hub_commit_accepts(self):
+        self.assertTrue(commit_parser().parse_args(["--retry-push"]).retry_push)
+
+    def test_push_notes_is_a_flag_hub_review_accepts(self):
+        self.assertTrue(review_parser().parse_args(["--push-notes"]).push_notes)
+
+    def test_the_interpreter_is_the_pinned_venv_not_the_system_python(self):
+        for line in self.commands():
+            for token in line.split():
+                if token.endswith(".py"):
+                    self.assertIn("/buzai/.venv/bin/python", line, line)
+                    break
+
+    def test_every_path_is_rewritable_by_make_service_install(self):
+        # `make service-install WORKDIR=…` runs `sed 's|%h/buzai|$(WORKDIR)|g'`, so a
+        # checkout path written any other way silently keeps pointing at ~/buzai
+        for line in self.commands():
+            for token in line.split():
+                if token.endswith(".py"):
+                    self.assertIn("%h/buzai/", token)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,6 +33,7 @@ from scripts.hub_remote import (
     default_cache_path,
     default_git_runner,
     default_host_resolver,
+    helper_shape,
     main,
     no_config_injection,
     origin_credential_violations,
@@ -784,6 +786,121 @@ class TestCacheIo(HubTempCase):
         bare.mkdir()
         self.assertFalse(write_cache(default_cache_path(bare), CacheEntry(SSH_URL, PRIVATE, NOW)))
         self.assertFalse((bare / ".git").exists())
+
+
+class TestTwoSessionsWritingTheCacheAtOnce(HubTempCase):
+    """PLANT: two sessions verifying the same hub concurrently, interleaved for real.
+
+    `--spawn=same-dir` is what the unit runs, so two Claude sessions in one directory
+    sharing one hub is the normal case, not an exotic one. The write is
+    write-temp-then-replace; with a single fixed temp name the SECOND writer overwrites
+    the FIRST writer's temp file before the first has replaced, so the first's
+    `replace()` fails on a file that is no longer there — it reports failure while the
+    cache silently holds the *other* session's entry.
+
+    The interleaving is planted by intercepting the first writer's `replace()` exactly
+    once and running the second writer to completion inside it. That is the real race,
+    made deterministic; nothing is simulated.
+
+    Verified against the unfixed version (`temp = path.with_suffix('.tmp')`): writer A
+    returned False and the cache held B's PUBLIC-URL entry instead of A's.
+    """
+
+    A = CacheEntry("ssh://a.invalid/a.git", PRIVATE, NOW)
+    B = CacheEntry("ssh://b.invalid/b.git", PRIVATE, NOW + timedelta(minutes=1))
+
+    def test_neither_session_loses_its_write_to_the_others_temp_file(self):
+        path = default_cache_path(self.hub)
+        original = Path.replace
+        other: list[bool] = []
+        entered: list[bool] = []
+
+        second_pid = os.getpid() + 1
+
+        def replace_once(self_path, target):
+            if not entered:
+                entered.append(True)  # set BEFORE recursing, or the nested write re-enters
+                # The second session runs entirely inside the first one's window, and is a
+                # separate PROCESS — patching getpid is what makes these two sessions
+                # rather than one function called twice.
+                with unittest.mock.patch("os.getpid", return_value=second_pid):
+                    other.append(write_cache(path, self.B))
+            return original(self_path, target)
+
+        with unittest.mock.patch.object(Path, "replace", replace_once):
+            first = write_cache(path, self.A)
+
+        self.assertEqual(other, [True], "the second session's write failed")
+        self.assertTrue(first, "the first session's write failed — its temp file was clobbered")
+        # observable end state: the last writer to replace() wins, and it is intact
+        self.assertEqual(read_cache(path), self.A)
+
+    def test_no_temp_file_is_left_behind(self):
+        path = default_cache_path(self.hub)
+        write_cache(path, self.A)
+        self.assertEqual([p.name for p in path.parent.iterdir()], [path.name])
+
+    def test_the_temp_name_is_scoped_to_this_process(self):
+        # the mechanism, stated once: hub_commit.atomic_write's rule, replicated here
+        # because hub_commit imports this module and importing it back is a cycle
+        path = default_cache_path(self.hub)
+        seen = []
+        original = Path.replace
+
+        def capture(self_path, target):
+            seen.append(self_path.name)
+            return original(self_path, target)
+
+        with unittest.mock.patch.object(Path, "replace", capture):
+            write_cache(path, self.A)
+        self.assertEqual(seen, [f"{path.name}.buzai-tmp.{os.getpid()}"])
+
+
+class TestTheCredentialHelperFindingIsCredentialFree(HubTempCase):
+    """PLANT: an inline shell credential helper carrying a live token.
+
+    `credential.helper = !f() { echo password=ghp_…; }; f` is a documented git idiom, and
+    the service sends stderr to the journal — so a finding that interpolated the helper's
+    VALUE would write the token to the logs in plaintext. The check meant to protect the
+    public origin would be the thing that leaked a credential.
+
+    Verified against the unfixed version (`{helper!r}` on the raw value): the token
+    appeared verbatim in the violation string.
+    """
+
+    TOKEN = "ghp_ThisIsAFakeTokenForTestsOnly0123456789"
+    INLINE = "!f() { echo password=" + TOKEN + "; }; f"
+
+    def violations(self, helper):
+        return origin_credential_violations(self.repo, ScriptedGit(helpers=[helper]), 5)
+
+    def test_the_token_never_reaches_the_message(self):
+        problems = self.violations(self.INLINE)
+        self.assertEqual(len(problems), 1)
+        self.assertNotIn(self.TOKEN, problems[0])
+        self.assertNotIn("password=", problems[0])
+        self.assertIn("<inline shell helper>", problems[0])
+
+    def test_the_violation_is_still_reported(self):
+        # the redaction must not become a way of missing the finding
+        problems = self.violations(self.INLINE)
+        self.assertIn("credential helper", problems[0])
+        self.assertIn("--unset-all credential.helper", problems[0])
+
+    def test_a_named_helper_is_still_named(self):
+        self.assertIn("(store)", self.violations("store")[0])
+
+    def test_arguments_after_the_helper_name_are_dropped(self):
+        # `/opt/helper --token=…` is a value too, and the first token identifies it
+        problems = self.violations(f"/opt/helper --token={self.TOKEN}")
+        self.assertNotIn(self.TOKEN, problems[0])
+        self.assertIn("(/opt/helper)", problems[0])
+
+    def test_helper_shape_is_pure_and_total(self):
+        self.assertEqual(helper_shape("store"), "store")
+        self.assertEqual(helper_shape("  osxkeychain  "), "osxkeychain")
+        self.assertEqual(helper_shape("!anything at all"), "<inline shell helper>")
+        self.assertEqual(helper_shape("   "), "<empty>")
 
 
 # --- the public origin must stay unable to push ----------------------------------

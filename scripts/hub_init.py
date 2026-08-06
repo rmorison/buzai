@@ -52,7 +52,10 @@ a restore-by-clone with the rest of the history.
 
 Format: UTF-8 text. Blank lines and `#` comment lines are ignored; the first
 remaining line is an ISO-8601 timestamp with an explicit UTC offset. Use
-`render_marker()` / `parse_marker()` rather than re-deriving the format.
+`render_marker()` / `parse_marker()` rather than re-deriving the format. The offset is
+*required*, not conventional: `parse_marker` rejects a naive timestamp as a `ValueError`
+so it cannot reach a subtraction against an aware `now` and raise `TypeError` out of a
+durability check on the `ExecStartPre` path — see `parse_marker`.
 """
 
 from __future__ import annotations
@@ -95,6 +98,20 @@ MARKER = Path(".buzai") / "remote-expected"
 # the point, since the alternative (infer it from `git ls-files`) silently exempted any
 # personal file that had already been staged or committed.
 SCAFFOLDS: frozenset[str] = frozenset({"README.md", "_example-hub.md"})
+
+# The `instruction-source` the SEED commit carries, and the reason it is not
+# `owner-directed`. The owner did run `make hub-init`, so `owner-directed` was true — and
+# useless: it made the store's own bootstrap indistinguishable, by source alone, from
+# knowledge the assistant recorded at the owner's request, which is why the seed had to be
+# excluded from the review queue by being the parentless commit instead. This value says
+# what the commit *is*: scaffolding this script wrote, never something awaiting a verdict.
+#
+# `hub_review`'s root-commit exclusion still carries that job today and is unchanged — a
+# distinct source is the groundwork for retiring it, not a replacement made here. Note the
+# asymmetry with `resume_message`, which stays `owner-directed` deliberately: that commit
+# migrates the owner's REAL hub content out of the public checkout, and content the owner
+# should see is content the owner should be able to review.
+BOOTSTRAP_SOURCE = "store-bootstrap"
 
 
 class HubInitError(Exception):
@@ -152,12 +169,30 @@ def git(
         ) from e
 
 
+def detail_of(result: subprocess.CompletedProcess) -> str:
+    """The most useful single line of a git call, for a message a human will read.
+
+    The one copy in this module: the same expression was inlined at three call sites
+    below, which is how `hub_commit` and `hub_review` grew two near-identical private
+    helpers that then drifted apart.
+
+    It is not `hub_commit.detail_of`, and cannot be, for two independent reasons.
+    `hub_commit` imports `hub_init` (`DEFAULT_BRANCH`) and `hub_remote`, which imports
+    `hub_init` too, so an import in this direction is a cycle that fails at interpreter
+    start rather than at runtime. And that function is typed over `hub_remote.GitResult`,
+    while everything here is a `subprocess.CompletedProcess`: passing one for the other
+    would type-check as a lie even if the cycle did not exist. Keeping the two in step is
+    a one-line obligation; the alternative was three copies inside this file alone.
+    """
+    text = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+    return text.splitlines()[-1]
+
+
 def git_ok(args: list[str], git_bin: str, what: str, timeout: float = GIT_TIMEOUT_SECONDS) -> str:
     """Run git and require success. Returns stdout; raises `HubInitError` on failure."""
     r = git(args, git_bin, timeout)
     if r.returncode != 0:
-        detail = (r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}").splitlines()[-1]
-        raise HubInitError(f"{what} failed: {detail}")
+        raise HubInitError(f"{what} failed: {detail_of(r)}")
     return r.stdout
 
 
@@ -257,11 +292,29 @@ def parse_marker(text: str) -> datetime:
 
     Raises `ValueError` on anything unparseable — a garbled marker must surface as a
     problem, never be silently read as "no warning needed".
+
+    A timestamp with **no UTC offset** is unparseable for this purpose, and that is the
+    point of the second check. The documented format carries an offset (`render_marker`
+    always writes one), but the file is plain text inside the owner's own repo: a
+    hand-edit, a restore from an older format, or a future writer can leave it naive. The
+    only consumers subtract it from an aware `now` — `secrets_preflight.stale_remote_warning`
+    on the systemd `ExecStartPre` path — and mixing naive with aware raises `TypeError`,
+    which is not what any caller catches. That exception would escape a *durability*
+    check and fail `ExecStartPre`; with `StartLimitBurst=5` the unit ends `failed`, so a
+    marker typo would end the assistant. Rejected here, it is one more `ValueError` the
+    readers already handle as "marker unreadable" -> a warning. This is the rule
+    `hub_remote.read_cache` already applies to its own stored timestamp.
     """
     for line in text.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            return datetime.fromisoformat(line)
+            stamp = datetime.fromisoformat(line)
+            if stamp.tzinfo is None:
+                raise ValueError(
+                    f"marker timestamp {line!r} has no UTC offset — the format requires one, "
+                    f"and a naive timestamp cannot be compared with the current time"
+                )
+            return stamp
     raise ValueError("marker file has no timestamp line")
 
 
@@ -313,8 +366,9 @@ other than `~/hubs`, clone it there and set `{ENV_VAR}` in the service unit.
 def commit_message(migrated: Iterable[str]) -> str:
     """Initial-commit message. Pure.
 
-    Carries the instruction-source trailer from the start: the owner ran `make
-    hub-init`, so this commit is owner-directed and history says so from commit one.
+    Carries the instruction-source trailer from the start, and it is `BOOTSTRAP_SOURCE`
+    rather than `owner-directed`: history should say this commit is the store's own
+    scaffolding, not knowledge recorded at the owner's request. See `BOOTSTRAP_SOURCE`.
     """
     moved = list(migrated)
     body = "Seeded from the buzai public scaffolds by `make hub-init`."
@@ -323,7 +377,7 @@ def commit_message(migrated: Iterable[str]) -> str:
             f"\n\nMoved {len(moved)} existing hub file(s) out of the public checkout:\n"
             + "\n".join(f"  - {m}" for m in moved)
         )
-    return f"Initialize hub store\n\n{body}\n\ninstruction-source: owner-directed\n"
+    return f"Initialize hub store\n\n{body}\n\ninstruction-source: {BOOTSTRAP_SOURCE}\n"
 
 
 def resume_message(migrated: Iterable[str]) -> str:
@@ -469,8 +523,9 @@ def _resume(hub: Path, source: Path, migrate: list[str], git_bin: str) -> InitRe
             "git commit",
         )
     elif staged.returncode != 0:
-        detail = (staged.stderr.strip() or f"exit {staged.returncode}").splitlines()[-1]
-        raise HubInitError(f"cannot tell what is staged in {hub}, so nothing was moved: {detail}")
+        raise HubInitError(
+            f"cannot tell what is staged in {hub}, so nothing was moved: {detail_of(staged)}"
+        )
     _remove_migrated(source, migrate, git_bin)
     return InitResult(
         "resumed", hub, [], migrate, commit_count(hub, git_bin), remotes(hub, git_bin)
@@ -498,11 +553,10 @@ def _unstage_migrated(source: Path, migrated: Iterable[str], git_bin: str) -> li
         return []
     removed = git(["-C", str(source), "rm", "--cached", "-f", "-q", "--", *staged], git_bin)
     if removed.returncode != 0:
-        detail = (removed.stderr.strip() or f"exit {removed.returncode}").splitlines()[-1]
         raise HubInitError(
             "the hub repo was created and committed, but these files are still in the "
             f"public checkout's git index — remove them by hand with `git -C {source} rm "
-            f"--cached -f -- {' '.join(staged)}`: {detail}"
+            f"--cached -f -- {' '.join(staged)}`: {detail_of(removed)}"
         )
     return staged
 
