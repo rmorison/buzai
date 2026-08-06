@@ -29,6 +29,19 @@ one more:
     helper configured anywhere can run.
   * `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` -> `os.devnull` — `~/.gitconfig` and
     `/etc/gitconfig` contribute no helper, no `insteadOf` rewrite, nothing.
+  * `GIT_CONFIG_COUNT` + every `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pair,
+    `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` **unset** — these are config *injection*
+    channels that bypass the two files above entirely. One `url.<base>.insteadOf` entry
+    rewrites the probe URL to somewhere readable (a private repo then reads as public,
+    or worse: an attacker-chosen host answers for it), and the same channel installs a
+    credential helper that `-c credential.helper=` alone cannot cancel, because a later
+    `-c` on the command line is not what the pairs go through. The pairs are enumerated
+    from the environment rather than assumed to be few: the count is arbitrary.
+  * `http_proxy` / `https_proxy` / `all_proxy` (both cases), `GIT_PROXY_COMMAND`
+    **unset**, plus `-c http.proxy=` — a proxy answers *for* the host, so it decides
+    what the probe sees; a proxy that returns 200 for everything makes every repo look
+    public (a refusal, survivable) and one that returns a canned error page makes every
+    repo look private (the failure this module exists to prevent).
   * `-C <neutral dir>` + `GIT_CEILING_DIRECTORIES` — the probe runs outside any repo,
     so no *repo-local* config applies either (the checkout's would otherwise).
   * `GIT_TERMINAL_PROMPT=0` and `GIT_ASKPASS`/`SSH_ASKPASS` **unset** — git cannot ask
@@ -140,6 +153,12 @@ LOCAL_ONLY = "local-only"
 # Substrings that make a *failed* probe definitively "not anonymously readable".
 # Everything not listed here stays UNKNOWN, so the fail-closed direction is the default
 # and a new git error message can only ever cost a refusal, never grant one.
+#
+# Every entry must be phrasing only git or a git host produces. A bare "not found" was
+# one of these and is deliberately gone: any HTML error body — a proxy, a captive
+# portal, a load balancer — that happens to contain those two words would otherwise be
+# read as proof that the repository is private, which is the one direction this module
+# must never guess in. "repository not found" cannot be reached that generically.
 DENIED_PATTERNS = (
     "terminal prompts disabled",
     "could not read username",
@@ -147,7 +166,7 @@ DENIED_PATTERNS = (
     "authentication failed",
     "permission denied",
     "access denied",
-    "not found",
+    "repository not found",
     "returned error: 401",
     "returned error: 403",
     "returned error: 404",
@@ -164,6 +183,29 @@ ANON_SSH = (
 )
 AUTH_SSH = "ssh -o BatchMode=yes -o ConnectTimeout=10"
 LOCAL_ENV: dict[str, str | None] = {"GIT_TERMINAL_PROMPT": "0"}
+
+# Environment channels the anonymous probe must not inherit: config injection that
+# bypasses GIT_CONFIG_GLOBAL/SYSTEM entirely, and proxies, which decide who answers for
+# the host. Each is *unset* rather than emptied — an empty `GIT_CONFIG_PARAMETERS` is
+# parsed, an absent one is not.
+SUPPRESSED_VARS = (
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_PROXY_COMMAND",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+)
+
+# `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` come in numbered pairs with no bound on
+# `<n>`, so they are enumerated from the environment. Dropping `GIT_CONFIG_COUNT` alone
+# would be enough for today's git; matching the pairs too means the suppression does not
+# depend on that implementation detail staying true.
+CONFIG_PAIR_VAR = re.compile(r"^GIT_CONFIG_(?:KEY|VALUE)_\d+$")
 
 # `host:path`, git's scp-like remote syntax. The `(?!//)` keeps `scheme://…` out.
 SCP_LIKE = re.compile(r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?!//)(?P<path>.+)$")
@@ -303,9 +345,18 @@ def anonymous_urls(url: str) -> list[str]:
 # --- probing and the decision ------------------------------------------------------
 
 
-def anonymous_env(neutral_dir: str) -> dict[str, str | None]:
-    """The credential-suppressing environment. Pure. See the module docstring."""
-    return {
+def anonymous_env(
+    neutral_dir: str, environ: Mapping[str, str] | None = None
+) -> dict[str, str | None]:
+    """The credential- and config-suppressing environment overlay. See the module docstring.
+
+    Pure given `environ` (the parent environment, `os.environ` by default). It is read
+    only to *enumerate* what must be unset: the `GIT_CONFIG_KEY_<n>`/`_VALUE_<n>` pairs
+    are numbered, so the set of names to suppress cannot be written down in advance.
+    A `None` value means unset in the child, which is what `default_git_runner` does.
+    """
+    source = os.environ if environ is None else environ
+    env: dict[str, str | None] = {
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS": None,
         "SSH_ASKPASS": None,
@@ -316,12 +367,33 @@ def anonymous_env(neutral_dir: str) -> dict[str, str | None]:
         "GIT_CEILING_DIRECTORIES": neutral_dir,
         "GIT_SSH_COMMAND": ANON_SSH,
     }
+    for name in SUPPRESSED_VARS:
+        env[name] = None
+    for name in source:
+        if CONFIG_PAIR_VAR.match(name):
+            env[name] = None
+    return env
 
 
 def anonymous_probe(url: str, runner: GitRunner, timeout: float) -> GitResult:
-    """Read `url`'s ref list as a stranger would. Success means the repo is public."""
+    """Read `url`'s ref list as a stranger would. Success means the repo is public.
+
+    The two `-c` resets are belt to the environment's braces: a helper or a proxy that
+    reached git through a channel `anonymous_env` does not know about is still cleared
+    here, and command-line `-c` outranks every config file.
+    """
     neutral = tempfile.gettempdir()
-    args = ["-C", neutral, "-c", "credential.helper=", "ls-remote", url, "HEAD"]
+    args = [
+        "-C",
+        neutral,
+        "-c",
+        "credential.helper=",
+        "-c",
+        "http.proxy=",
+        "ls-remote",
+        url,
+        "HEAD",
+    ]
     return runner(args, anonymous_env(neutral), timeout)
 
 

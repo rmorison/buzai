@@ -9,6 +9,7 @@ from pathlib import Path
 
 from scripts.hub_init import (
     MARKER,
+    SCAFFOLDS,
     HubInitError,
     commit_message,
     initialize,
@@ -18,7 +19,7 @@ from scripts.hub_init import (
     plan_migration,
     plan_seed,
     render_marker,
-    tracked_scaffolds,
+    tracked_paths,
 )
 
 NOW = datetime(2026, 8, 5, 12, 30, 0, tzinfo=UTC)
@@ -92,10 +93,24 @@ class HubTempCase(unittest.TestCase):
         self._tmp.cleanup()
 
     def tracked(self) -> set[str]:
-        return tracked_scaffolds(self.source)
+        return tracked_paths(self.source)
 
-    def init(self, hub=None, tracked=None, now=NOW, git_bin="git"):
-        return initialize(hub or self.hub, self.source, tracked or self.tracked(), now, git_bin)
+    def indexed(self) -> set[str]:
+        """What the public checkout's git index holds, repo-relative."""
+        return set(git("-C", str(self.checkout), "ls-files").split())
+
+    def track(self, rel: str, body: str, commit: bool = True) -> Path:
+        """PLANT: a personal hub file the public checkout already tracks."""
+        path = self.source / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        git("-C", str(self.checkout), "add", "--", f"hubs/{rel}")
+        if commit:
+            git("-C", str(self.checkout), "commit", "-q", "-m", f"track {rel}")
+        return path
+
+    def init(self, hub=None, now=NOW, git_bin="git", scaffolds=SCAFFOLDS):
+        return initialize(hub or self.hub, self.source, now, git_bin, scaffolds)
 
     def committed(self, hub=None) -> set[str]:
         out = git("-C", str(hub or self.hub), "ls-tree", "-r", "--name-only", "HEAD")
@@ -105,12 +120,19 @@ class HubTempCase(unittest.TestCase):
         return int(git("-C", str(hub or self.hub), "rev-list", "--count", "HEAD").strip())
 
 
+class TestScaffoldSet(unittest.TestCase):
+    """The scaffold set is named, not inferred — the whole point of the fix."""
+
+    def test_exactly_the_two_files_the_public_repo_ships(self):
+        self.assertEqual(set(SCAFFOLDS), {"README.md", "_example-hub.md"})
+
+
 class TestPlanSeed(unittest.TestCase):
     def test_public_readme_is_not_seeded(self):
         # the hub store gets its own README; the public one describes the template dir
-        self.assertEqual(plan_seed({"README.md", "_example-hub.md"}), ["_example-hub.md"])
+        self.assertEqual(plan_seed(), ["_example-hub.md"])
 
-    def test_future_scaffolds_are_seeded_without_a_code_change(self):
+    def test_a_new_scaffold_is_seeded_from_the_named_set(self):
         self.assertEqual(
             plan_seed({"README.md", "_example-hub.md", "CONVENTIONS.md"}),
             ["CONVENTIONS.md", "_example-hub.md"],
@@ -119,32 +141,45 @@ class TestPlanSeed(unittest.TestCase):
 
 class TestPlanMigration(HubTempCase):
     def test_scaffolds_are_not_migrated(self):
-        self.assertEqual(plan_migration(self.source, self.tracked()), [])
+        self.assertEqual(plan_migration(self.source), [])
 
     def test_untracked_files_are_migrated_including_folder_hubs(self):
         (self.source / "finance-and-tax.md").write_text("real content\n")
         (self.source / "trip").mkdir()
         (self.source / "trip" / "notes.md").write_text("more real content\n")
         self.assertEqual(
-            plan_migration(self.source, self.tracked()),
+            plan_migration(self.source),
             ["finance-and-tax.md", "trip/notes.md"],
         )
 
+    def test_tracked_personal_content_is_migrated_not_exempted(self):
+        # PLANT: the hole. A committed hubs/personal.md used to read as "scaffold" —
+        # so the file sitting in the PUBLIC repo was the one thing migration skipped.
+        self.track("personal.md", "# Personal\n")
+        self.assertIn("personal.md", plan_migration(self.source))
+
+    def test_tracked_content_in_a_subdirectory_is_migrated_too(self):
+        self.track("trip/notes.md", "# Trip\n")
+        self.assertIn("trip/notes.md", plan_migration(self.source))
+
     def test_missing_source_directory_is_not_an_error(self):
-        self.assertEqual(plan_migration(self.root / "absent", self.tracked()), [])
+        self.assertEqual(plan_migration(self.root / "absent"), [])
 
 
-class TestTrackedScaffolds(HubTempCase):
-    def test_reports_tracked_files_only(self):
-        (self.source / "finance-and-tax.md").write_text("real content\n")
-        self.assertEqual(self.tracked(), {"README.md", "_example-hub.md"})
+class TestTrackedPaths(HubTempCase):
+    def test_reports_what_git_tracks_including_personal_content(self):
+        # tracked is NOT scaffold: this answers "what does the public repo already
+        # carry", which only chooses the remedy
+        (self.source / "untracked.md").write_text("real content\n")
+        self.track("personal.md", "# Personal\n")
+        self.assertEqual(self.tracked(), {"README.md", "_example-hub.md", "personal.md"})
 
     def test_outside_a_checkout_fails_loudly(self):
-        # without git's answer we cannot tell a scaffold from personal content
+        # "git could not say" must never be reported as "the repo carries nothing"
         loose = self.root / "loose"
         loose.mkdir()
         with self.assertRaises(HubInitError):
-            tracked_scaffolds(loose)
+            tracked_paths(loose)
 
 
 class TestMarker(unittest.TestCase):
@@ -261,6 +296,55 @@ class TestMigration(HubTempCase):
         self.assertIn("finance-and-tax.md", body)
 
 
+class TestCommittedContentMigration(HubTempCase):
+    """PLANT: personal hub content the public repo has already COMMITTED under hubs/.
+
+    The exempt-because-tracked bug lived exactly here, and deleting the file from disk
+    would not have been enough: the index entry is what the public repo pushes.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.leak = self.track("personal.md", "# Personal\n")
+        self.result = self.init()
+
+    def test_it_is_migrated_into_the_hub_repo(self):
+        self.assertIn("personal.md", self.result.migrated)
+        self.assertEqual((self.hub / "personal.md").read_text(), "# Personal\n")
+        self.assertIn("personal.md", self.committed())
+
+    def test_it_is_gone_from_the_public_working_tree(self):
+        self.assertFalse(self.leak.exists())
+
+    def test_it_is_gone_from_the_public_index(self):
+        self.assertNotIn("hubs/personal.md", self.indexed())
+
+    def test_the_scaffolds_are_left_alone_in_both(self):
+        self.assertEqual(
+            {p.relative_to(self.source).as_posix() for p in self.source.rglob("*") if p.is_file()},
+            {"README.md", "_example-hub.md"},
+        )
+        self.assertEqual(
+            self.indexed() & {"hubs/README.md", "hubs/_example-hub.md"},
+            {"hubs/README.md", "hubs/_example-hub.md"},
+        )
+
+
+class TestStagedContentMigration(HubTempCase):
+    """`git add`ed but never committed — the case `git rm --cached` refuses without -f."""
+
+    def setUp(self):
+        super().setUp()
+        self.leak = self.track("personal.md", "# Personal\n", commit=False)
+        self.result = self.init()
+
+    def test_it_is_migrated_and_de_indexed(self):
+        self.assertIn("personal.md", self.result.migrated)
+        self.assertEqual((self.hub / "personal.md").read_text(), "# Personal\n")
+        self.assertFalse(self.leak.exists())
+        self.assertNotIn("hubs/personal.md", self.indexed())
+
+
 class TestRefusals(HubTempCase):
     def test_non_empty_non_repo_directory_is_refused(self):
         self.hub.mkdir()
@@ -309,11 +393,11 @@ class TestErrorPaths(HubTempCase):
         self.assertFalse(self.hub.exists())
 
     def test_failure_after_git_init_rolls_the_repo_back(self):
-        # a scaffold git still tracks but that is missing from the working tree
+        # a named scaffold that is missing from the working tree
         (self.source / "_example-hub.md").unlink()
 
         with self.assertRaises(HubInitError) as cm:
-            self.init(tracked={"README.md", "_example-hub.md"})
+            self.init()
 
         self.assertIn("_example-hub.md", str(cm.exception))
         self.assertFalse(self.hub.exists())
@@ -324,7 +408,7 @@ class TestErrorPaths(HubTempCase):
         (self.source / "_example-hub.md").unlink()
 
         with self.assertRaises(HubInitError):
-            self.init(tracked={"README.md", "_example-hub.md"})
+            self.init()
 
         self.assertEqual(list(self.hub.iterdir()), [])  # nothing of ours left behind
         # the migration source is only deleted after a successful commit

@@ -16,6 +16,7 @@ from scripts.secrets_preflight import (
     HubTarget,
     _git_tracked,
     _repo_secret_candidates,
+    assess,
     backlog_warning,
     dirty_warning,
     enclosing_repo,
@@ -24,6 +25,7 @@ from scripts.secrets_preflight import (
     hub_checkout_problems,
     hub_content_problems,
     inspect_hub,
+    main,
     nested_repo_warning,
     notes_for,
     origin_credential_violations,
@@ -349,19 +351,80 @@ class TestHubContentInCheckout(unittest.TestCase):
         self.assertEqual(hub_checkout_problems(self.repo / "nope"), [])
 
     def test_unanswerable_is_reported_not_passed(self):
-        # a hubs/ directory that is not inside any git repo: git cannot say what is a
-        # scaffold, and "cannot tell" must never read as "clean"
+        # a hubs/ directory that is not inside any git repo: git cannot say what the
+        # public repo carries, and "cannot tell" must never read as "clean"
         outside = Path(self._tmp.name) / "loose-hubs"
         outside.mkdir()
         (outside / "x.md").write_text("x")
         probs = hub_checkout_problems(outside)
-        self.assertEqual(len(probs), 1)
-        self.assertIn("unverified", probs[0])
+        self.assertTrue(any("unverified" in p for p in probs))
+        self.assertTrue(any(str(outside / "x.md") in p for p in probs))
 
     def test_message_names_the_remedy(self):
-        probs = hub_content_problems(["finance.md"], Path("/repo/hubs"))
+        probs = hub_content_problems(["finance.md"], Path("/repo/hubs"), [])
         self.assertIn("/repo/hubs/finance.md", probs[0])
         self.assertIn("make hub-init", probs[0])
+
+    # --- the hole: content the public repo ALREADY tracks --------------------------
+
+    def _track(self, rel: str, body: str = "# Personal\n", commit: bool = True) -> Path:
+        """PLANT: personal hub content that is already in the public repo's index."""
+        path = self.hubs / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        git("-C", str(self.repo), "add", "--", f"hubs/{rel}")
+        if commit:
+            commit_all(self.repo, f"track {rel}")
+        return path
+
+    def test_tracked_personal_content_is_fatal_not_exempt(self):
+        # the check used to read "tracked under hubs/" as "scaffold", so the file
+        # sitting IN the public repo was the one thing it waved through
+        leak = self._track("personal.md")
+        probs = hub_checkout_problems(self.hubs)
+        self.assertEqual(len(probs), 1)
+        self.assertIn(str(leak), probs[0])
+
+    def test_the_tracked_message_names_git_rm_cached(self):
+        # deleting the file is not the whole remedy — the index entry is what pushes
+        leak = self._track("personal.md")
+        probs = hub_checkout_problems(self.hubs)
+        self.assertIn(f"git rm --cached {leak}", probs[0])
+        self.assertIn("PUBLIC repo already tracks", probs[0])
+
+    def test_staged_but_uncommitted_content_is_fatal_too(self):
+        leak = self._track("personal.md", commit=False)
+        probs = hub_checkout_problems(self.hubs)
+        self.assertEqual(len(probs), 1)
+        self.assertIn(f"git rm --cached {leak}", probs[0])
+
+    def test_tracked_content_in_a_subdirectory_is_found(self):
+        leak = self._track("trip/notes.md")
+        probs = hub_checkout_problems(self.hubs)
+        self.assertEqual(len(probs), 1)
+        self.assertIn(str(leak), probs[0])
+
+    def test_the_untracked_message_is_kept_for_untracked_content(self):
+        (self.hubs / "loose.md").write_text("# Loose\n")
+        probs = hub_checkout_problems(self.hubs)
+        self.assertEqual(len(probs), 1)
+        self.assertIn("make hub-init", probs[0])
+        self.assertNotIn("git rm --cached", probs[0])
+
+    def test_a_tracked_leak_reaches_the_fatal_list(self):
+        self._track("personal.md")
+        fatal = fatal_problems(
+            secret_files=[],
+            repo_secrets=[],
+            creds=self.repo / "absent.json",
+            hub_credentials=[],
+            hub_content=hub_checkout_problems(self.hubs),
+            hub_path_problem=None,
+            origin_violations=[],
+            is_tracked=lambda p: False,
+        )
+        self.assertEqual(len(fatal), 1)
+        self.assertIn("git rm --cached", fatal[0])
 
 
 # --- FATAL: the hub path itself (R3) ----------------------------------------------
@@ -767,6 +830,185 @@ class TestInspectHub(unittest.TestCase):
     def test_enclosing_repo_is_none_when_hub_is_its_own_repo_only(self):
         # asked from the parent, so the hub's own repo can never be the answer
         self.assertIsNone(enclosing_repo(self.hub, real_git))
+
+
+# --- the WIRING: assess() / main(), with the real composition ----------------------
+#
+# Every individual check above is well tested. `assess()` is what actually decides
+# whether the service starts, and until now nothing exercised it: a check composed with
+# the wrong constant, or dropped from the list entirely, would leave this whole file
+# green while the deployed preflight stopped catching leaks. That is the dead-no-op
+# failure class the module docstring warns about, one level up.
+#
+# So each test below plants ONE real violation under a tempdir, drives it through
+# `main()` -> `assess()` -> `report()`, and asserts the composed verdict. Delete any
+# line from `assess()`'s `fatal_problems(...)` call and the matching test fails.
+
+
+class TestAssessComposition(unittest.TestCase):
+    """A whole fake instance in a tempdir: never the real home, checkout, or secrets."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+        self.now = datetime.now(UTC)
+
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.checkout = make_repo(self.root / "checkout")
+        git("-C", str(self.checkout), "remote", "add", "origin", "https://example.invalid/b.git")
+        self.hubs = self.checkout / "hubs"
+        self.hubs.mkdir()
+        (self.hubs / "README.md").write_text("# scaffold\n")
+        (self.hubs / "_example-hub.md").write_text("# example\n")
+        self.env_dir = self.checkout / "deploy" / "env"
+        self.env_dir.mkdir(parents=True)
+        (self.env_dir / "email.env.example").write_text("IMAP_PASSWORD=CHANGEME\n")
+        commit_all(self.checkout, "scaffolds")
+
+        self.secrets = self.home / ".config" / "buzai" / "secrets"
+        self.secrets.mkdir(parents=True)
+        self.creds = self.home / ".claude" / ".credentials.json"
+        self.creds.parent.mkdir(parents=True)
+        self.creds.write_text("{}")
+        os.chmod(self.creds, 0o600)
+        self.hub_key = self.home / ".ssh" / "buzai-hub"
+        self.hub_key.parent.mkdir(parents=True)
+        self.environ: dict[str, str] = {}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def seams(self, **overrides):
+        seams = {
+            "environ": self.environ,
+            "home": self.home,
+            "repo_root": self.checkout,
+            "secrets_dir": self.secrets,
+            "creds": self.creds,
+            "env_dir": self.env_dir,
+            "scaffold_dir": self.hubs,
+            "hub_key": self.hub_key,
+        }
+        seams.update(overrides)
+        return seams
+
+    def findings(self, **overrides) -> Findings:
+        return assess(self.now, **self.seams(**overrides))[1]
+
+    def run_main(self, **overrides):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main([], **self.seams(**overrides))
+        return code, out.getvalue(), err.getvalue()
+
+    def assert_only_fatal(self, needle: str) -> None:
+        """One planted violation -> exactly one fatal finding, and start is blocked."""
+        findings = self.findings()
+        self.assertEqual(len(findings.fatal), 1, findings.fatal)
+        self.assertIn(needle, findings.fatal[0])
+        self.assertTrue(findings.blocks_start)
+        code, _, err = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn(f"secrets-preflight FAIL: {findings.fatal[0]}", err)
+
+    # --- the clean and warning-only baselines --------------------------------------
+
+    def test_a_clean_instance_passes(self):
+        findings = self.findings()
+        self.assertEqual(findings.fatal, ())
+        code, out, _ = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("secrets-preflight OK", out)
+
+    def test_a_durability_warning_composed_through_assess_still_exits_zero(self):
+        # PLANT: a real hub repo with commits, no remote, and a marker old enough to
+        # clear the grace period. Warning, never fatal — StartLimitBurst=5 would turn
+        # "knowledge is not backed up" into "the assistant is gone".
+        hub = make_repo(self.home / "hubs")
+        (hub / "home.md").write_text("# Home\n")
+        marker = hub / ".buzai" / "remote-expected"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"# created\n{(self.now - timedelta(days=40)).isoformat()}\n")
+        commit_all(hub, "first hub entry")
+
+        findings = self.findings()
+        self.assertEqual(findings.fatal, ())
+        self.assertTrue(any("NO remote" in w for w in findings.warnings))
+        code, out, err = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("secrets-preflight WARN:", err)
+        self.assertIn("start not blocked", out)
+
+    # --- one planted leak per check `assess()` is supposed to compose ---------------
+
+    def test_a_loose_secret_file_reaches_the_verdict(self):
+        secret = self.secrets / "email.env"
+        secret.write_text("IMAP_PASSWORD=hunter2\n")
+        os.chmod(secret, 0o644)
+        self.assert_only_fatal("must be 0600")
+
+    def test_loose_credentials_json_reaches_the_verdict(self):
+        os.chmod(self.creds, 0o644)
+        self.assert_only_fatal(f"{self.creds} is 0o644")
+
+    def test_a_real_env_file_in_the_checkout_reaches_the_verdict(self):
+        real = self.env_dir / "email.env"
+        real.write_text("IMAP_PASSWORD=hunter2\n")
+        os.chmod(real, 0o600)  # perms are clean: existence alone is the violation
+        self.assert_only_fatal("*.env.example scaffolds")
+
+    def test_untracked_hub_content_in_the_checkout_reaches_the_verdict(self):
+        (self.hubs / "finance-and-tax.md").write_text("# Finance\n")
+        self.assert_only_fatal("personal hub content inside the public checkout")
+
+    def test_tracked_hub_content_in_the_checkout_reaches_the_verdict(self):
+        # PLANT: the P0 hole, end to end. Already in the public repo's index, and the
+        # composed preflight must refuse to start rather than exempt it.
+        leak = self.hubs / "personal.md"
+        leak.write_text("# Personal\n")
+        git("-C", str(self.checkout), "add", "--", "hubs/personal.md")
+        commit_all(self.checkout, "oops")
+        self.assert_only_fatal(f"git rm --cached {leak}")
+
+    def test_a_loose_hub_deploy_key_reaches_the_verdict(self):
+        self.hub_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+        os.chmod(self.hub_key, 0o644)
+        self.assert_only_fatal(f"{self.hub_key} is 0o644")
+
+    def test_a_tracked_hub_deploy_key_reaches_the_verdict(self):
+        # the key lives outside the checkout, so only a repo at ~ can track it — the
+        # exact case a `git -C REPO_ROOT` tracked-check could never see
+        dotfiles = make_repo(self.home)
+        self.hub_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+        os.chmod(self.hub_key, 0o600)
+        git("-C", str(dotfiles), "add", "--", ".ssh/buzai-hub")
+        commit_all(dotfiles, "track the deploy key")
+        self.assert_only_fatal("tracked by git")
+
+    def test_a_hub_path_inside_the_checkout_reaches_the_verdict(self):
+        self.environ["BUZAI_HUBS_DIR"] = str(self.checkout / "hubs")
+        self.assert_only_fatal("inside the repo checkout")
+
+    def test_a_credential_helper_on_the_public_origin_reaches_the_verdict(self):
+        git("-C", str(self.checkout), "config", "credential.helper", "store")
+        self.assert_only_fatal("credential helper")
+
+    # --- the seams are seams, not a second implementation --------------------------
+
+    def test_the_resolved_hub_target_is_reported_from_the_injected_environment(self):
+        self.environ["BUZAI_HUBS_DIR"] = str(self.root / "elsewhere")
+        target, _ = assess(self.now, **self.seams())
+        self.assertEqual(target.path, self.root / "elsewhere")
+        self.assertIn("BUZAI_HUBS_DIR", target.description)
+
+    def test_every_planted_leak_at_once_is_reported_together(self):
+        # nothing short-circuits: one fatal finding must not hide the others
+        os.chmod(self.creds, 0o644)
+        (self.hubs / "finance-and-tax.md").write_text("# Finance\n")
+        git("-C", str(self.checkout), "config", "credential.helper", "store")
+        findings = self.findings()
+        self.assertEqual(len(findings.fatal), 3, findings.fatal)
 
 
 if __name__ == "__main__":

@@ -55,6 +55,48 @@ UNREACHABLE = GitResult(
     128, "", "fatal: unable to access 'https://github.com/owner/hubs.git/': Could not resolve host"
 )
 TIMED_OUT = GitResult(124, "", "timed out after 20s", timed_out=True)
+# A generic HTTP error body — a proxy, a captive portal, a load balancer. It contains
+# "not found", which used to be enough to read it as proof the repo is private.
+CAPTIVE_PORTAL = GitResult(
+    128,
+    "",
+    "fatal: unable to access 'https://github.com/owner/hubs.git/': The requested URL "
+    "returned error: <html><head><title>Not Found</title></head><body>The page you "
+    "requested was not found on this network.</body></html>",
+)
+
+# What the anonymous probe must not inherit. Values are inert but shaped like the real
+# attack: an insteadOf rewrite that would send the probe somewhere readable, a helper
+# injected through the numbered pairs, and proxies that would answer for the host.
+INJECTED_ENV = {
+    "GIT_CONFIG_COUNT": "2",
+    "GIT_CONFIG_KEY_0": "url.https://buzai-probe.invalid/.insteadOf",
+    "GIT_CONFIG_VALUE_0": "https://github.com/",
+    "GIT_CONFIG_KEY_1": "credential.helper",
+    "GIT_CONFIG_VALUE_1": "!f() { echo password=x; }; f",
+    "GIT_CONFIG_KEY_41": "url.https://buzai-probe.invalid/.insteadOf",
+    "GIT_CONFIG_VALUE_41": "git@github.com:",
+    "GIT_CONFIG_PARAMETERS": "'credential.helper=store'",
+    "GIT_CONFIG": "/nonexistent/attacker.gitconfig",
+    "GIT_PROXY_COMMAND": "/nonexistent/attacker-proxy",
+    "http_proxy": "http://buzai-probe.invalid:8080",
+    "https_proxy": "http://buzai-probe.invalid:8080",
+    "all_proxy": "socks5://buzai-probe.invalid:1080",
+    "HTTP_PROXY": "http://buzai-probe.invalid:8080",
+    "HTTPS_PROXY": "http://buzai-probe.invalid:8080",
+    "ALL_PROXY": "socks5://buzai-probe.invalid:1080",
+}
+
+# Dumps the child's environment as JSON. Run through `default_git_runner` itself, so the
+# assertions cover the real env-construction path rather than a stand-in for it.
+DUMP_ENV = "import json, os; print(json.dumps(dict(os.environ)))"
+
+
+def restore_env(name: str, value: str | None) -> None:
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
 
 
 def anon_call(args: list[str]) -> bool:
@@ -207,15 +249,90 @@ class TestAnonymousEnv(unittest.TestCase):
     def test_repo_local_config_cannot_be_discovered(self):
         self.assertEqual(self.ENV["GIT_CEILING_DIRECTORIES"], "/tmp/neutral")
 
+    def test_config_injection_channels_are_unset(self):
+        # these bypass GIT_CONFIG_GLOBAL/SYSTEM entirely: one insteadOf entry here
+        # rewrites the probe URL, and one helper entry authenticates it
+        for name in ("GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"):
+            self.assertIn(name, self.ENV)
+            self.assertIsNone(self.ENV[name], name)
+
+    def test_numbered_config_pairs_are_enumerated_from_the_environment(self):
+        # the count is arbitrary, so the names cannot be written down in advance
+        env = anonymous_env("/tmp/neutral", INJECTED_ENV)
+        for name in ("GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_41"):
+            self.assertIn(name, env)
+            self.assertIsNone(env[name], name)
+
+    def test_proxy_channels_are_unset(self):
+        # a proxy decides who answers for the host, so it decides the verdict
+        for name in ("http_proxy", "https_proxy", "all_proxy", "GIT_PROXY_COMMAND"):
+            self.assertIsNone(self.ENV[name], name)
+            self.assertIsNone(self.ENV[name.upper()], name.upper())
+
+
+class TestProbeEnvironmentIsolation(unittest.TestCase):
+    """PLANT the injection channels in the PARENT and prove none reaches the child.
+
+    Driven through the real `default_git_runner` (with `sys.executable` standing in for
+    the git binary), so this covers the actual env-construction mechanism — overlay
+    semantics included — rather than a fake runner's idea of it.
+    """
+
+    def setUp(self):
+        for name, value in INJECTED_ENV.items():
+            self.addCleanup(restore_env, name, os.environ.get(name))
+            os.environ[name] = value
+        result = default_git_runner(
+            ["-c", DUMP_ENV],
+            anonymous_env(tempfile.gettempdir()),
+            30.0,
+            git_bin=sys.executable,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.child = json.loads(result.stdout)
+
+    def test_the_plant_is_really_in_the_parent(self):
+        # without this, every assertion below could pass against an env that never
+        # carried the violation — the dead-no-op shape this repo has shipped once
+        for name, value in INJECTED_ENV.items():
+            self.assertEqual(os.environ.get(name), value, name)
+
+    def test_no_injected_variable_reaches_the_child(self):
+        for name in INJECTED_ENV:
+            self.assertNotIn(name, self.child, name)
+
+    def test_the_pre_existing_suppressions_still_hold(self):
+        for name in ("SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS"):
+            self.assertNotIn(name, self.child, name)
+        self.assertEqual(self.child["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(self.child["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(self.child["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_unrelated_variables_are_left_alone(self):
+        # the overlay suppresses named channels; it is not a scorched-earth empty env
+        self.assertIn("PATH", self.child)
+
 
 class TestAnonymousProbeArgs(HubTempCase):
-    def test_probe_resets_the_credential_helper_list(self):
+    def setUp(self):
+        super().setUp()
         git = ScriptedGit(remote_url=HTTPS_URL, anon=PRIVATE_HTTPS)
         self.verify(git, use_cache=False)
-        anon = [args for args in git.probes if anon_call(args)]
-        self.assertTrue(anon)
-        for args in anon:
+        self.anon = [args for args in git.probes if anon_call(args)]
+        self.assertTrue(self.anon)
+
+    def config_overrides(self, args) -> list[str]:
+        return [args[i + 1] for i, a in enumerate(args) if a == "-c"]
+
+    def test_probe_resets_the_credential_helper_list(self):
+        for args in self.anon:
             self.assertEqual(args[args.index("-c") + 1], "credential.helper=")
+
+    def test_probe_resets_the_proxy_on_the_command_line_too(self):
+        # command-line -c outranks every config file, so a proxy that reached git
+        # through a channel the environment overlay does not know about is still gone
+        for args in self.anon:
+            self.assertIn("http.proxy=", self.config_overrides(args))
 
 
 # --- classification and the three-way decision -----------------------------------
@@ -244,12 +361,35 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(classify(UNREACHABLE), UNKNOWN)
         self.assertEqual(classify(GitResult(128, "", "Host key verification failed.")), UNKNOWN)
 
+    def test_an_unknown_host_key_is_unknown_including_gits_trailing_line(self):
+        # the full stderr git actually emits. Host-key checking is deliberately not
+        # weakened, so this failure must stay indeterminate — never "proof of private"
+        self.assertEqual(
+            classify(
+                GitResult(
+                    128,
+                    "",
+                    "Host key verification failed.\r\n"
+                    "fatal: Could not read from remote repository.",
+                )
+            ),
+            UNKNOWN,
+        )
+
     def test_timeout_is_unknown(self):
         self.assertEqual(classify(TIMED_OUT), UNKNOWN)
 
     def test_unrecognized_failure_is_unknown_not_denied(self):
         # the permissive-default guard: silence must never read as "denied" (=private)
         self.assertEqual(classify(GitResult(1, "", "")), UNKNOWN)
+
+    def test_a_generic_not_found_error_body_is_not_proof_of_privacy(self):
+        # PLANT: a captive-portal / proxy error page containing "not found". A bare
+        # "not found" pattern read this as DENIED, i.e. as evidence the repo is private
+        self.assertEqual(classify(CAPTIVE_PORTAL), UNKNOWN)
+
+    def test_gits_own_repository_not_found_is_still_denied(self):
+        self.assertEqual(classify(GitResult(128, "", "remote: Repository not found.")), DENIED)
 
 
 class TestDecide(unittest.TestCase):
@@ -320,6 +460,14 @@ class TestVerifyRefusals(HubTempCase):
         git = ScriptedGit(remote_url=HTTPS_URL, anon=PUBLIC_READ)
         self.verify(git)
         self.assertIsNone(read_cache(default_cache_path(self.hub)))
+
+    def test_a_generic_error_body_yields_indeterminate_not_private(self):
+        # end to end: an unrecognized failure fails closed (refuse + queue), and in
+        # particular never reaches a PRIVATE verdict that would permit a push
+        git = ScriptedGit(remote_url=SSH_URL, anon=CAPTIVE_PORTAL, auth=PUBLIC_READ)
+        result = self.verify(git)
+        self.assertEqual(result.verdict, INDETERMINATE)
+        self.assertFalse(result.push_allowed)
 
     def test_host_unreachable_refuses_rather_than_assuming_private(self):
         git = ScriptedGit(remote_url=SSH_URL, anon=UNREACHABLE, auth=UNREACHABLE)

@@ -16,7 +16,8 @@ earn that is therefore a deliberate decision, not a matter of severity feel:
 or the instance has a way to push to it. Refusing to run is strictly better than
 running:
 
-  * `hubs/` in the checkout holds anything beyond the tracked scaffolds (R16);
+  * `hubs/` in the checkout holds anything beyond the named scaffolds (R16) — whether
+    or not the public repo already tracks it, which makes it worse, not exempt;
   * a real `.env` sits under `deploy/env/` (R17);
   * the resolved hub path is inside — or contains — the checkout (R3);
   * the hub push credential is not 0600, or is tracked by *any* git repo (R15);
@@ -58,6 +59,13 @@ Shape: pure core, injected side effects. `perm_problems` / `tracked_problems` /
 `inspect_hub` gather. Nothing new is reimplemented here — the hub path rule comes from
 `hub_paths`, scaffold-vs-content from `hub_init`, the backlog from `hub_commit`, and
 the public-origin credential-helper check from `hub_remote`.
+
+`assess()` is the wiring: it composes those checks with the module constants above and
+is what systemd actually runs. Well-tested checks wired up wrongly — one composed with
+the wrong constant, one dropped from the list — is the same dead no-op wearing a
+different hat, and it would leave the suite green. So every constant `assess()` reads
+is a keyword argument defaulting to that constant, and the tests plant real violations
+under temporary directories and drive the *real* composition through `main()`.
 """
 
 from __future__ import annotations
@@ -66,10 +74,11 @@ import os
 import stat
 import subprocess
 import sys
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -83,12 +92,13 @@ from scripts.hub_commit import (  # noqa: E402
 )
 from scripts.hub_init import (  # noqa: E402
     MARKER,
+    SCAFFOLDS,
     HubInitError,
     commit_count,
     parse_marker,
     plan_migration,
     remotes,
-    tracked_scaffolds,
+    tracked_paths,
 )
 from scripts.hub_paths import ENV_VAR, HubPathError, expand, refusal, source_of  # noqa: E402
 from scripts.hub_remote import (  # noqa: E402
@@ -210,16 +220,29 @@ def env_file_problems(paths: Iterable[Path]) -> list[str]:
     ]
 
 
-def hub_content_problems(untracked: Iterable[str], source: Path) -> list[str]:
+def hub_content_problems(content: Iterable[str], source: Path, tracked: Iterable[str]) -> list[str]:
     """Personal hub content sitting in the public checkout. Pure. R3/R16.
 
-    `untracked` is whatever `hub_init.plan_migration` found under `source` that git does
-    not track — scaffold-vs-content decided by git, never by a filename list.
+    `content` is whatever `hub_init.plan_migration` found under `source` that is not a
+    named scaffold; `tracked` is the subset the public repo already has in its index.
+
+    Tracking does not excuse a file — it aggravates it, and gets its own remedy. The
+    earlier version of this check treated "tracked under `hubs/`" as *proof* of being a
+    scaffold, so a personal hub file that had been `git add`ed was the one case exempt
+    from the check whose entire job is keeping hub content out of the public repo.
     """
+    staged = set(tracked)
     return [
-        f"{source / rel} is personal hub content inside the public checkout — hub content "
-        f"lives in the private hub repo; run `make hub-init` to move it out"
-        for rel in untracked
+        (
+            f"{source / rel} is personal hub content that the PUBLIC repo already tracks — "
+            f"it is one push from being published; take it out of the index with "
+            f"`git rm --cached {source / rel}` and move the content into the private hub "
+            f"store (`make hub-init` does both)"
+            if rel in staged
+            else f"{source / rel} is personal hub content inside the public checkout — hub "
+            f"content lives in the private hub repo; run `make hub-init` to move it out"
+        )
+        for rel in content
     ]
 
 
@@ -420,20 +443,30 @@ def _git_tracked(path) -> bool:
 def hub_checkout_problems(source: Path = HUB_SCAFFOLD_DIR) -> list[str]:
     """Personal hub content found in the checkout's `hubs/`. R3/R16.
 
-    A missing `hubs/` is clean (nothing there to leak). An *unanswerable* question is
-    not: if git cannot say which files are scaffolds, the check reports unverified
-    rather than passing — the failure mode this file exists to avoid.
+    What is content and what is a scaffold comes from `hub_init.SCAFFOLDS` — an
+    explicit set, so git cannot be asked the wrong question. Git is still asked a
+    narrower one (what does the public repo already track?), and only to choose the
+    remedy; an *unanswerable* answer downgrades nothing, it adds a finding, because
+    "cannot tell" reading as "clean" is the failure mode this file exists to avoid.
+    A missing `hubs/` is clean: there is nothing there to leak.
     """
     if not source.is_dir():
         return []
+    content = plan_migration(source, SCAFFOLDS)
     try:
-        tracked = tracked_scaffolds(source)
+        tracked = tracked_paths(source)
     except HubInitError as e:
+        # Every content file below is still a finding; what cannot be answered is only
+        # which of them the index also holds, so the extra remedy is named here rather
+        # than asserted per-file. The unanswerable question is itself reported: "cannot
+        # tell" must never read as "clean".
         return [
-            f"cannot determine which files under {source} are tracked scaffolds — treated "
-            f"as unverified rather than clean: {e}"
+            f"cannot determine which files under {source} the public repo tracks — treated "
+            f"as unverified rather than clean: {e}; check each path below with `git rm "
+            f"--cached` as well as moving it",
+            *hub_content_problems(content, source, ()),
         ]
-    return hub_content_problems(plan_migration(source, tracked), source)
+    return hub_content_problems(content, source, tracked)
 
 
 def read_marker(hub: Path) -> tuple[datetime | None, str]:
@@ -490,21 +523,41 @@ def inspect_hub(
     )
 
 
-def assess(now: datetime, runner: GitRunner = default_git_runner) -> tuple[HubTarget, Findings]:
-    """Gather everything and return the verdict for this instance."""
-    target = resolve_hub_target(os.environ.get(ENV_VAR), Path.home(), REPO_ROOT)
-    secret_files = sorted(SECRETS_DIR.glob("*.env")) if SECRETS_DIR.is_dir() else []
-    repo_secrets = _repo_secret_candidates()
+def assess(
+    now: datetime,
+    runner: GitRunner = default_git_runner,
+    *,
+    environ: Mapping[str, str] = os.environ,
+    home: Path = Path.home(),
+    repo_root: Path = REPO_ROOT,
+    secrets_dir: Path = SECRETS_DIR,
+    creds: Path = CREDS,
+    env_dir: Path = DEPLOY_ENV_DIR,
+    scaffold_dir: Path = HUB_SCAFFOLD_DIR,
+    hub_key: Path = HUB_KEY,
+    is_tracked: Callable[[Path], bool] = _git_tracked,
+) -> tuple[HubTarget, Findings]:
+    """Gather everything and return the verdict for this instance.
+
+    Every location this reads is a keyword argument defaulting to the module constant,
+    so the *composition* — which check is fed which path — is testable against planted
+    violations under a tempdir. The deployment passes none of them and gets the real
+    layout; a test that plants a leak and drives this function proves the wiring, which
+    no amount of coverage on the individual checks can.
+    """
+    target = resolve_hub_target(environ.get(ENV_VAR), home, repo_root)
+    secret_files = sorted(secrets_dir.glob("*.env")) if secrets_dir.is_dir() else []
+    repo_secrets = _repo_secret_candidates(env_dir)
 
     fatal = fatal_problems(
         secret_files=secret_files,
         repo_secrets=repo_secrets,
-        creds=CREDS,
-        hub_credentials=[HUB_KEY],
-        hub_content=hub_checkout_problems(),
+        creds=creds,
+        hub_credentials=[hub_key],
+        hub_content=hub_checkout_problems(scaffold_dir),
         hub_path_problem=target.problem,
-        origin_violations=origin_credential_violations(REPO_ROOT, runner),
-        is_tracked=_git_tracked,
+        origin_violations=origin_credential_violations(repo_root, runner),
+        is_tracked=is_tracked,
     )
 
     # A refused hub path is not inspected: the warnings describe a store that must not
@@ -513,7 +566,7 @@ def assess(now: datetime, runner: GitRunner = default_git_runner) -> tuple[HubTa
     notes = notes_for(target.path if not target.problem else None, state)
     if not secret_files:
         notes.append(
-            f"no local secret files in {SECRETS_DIR} — fine for a managed-connector-only "
+            f"no local secret files in {secrets_dir} — fine for a managed-connector-only "
             f"setup; credentials.json perms are still checked"
         )
     return target, Findings(
@@ -549,8 +602,14 @@ def report(target: HubTarget, findings: Findings) -> int:
     return 0
 
 
-def main(argv=None) -> int:
-    return report(*assess(datetime.now(UTC)))
+def main(argv=None, **overrides: Any) -> int:
+    """The `ExecStartPre` entry point: exit 1 blocks service start.
+
+    `overrides` forwards `assess`'s injection seams and exists so a test can drive this
+    exact path — main -> assess -> report — against planted violations. The deployment
+    passes none, so what systemd runs is what the tests run.
+    """
+    return report(*assess(datetime.now(UTC), **overrides))
 
 
 if __name__ == "__main__":

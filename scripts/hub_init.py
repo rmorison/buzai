@@ -17,11 +17,18 @@ clobbered — and a non-empty directory that is *not* a repo is refused rather t
 initialized over. Anything that fails before the initial commit rolls back what this
 script created, so a failed run leaves no half-built repo behind.
 
-Migration is the one-time move of real hub content out of the public checkout.
-"Real" is decided from git, not from a filename list: whatever `git ls-files` reports
-under `hubs/` is a tracked scaffold and stays, everything else is personal content
-and moves. It is **copied** into the hub repo, committed, and only then removed from
-the checkout — so a failure anywhere in between costs nothing.
+Migration is the one-time move of real hub content out of the public checkout. What
+counts as a scaffold is the explicit `SCAFFOLDS` set and nothing else — pointedly
+*not* "whatever git tracks under `hubs/`". That inference was the hole: a personal hub
+file already `git add`ed or committed under `hubs/` is the most exposed state there
+is, and reading tracking as scaffold-ness made exactly that case exempt from both this
+migration and the preflight check meant to catch it.
+
+Content is **copied** into the hub repo, committed, and only then removed from the
+checkout — so a failure anywhere in between costs nothing. Removal covers the *index*
+as well as the working tree (`git rm --cached`, see `_remove_migrated`): a personal
+file deleted from disk but left staged is still content the public repo is one commit
+from carrying, so "migrated" has to mean gone from both.
 
 The `remote_expected` marker
 ----------------------------
@@ -57,6 +64,14 @@ GIT = "git"
 DEFAULT_BRANCH = "main"
 INSTANCE_README = "README.md"
 MARKER = Path(".buzai") / "remote-expected"
+
+# The scaffolds the public repo ships under `hubs/`, as paths relative to that
+# directory. THE single source of truth for scaffold-vs-personal-content: `hub_init`
+# migrates everything else out, and `secrets_preflight` refuses to start on everything
+# else still being there. Adding a scaffold to the repo means adding it here — which is
+# the point, since the alternative (infer it from `git ls-files`) silently exempted any
+# personal file that had already been staged or committed.
+SCAFFOLDS: frozenset[str] = frozenset({"README.md", "_example-hub.md"})
 
 
 class HubInitError(Exception):
@@ -118,17 +133,19 @@ def remotes(hub: Path, git_bin: str = GIT) -> list[str]:
     return r.stdout.split() if r.returncode == 0 else []
 
 
-def tracked_scaffolds(source: Path, git_bin: str = GIT) -> set[str]:
-    """Scaffold names under `source`, per git — the authority on scaffold vs. content.
+def tracked_paths(source: Path, git_bin: str = GIT) -> set[str]:
+    """Everything git has in its index under `source`, relative to it.
 
-    Paths come back relative to `source`. A failure here is fatal rather than an empty
-    set: without git's answer, every personal file would look like a scaffold (and stay
-    in the public checkout) or every scaffold would look like personal content.
+    Tracked is **not** the same as scaffold — `SCAFFOLDS` decides that. This answers a
+    narrower question: which of the files found under `source` the public repo already
+    carries, which is what tells a "move this out" remedy from a "`git rm --cached` this
+    out" one. A failure is fatal rather than an empty set: "git could not say" must not
+    be reported as "the repo carries nothing".
     """
     out = git_ok(
         ["-C", str(source), "ls-files", "-z", "--", "."],
         git_bin,
-        f"listing tracked scaffolds in {source}",
+        f"listing git-tracked files in {source}",
     )
     return {name for name in out.split("\0") if name}
 
@@ -136,25 +153,28 @@ def tracked_scaffolds(source: Path, git_bin: str = GIT) -> set[str]:
 # --- pure planning and rendering -------------------------------------------------
 
 
-def plan_seed(tracked: Iterable[str]) -> list[str]:
+def plan_seed(scaffolds: Iterable[str] = SCAFFOLDS) -> list[str]:
     """Scaffolds to copy into the hub repo. Pure.
 
-    Every tracked scaffold except `README.md`: the public one describes the *template*
+    Every scaffold except `README.md`: the public one describes the *template*
     directory ("your content does not live here"), which is the opposite of what the
     hub store's own README needs to say. `render_readme` writes that one instead.
     """
-    return sorted(name for name in tracked if name != INSTANCE_README)
+    return sorted(name for name in scaffolds if name != INSTANCE_README)
 
 
-def plan_migration(source: Path, tracked: Iterable[str]) -> list[str]:
-    """Real hub files under `source` (recursively), as paths relative to it.
+def plan_migration(source: Path, scaffolds: Iterable[str] = SCAFFOLDS) -> list[str]:
+    """Personal hub files under `source` (recursively), as paths relative to it. Pure-ish.
 
-    Anything git does not track is personal content. Recursive because a hub that
-    outgrew a single file becomes a folder, and the folder must move whole.
+    Anything that is not a named scaffold is personal content — *including* a file git
+    already tracks. Tracked-and-under-`hubs/` used to mean "scaffold, leave it alone",
+    which exempted the worst case (personal content already staged in the public repo)
+    from the very move that exists to rescue it. Recursive because a hub that outgrew a
+    single file becomes a folder, and the folder must move whole.
     """
     if not source.is_dir():
         return []
-    known = set(tracked)
+    known = set(scaffolds)
     found = []
     for path in source.rglob("*"):
         if not path.is_file():
@@ -313,8 +333,45 @@ def _copy_into(source: Path, hub: Path, rel: str) -> None:
         raise HubInitError(f"cannot copy {source / rel} to {dest}: {e}") from e
 
 
-def _remove_migrated(source: Path, migrated: Iterable[str]) -> None:
-    """Delete the checkout's copies once they are safely committed in the hub repo."""
+def _unstage_migrated(source: Path, migrated: Iterable[str], git_bin: str) -> list[str]:
+    """Drop the checkout's *index* entries for the migrated paths. Returns what it removed.
+
+    `git rm --cached -f`, and both flags are deliberate. `--cached` touches only the
+    index — the working-tree copies are deleted separately, below, and only after the
+    content is committed in the hub repo. `-f` is needed because git refuses to unstage
+    a path whose index entry differs from HEAD, which is exactly the case that matters
+    here: personal content that was `git add`ed but never committed. Forcing is safe
+    only because this runs after the hub repo's commit, so the content is not at risk.
+
+    A `source` that is not inside any git repo has no index to clean and is not an
+    error. A git failure that is not that *is* an error — see `_remove_migrated`.
+    """
+    listed = git(["-C", str(source), "ls-files", "-z", "--", "."], git_bin)
+    if listed.returncode != 0:
+        return []
+    staged = sorted({name for name in listed.stdout.split("\0") if name} & set(migrated))
+    if not staged:
+        return []
+    removed = git(["-C", str(source), "rm", "--cached", "-f", "-q", "--", *staged], git_bin)
+    if removed.returncode != 0:
+        detail = (removed.stderr.strip() or f"exit {removed.returncode}").splitlines()[-1]
+        raise HubInitError(
+            "the hub repo was created and committed, but these files are still in the "
+            f"public checkout's git index — remove them by hand with `git -C {source} rm "
+            f"--cached -f -- {' '.join(staged)}`: {detail}"
+        )
+    return staged
+
+
+def _remove_migrated(source: Path, migrated: Iterable[str], git_bin: str = GIT) -> None:
+    """Take the checkout's copies out of the index *and* the working tree.
+
+    Called only once the content is committed in the hub repo. Both halves are the job:
+    a personal file deleted from disk but left in the index is still content the public
+    repo carries, and a file removed from the index but left on disk is still content
+    one `git add` from being carried again.
+    """
+    _unstage_migrated(source, migrated, git_bin)
     failed = []
     for rel in migrated:
         path = source / rel
@@ -339,14 +396,15 @@ def _remove_migrated(source: Path, migrated: Iterable[str]) -> None:
 def initialize(
     hub: Path,
     source: Path,
-    tracked: Iterable[str],
     now: datetime,
     git_bin: str = GIT,
+    scaffolds: Iterable[str] = SCAFFOLDS,
 ) -> InitResult:
     """Create and seed the hub repo at `hub`, or report the one already there.
 
-    `source` is the checkout's `hubs/` directory and `tracked` the scaffold names git
-    reports in it; everything else under `source` is personal content and is migrated.
+    `source` is the checkout's `hubs/` directory. `scaffolds` names what stays there;
+    everything else under `source` is personal content and is migrated out of both the
+    working tree and the index, tracked or not.
     """
     probe = git(["--version"], git_bin)
     if probe.returncode != 0:
@@ -362,8 +420,8 @@ def initialize(
             f"initialize over it; move it aside, or point {ENV_VAR} at another location"
         )
 
-    seed = plan_seed(tracked)
-    migrate = plan_migration(source, tracked)
+    seed = plan_seed(scaffolds)
+    migrate = plan_migration(source, scaffolds)
     existed = hub.is_dir()
     try:
         hub.mkdir(parents=True, exist_ok=True)
@@ -395,7 +453,7 @@ def initialize(
         _rollback(hub, existed)
         raise
 
-    _remove_migrated(source, migrate)
+    _remove_migrated(source, migrate, git_bin)
     return InitResult(
         "created", hub, seed, migrate, commit_count(hub, git_bin), remotes(hub, git_bin)
     )
@@ -410,8 +468,7 @@ def main(argv=None) -> int:
     print(f"hub-init: hubs resolve to {location}")
 
     try:
-        tracked = tracked_scaffolds(SCAFFOLD_DIR)
-        result = initialize(location.path, SCAFFOLD_DIR, tracked, datetime.now(UTC))
+        result = initialize(location.path, SCAFFOLD_DIR, datetime.now(UTC))
     except (HubInitError, OSError) as e:
         print(f"hub-init FAIL: {e}", file=sys.stderr)
         return 1
@@ -426,8 +483,8 @@ def main(argv=None) -> int:
         print(f"  seeded:   {', '.join(result.seeded) or 'nothing (no scaffolds tracked)'}")
         if result.migrated:
             print(
-                f"  migrated: {len(result.migrated)} file(s) out of {SCAFFOLD_DIR} — "
-                f"{', '.join(result.migrated)}"
+                f"  migrated: {len(result.migrated)} file(s) out of {SCAFFOLD_DIR}, from the "
+                f"working tree AND the git index — {', '.join(result.migrated)}"
             )
         print(f"  marker:   {MARKER} (creation timestamp; the durability check reads it)")
         print(f"  commit:   {result.commits} initial commit")
