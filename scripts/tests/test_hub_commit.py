@@ -14,6 +14,7 @@ from pathlib import Path
 from scripts.hub_commit import (
     APPEND_ENTRY,
     AUTONOMOUS,
+    CLI_SOURCES,
     COMMITTED,
     DIVERGED,
     FAILED,
@@ -35,7 +36,9 @@ from scripts.hub_commit import (
     added_lines,
     apply_operation,
     attempt_push,
+    build_parser,
     commit_message,
+    covers,
     default_backlog_path,
     default_lock_path,
     entropy,
@@ -709,6 +712,79 @@ class TestDirtyTreeReconciliation(HubRepoCase):
         self.assertNotIn("leaked.md", git("-C", str(self.hub), "ls-files"))
 
 
+class TestCoversPath(unittest.TestCase):
+    def test_a_path_covers_itself(self):
+        self.assertTrue(covers("notes.md", "notes.md"))
+
+    def test_an_untracked_directory_covers_the_files_under_it(self):
+        # git reports an untracked directory as ONE porcelain record, `sub/`
+        self.assertTrue(covers("sub/", "sub/notes.md"))
+        self.assertTrue(covers("sub", "sub/notes.md"))
+
+    def test_a_prefix_that_is_not_a_directory_boundary_covers_nothing(self):
+        self.assertFalse(covers("note", "notes.md"))
+        self.assertFalse(covers("notes.md", "notes.md.bak"))
+
+
+class TestFlaggedDirtyTargetIsRefused(HubRepoCase):
+    """The reconciler skipping a file protects it only from the RECONCILE commit.
+
+    When the flagged file is the one this operation targets, the path-scoped commit names
+    that path and carries the pre-existing credential-shaped content in with the new
+    entry — and the added-lines scan cannot catch it, because those lines were already on
+    disk and are therefore not "added". The existing skip test uses a DIFFERENT file,
+    which is how this escaped. Verified against the unfixed version: the write reported
+    `committed`, and `git show HEAD:notes.md` contained the planted token.
+    """
+
+    TOKEN = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+    def setUp(self):
+        super().setUp()
+        self.dirty = f"{self.SEED}- the deploy token is {self.TOKEN}\n"
+        self.notes.write_text(self.dirty)  # pre-existing, uncommitted, credential-shaped
+        self.result = self.append("an unrelated fact")
+
+    def committed_notes(self) -> str:
+        return git("-C", str(self.hub), "show", "HEAD:notes.md")
+
+    def test_the_flagged_content_never_reaches_a_commit(self):
+        self.assertNotIn(self.TOKEN, self.committed_notes())
+        self.assertEqual(self.commits(), 1)  # only the seed
+
+    def test_the_write_is_refused_rather_than_carried_through(self):
+        self.assertEqual(self.result.status, REFUSED)
+        self.assertFalse(self.result.recorded)
+        self.assertIsNone(self.result.commit)
+
+    def test_nothing_was_written_to_the_file_either(self):
+        self.assertEqual(self.notes.read_text(), self.dirty)
+        self.assertNotIn("an unrelated fact", self.notes.read_text())
+
+    def test_the_refusal_says_which_file_and_which_rule_without_the_value(self):
+        self.assertIn("notes.md", self.result.detail)
+        self.assertIn("github personal access token", self.result.detail)
+        self.assertNotIn(self.TOKEN, self.result.detail)
+        self.assertIn("github personal access token", [f.rule for f in self.result.findings])
+
+    def test_the_file_is_still_reported_as_left_uncommitted(self):
+        self.assertEqual([p for p, _ in self.result.reconciled.skipped], ["notes.md"])
+        self.assertIn("notes.md", self.porcelain())
+
+    def test_a_flagged_file_in_an_untracked_directory_still_blocks_its_children(self):
+        sub = self.hub / "sub"
+        sub.mkdir()
+        (sub / "keys.md").write_text(f"- {self.TOKEN}\n")
+        result = record(
+            self.hub,
+            WriteRequest(Operation(APPEND_ENTRY, "sub/notes.md", "- a fact"), "s", "r"),
+            now=NOW,
+            push=False,
+        )
+        self.assertEqual(result.status, REFUSED)
+        self.assertFalse((self.hub / "sub" / "notes.md").exists())
+
+
 # --- concurrency ----------------------------------------------------------------------
 
 
@@ -1003,6 +1079,108 @@ class TestMain(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertIn("make hub-init", err.getvalue())
             self.assertFalse((Path(tmp) / "hubs").exists())
+
+
+class TestMainAgainstARealHub(HubRepoCase):
+    """`main` against a hub with no remote — nothing here can reach the network."""
+
+    TOKEN = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(self.hub)
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_left_uncommitted_is_never_printed_for_a_path_that_was_committed(self):
+        """The output and the tree have to agree about notes.md.
+
+        Verified against the unfixed version: it printed `left notes.md uncommitted`,
+        exited 0, and `git show HEAD:notes.md` held the planted token — the WARN was
+        describing a file the same run had just committed.
+        """
+        self.notes.write_text(f"{self.SEED}- the deploy token is {self.TOKEN}\n")
+
+        rc, _, err = self.run_main(
+            ["--file", "notes.md", "--append", "- a fact", "--summary", "s", "--no-push"]
+        )
+
+        self.assertEqual(rc, 1)
+        self.assertIn("refused to record into notes.md", err)
+        self.assertIn("left notes.md uncommitted", err)
+        self.assertIn("notes.md", self.porcelain())  # and it really is uncommitted
+        self.assertNotIn(self.TOKEN, git("-C", str(self.hub), "show", "HEAD:notes.md"))
+
+    def test_an_unrelated_flagged_file_still_warns_and_the_write_lands(self):
+        (self.hub / "leaked.md").write_text(f"token {self.TOKEN}\n")
+
+        rc, out, err = self.run_main(
+            ["--file", "notes.md", "--append", "- a fact", "--summary", "s", "--no-push"]
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertIn("left leaked.md uncommitted", err)
+        self.assertIn("committed", out)
+        self.assertIn("- a fact", self.notes.read_text())
+
+
+class TestOwnerCorrectionIsNotACommandLineChoice(HubRepoCase):
+    """`hub_review.reviewable()` excludes `owner-correction` from the review queue: it is
+    the owner's own verdict, produced by the rejection flow together with the note that
+    accounts for it. Offered as a plain CLI choice with generic help, an assistant told
+    "record the correction the owner just gave me" would reach for it directly and write
+    hub content that never appears for review — the accountability property the whole
+    feature exists for, defeated by a flag."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(self.hub)
+
+    def test_asking_for_it_on_the_command_line_records_nothing(self):
+        argv = [
+            "--file", "notes.md",
+            "--append", "- the owner says the dentist is on Elm Street",
+            "--summary", "Record the owner's correction",
+            "--source", OWNER_CORRECTION,
+            "--no-push",
+        ]  # fmt: skip
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                main(argv)
+
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("invalid choice", err.getvalue())
+        self.assertEqual(self.commits(), 1)
+        self.assertEqual(self.notes.read_text(), self.SEED)
+
+    def test_the_help_sends_the_caller_to_the_rejection_flow_instead(self):
+        text = " ".join(build_parser().format_help().split())
+        self.assertIn("hub_review.py --reject", text)
+        self.assertNotIn(OWNER_CORRECTION, [c for c in CLI_SOURCES])
+
+    def test_the_rejection_flow_can_still_record_one_through_the_api(self):
+        # `hub_review._correct()` calls record() directly; restricting the parser must
+        # not restrict that
+        result = record(
+            self.hub,
+            WriteRequest(
+                Operation(APPEND_ENTRY, "notes.md", "- the owner's value"),
+                summary="Record the owner's correction",
+                reason="the owner rejected the original",
+                source=OWNER_CORRECTION,
+            ),
+            now=NOW,
+            push=False,
+        )
+        self.assertEqual(result.status, COMMITTED)
+        self.assertIn(f"instruction-source: {OWNER_CORRECTION}", self.log("%B"))
 
 
 if __name__ == "__main__":

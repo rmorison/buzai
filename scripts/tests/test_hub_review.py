@@ -12,6 +12,7 @@ from pathlib import Path
 from scripts.hub_commit import (
     APPEND_ENTRY,
     AUTONOMOUS,
+    CLI_SOURCES,
     DIVERGED,
     NOTHING_TO_PUSH,
     OWNER_CORRECTION,
@@ -38,6 +39,7 @@ from scripts.hub_review import (
     NOTES_REF,
     NOTHING_TO_REMOVE,
     OWNER_AUTHORED,
+    PARTIALLY_REMOVED,
     RECORDED,
     REJECTED,
     REMOVED,
@@ -47,8 +49,9 @@ from scripts.hub_review import (
     Decision,
     Disposition,
     HubReviewError,
+    added_blocks,
     build_change,
-    contains_block,
+    count_block,
     dispose,
     disposed_shas,
     duration,
@@ -58,8 +61,10 @@ from scripts.hub_review import (
     push_notes,
     read_changes,
     read_disposition,
+    removal_scope,
     reviewable,
     run_list,
+    split_hunks,
     staleness_warning,
     summarize,
 )
@@ -219,6 +224,9 @@ class ReviewRepoCase(unittest.TestCase):
     def subjects(self) -> list[str]:
         return git("-C", str(self.hub), "log", "--pretty=%s").split("\n")
 
+    def commit_count(self) -> int:
+        return int(git("-C", str(self.hub), "rev-list", "--count", "HEAD").strip())
+
     def approve(self, sha: str, **kw):
         kw.setdefault("push", False)
         return dispose(self.hub, Decision(sha, APPROVED), now=NOW, **kw)
@@ -291,21 +299,89 @@ class TestReviewable(unittest.TestCase):
         self.assertFalse(reviewable(self.change("")))
 
 
-class TestContainsBlock(unittest.TestCase):
+class TestCountBlock(unittest.TestCase):
+    """The matcher counts rather than answering yes/no: one match and two matches call
+    for opposite actions (remove, or refuse), and a hub repeats lines constantly."""
+
     DOC = "# Notes\n\n- one\n- two\n- three\n"
+    REPEATED = "# Notes\n\n## Car\n\n- Renewed the policy.\n\n## Home\n\n- Renewed the policy.\n"
 
     def test_a_present_block_is_found(self):
-        self.assertTrue(contains_block(self.DOC, ["- two"]))
+        self.assertEqual(count_block(self.DOC, ["- two"]), 1)
 
     def test_a_multi_line_block_must_be_contiguous(self):
-        self.assertTrue(contains_block(self.DOC, ["- two", "- three"]))
-        self.assertFalse(contains_block(self.DOC, ["- one", "- three"]))
+        self.assertEqual(count_block(self.DOC, ["- two", "- three"]), 1)
+        self.assertEqual(count_block(self.DOC, ["- one", "- three"]), 0)
 
     def test_reworded_content_is_not_a_match(self):
-        self.assertFalse(contains_block(self.DOC, ["- two (reworded)"]))
+        self.assertEqual(count_block(self.DOC, ["- two (reworded)"]), 0)
 
     def test_an_empty_block_never_matches(self):
-        self.assertFalse(contains_block(self.DOC, []))
+        self.assertEqual(count_block(self.DOC, []), 0)
+        self.assertEqual(count_block(self.REPEATED, [], "Home"), 0)
+
+    def test_a_repeated_line_is_counted_not_collapsed(self):
+        self.assertEqual(count_block(self.REPEATED, ["- Renewed the policy."]), 2)
+
+    def test_a_section_narrows_the_search_to_one_of_them(self):
+        self.assertEqual(count_block(self.REPEATED, ["- Renewed the policy."], "Home"), 1)
+        self.assertEqual(count_block(self.REPEATED, ["- Renewed the policy."], "Car"), 1)
+
+    def test_a_heading_that_is_gone_matches_nothing_rather_than_wandering(self):
+        self.assertEqual(count_block(self.REPEATED, ["- Renewed the policy."], "Garage"), 0)
+
+    def test_the_heading_line_itself_is_outside_its_own_body(self):
+        self.assertEqual(count_block(self.REPEATED, ["## Home"], "Home"), 0)
+
+
+class TestRemovalScope(unittest.TestCase):
+    def test_an_ordinary_entry_keeps_its_heading(self):
+        self.assertEqual(removal_scope(["- a fact"], "Health"), "Health")
+
+    def test_a_block_that_carries_a_heading_is_searched_unscoped(self):
+        # `_apply_append` creates a missing section as part of the entry, so the recorded
+        # block starts with `## Health` — which a scoped search could never find, because
+        # a section body does not contain its own heading
+        self.assertIsNone(removal_scope(["## Health", "", "- a fact"], "Health"))
+
+    def test_no_recorded_heading_stays_unscoped(self):
+        self.assertIsNone(removal_scope(["- a fact"], None))
+
+
+class TestSplitHunks(unittest.TestCase):
+    """One block per hunk. A flattened block spanning two hunks is contiguous nowhere in
+    the file, so it silently matches nothing and a rejection removes nothing."""
+
+    TWO_HUNKS = (
+        "diff --git a/notes.md b/notes.md\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/notes.md\n"
+        "+++ b/notes.md\n"
+        "@@ -5 +5 @@ ## Health\n"
+        "-- line one\n"
+        "+- new one\n"
+        "@@ -7 +7 @@\n"
+        "-- line three\n"
+        "+- new three\n"
+    )
+
+    def test_each_hunk_becomes_its_own_block(self):
+        self.assertEqual(split_hunks(self.TWO_HUNKS), [["- new one"], ["- new three"]])
+
+    def test_the_file_header_is_never_mistaken_for_added_content(self):
+        for block in split_hunks(self.TWO_HUNKS):
+            self.assertNotIn("+++ b/notes.md", block)
+            self.assertNotIn(" b/notes.md", block)
+
+    def test_a_multi_line_hunk_stays_one_contiguous_block(self):
+        diff = "@@ -1,0 +2,2 @@\n+- one\n+- two\n"
+        self.assertEqual(split_hunks(diff), [["- one", "- two"]])
+
+    def test_a_hunk_that_only_deleted_contributes_no_block(self):
+        self.assertEqual(split_hunks("@@ -3 +2,0 @@\n-- gone\n"), [])
+
+    def test_blank_padding_is_trimmed_off_each_block(self):
+        self.assertEqual(split_hunks("@@ -1,0 +2,3 @@\n+\n+- one\n+\n"), [["- one"]])
 
 
 class TestDispositionRoundTrip(unittest.TestCase):
@@ -652,6 +728,215 @@ class TestRejectingARemoval(ReviewRepoCase):
         result = self.reject(self.removal, reason="I still need that", value="- seeded fact")
         self.assertEqual(result.resolution, REPLACED)
         self.assertIn("- seeded fact", self.notes.read_text())
+
+
+class TestRejectionDoesNotRemoveTheWrongEntry(ReviewRepoCase):
+    """A hub repeats itself: the same bullet under two headings is ordinary, not exotic.
+
+    Rejecting the one under 'Home' must take out the one under 'Home'. An unscoped search
+    takes the FIRST match instead — here, the still-correct entry under 'Car' — which is
+    silent destruction of knowledge by the feature whose whole purpose is protecting it.
+    Verified against the unscoped version: the 'Car' entry was the one that vanished and
+    the rejected 'Home' entry stayed put, with the verdict reported as a clean success.
+    """
+
+    REPEATED = "- Renewed the policy."
+    SEED = f"# Notes\n\n## Car\n\n{REPEATED}\n\n## Home\n\n- the boiler was serviced\n"
+
+    def setUp(self):
+        super().setUp()
+        self.sha = self.append("Renewed the policy.", section="Home")
+        self.assertEqual(self.notes.read_text().count(self.REPEATED), 2)  # the plant is real
+        self.result = self.reject(self.sha, reason="that was the car, not the house")
+
+    def test_the_rejected_entry_is_the_one_that_goes(self):
+        self.assertEqual(self.result.status, RECORDED, self.result.detail)
+        self.assertEqual(self.result.resolution, REMOVED)
+        self.assertEqual(
+            self.notes.read_text(),
+            f"# Notes\n\n## Car\n\n{self.REPEATED}\n\n## Home\n\n- the boiler was serviced\n",
+        )
+
+    def test_the_untouched_entry_under_the_other_heading_survives(self):
+        section = self.notes.read_text().split("## Home")[0]
+        self.assertIn(self.REPEATED, section)
+        self.assertEqual(self.notes.read_text().count(self.REPEATED), 1)
+
+    def test_the_removal_commit_names_the_heading_it_was_scoped_to(self):
+        message = git("-C", str(self.hub), "log", "-1", "--pretty=%B", self.result.corrections[0])
+        self.assertIn("removed a 1-line entry from notes.md under 'Home'", message)
+
+
+class TestAmbiguousRemovalIsRefused(ReviewRepoCase):
+    """When the block is still not unique inside the window, there is no way to tell which
+    occurrence the rejected commit wrote — so nothing is removed and the item stays open.
+
+    Verified against the guessing version: it removed the pre-existing seeded line (the
+    first match, and not the one the commit wrote), reported `removed`, and settled the
+    item — the owner would have been told their rejection succeeded.
+    """
+
+    REPEATED = "- Renewed the policy."
+    SEED = f"# Notes\n\n{REPEATED}\n"
+
+    def setUp(self):
+        super().setUp()
+        self.sha = self.append("Renewed the policy.")  # no heading: the whole file is the window
+        self.before = self.notes.read_text()
+        self.assertEqual(self.before.count(self.REPEATED), 2)  # the plant is real
+        self.result = self.reject(self.sha, reason="I never renewed anything")
+
+    def test_the_verdict_is_refused_rather_than_guessed(self):
+        self.assertEqual(self.result.status, FAILED)
+        self.assertEqual(self.result.corrections, ())
+
+    def test_not_one_line_was_removed(self):
+        self.assertEqual(self.notes.read_text(), self.before)
+        self.assertEqual(self.commit_count(), 2)  # seed + the append; no correction commit
+
+    def test_the_owner_is_told_where_and_how_many(self):
+        self.assertIn("notes.md", self.result.detail)
+        self.assertIn("appears 2 times", self.result.detail)
+        self.assertIn("no heading", self.result.detail)
+        self.assertIn("hub_commit.py", self.result.detail)
+
+    def test_the_item_is_left_open_for_review_not_marked_resolved(self):
+        self.assertIsNone(read_disposition(self.hub, self.sha))
+        self.assertIn(self.sha, [c.sha for c in self.pending()])
+
+    def test_a_refusal_is_not_a_diff(self):
+        for marker in ("diff --git", "@@ ", self.REPEATED):
+            self.assertNotIn(marker, self.result.detail)
+
+    def test_the_command_line_reports_it_as_a_failure(self):
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(self.hub)
+        second = self.append("Renewed the policy.")  # a third copy, still ambiguous
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main(["--reject", second, "--reason", "no", "--no-push"])
+        self.assertEqual(rc, 1)
+        self.assertIn("still awaiting your review", err.getvalue())
+
+
+class TestAmbiguityInsideOneSection(ReviewRepoCase):
+    """Scoping narrows the window; it does not make a duplicate inside it decidable."""
+
+    SEED = "# Notes\n\n## Health\n\n- Dr. Smith, Tuesdays.\n\n## Car\n\n- Dr. Smith, Tuesdays.\n"
+
+    def setUp(self):
+        super().setUp()
+        self.sha = self.append("Dr. Smith, Tuesdays.", section="Health")
+        self.before = self.notes.read_text()
+        self.result = self.reject(self.sha, reason="wrong day")
+
+    def test_two_matches_inside_the_scoped_window_still_refuse(self):
+        self.assertEqual(self.result.status, FAILED)
+        self.assertEqual(self.notes.read_text(), self.before)
+
+    def test_the_refusal_names_the_heading_it_searched(self):
+        self.assertIn("'Health'", self.result.detail)
+        self.assertIn("appears 2 times", self.result.detail)
+
+
+class TestMultiHunkRejection(ReviewRepoCase):
+    """A commit that touched two places in a file added two separate runs of text.
+
+    Flattened into one block they are contiguous nowhere, so the search finds nothing, the
+    rejection resolves as `already-absent`, and the owner is told they rejected content
+    that is still sitting in their hub. Verified against the flattening version: both
+    lines were still in the file and the verdict came back `already-absent` with no
+    corrections.
+    """
+
+    SEED = (
+        "# Notes\n\n## Health\n\n- line one\n- shared line\n- line three\n\n"
+        "## Home\n\n- the boiler was serviced\n"
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.sha = self.replace_section("Health", "- new one\n- shared line\n- new three")
+
+    def test_the_commit_really_produced_more_than_one_hunk(self):
+        # without this the rest of the class would pass against a one-hunk commit, which
+        # is precisely the case the bug did NOT affect
+        self.assertEqual(len(added_blocks(self.hub, self.sha, "notes.md")), 2)
+
+    def test_every_block_the_commit_wrote_is_removed(self):
+        result = self.reject(self.sha, reason="none of that is right")
+        self.assertEqual(result.status, RECORDED, result.detail)
+        self.assertEqual(result.resolution, REMOVED)
+        content = self.notes.read_text()
+        self.assertNotIn("- new one", content)
+        self.assertNotIn("- new three", content)
+        self.assertIn("- shared line", content)  # it did not write that one
+
+    def test_one_remove_entry_correction_per_present_block(self):
+        result = self.reject(self.sha, reason="none of that is right")
+        self.assertEqual(len(result.corrections), 2)
+        for sha in result.corrections:
+            message = git("-C", str(self.hub), "log", "-1", "--pretty=%B", sha)
+            self.assertIn("hub-operation: remove-entry", message)
+            self.assertIn(f"instruction-source: {OWNER_CORRECTION}", message)
+        subjects = [
+            git("-C", str(self.hub), "log", "-1", "--pretty=%s", s) for s in result.corrections
+        ]
+        self.assertIn("part 1 of 2", subjects[0])
+        self.assertIn("part 2 of 2", subjects[1])
+
+    def test_a_partly_superseded_commit_reports_both_halves(self):
+        record(
+            self.hub,
+            WriteRequest(
+                Operation(REMOVE_ENTRY, "notes.md", "- new three"),
+                summary="Drop the third line",
+                reason="a later session tidied it away",
+            ),
+            now=NOW,
+            push=False,
+        )
+        result = self.reject(self.sha, reason="none of that is right")
+
+        self.assertEqual(result.status, RECORDED, result.detail)
+        self.assertEqual(result.resolution, PARTIALLY_REMOVED)
+        self.assertEqual(len(result.corrections), 1)
+        self.assertIn("Removed: 1", result.detail)
+        self.assertIn("Already gone", result.detail)
+        self.assertNotIn("- new one", self.notes.read_text())
+
+    def test_a_partial_outcome_is_recorded_as_partial_in_the_note(self):
+        record(
+            self.hub,
+            WriteRequest(
+                Operation(REMOVE_ENTRY, "notes.md", "- new three"), "Drop it", "tidied away"
+            ),
+            now=NOW,
+            push=False,
+        )
+        self.reject(self.sha, reason="none of that is right")
+        note = read_disposition(self.hub, self.sha)
+        assert note is not None
+        self.assertEqual(note.resolution, PARTIALLY_REMOVED)  # never a plain "removed"
+
+
+class TestReviewScopeMatchesWhatTheCliCanRecord(unittest.TestCase):
+    """P1-D, as the invariant rather than as a flag list.
+
+    `reviewable()` drops `owner-correction` because that source is only ever produced by
+    the rejection flow, which writes the matching note in the same breath. That is sound
+    exactly as long as nothing else can mint it. Verified against the version whose CLI
+    offered every source: `owner-correction` was reachable from the command line and this
+    test fails on it — an assistant told "record the correction the owner just gave me"
+    would have written hub content that never appears for review.
+    """
+
+    def test_every_source_the_cli_accepts_produces_a_reviewable_commit(self):
+        for source in CLI_SOURCES:
+            change = Change(
+                "a" * 40, NOW, "buzai assistant", "s", "c", "w", "notes.md", APPEND_ENTRY, source
+            )
+            self.assertTrue(reviewable(change), f"{source} is recordable but never reviewed")
 
 
 class TestRejectionFailurePaths(ReviewRepoCase):

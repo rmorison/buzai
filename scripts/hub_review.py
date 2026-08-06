@@ -65,6 +65,22 @@ much the file has moved since. A rejected change that *removed* content resolves
 `nothing-to-remove` for the same reason: putting the text back is a judgement about what
 the hub should say, and only the owner makes those — `--value` is how they do it.
 
+Two properties keep that search honest, and both exist because getting them wrong
+destroys knowledge quietly rather than loudly.
+
+  * **Scoped, and unique or nothing.** The search is confined to the heading the change
+    recorded, and if the block still matches more than once inside it the removal is
+    REFUSED as ambiguous and the item stays open. A hub repeats itself — "- Renewed the
+    policy.", a bare date, a boilerplate bullet — so "remove the first match" removes a
+    different, still-correct entry often enough to be a real way to lose knowledge, in
+    the one feature whose whole purpose is protecting it.
+  * **One block per hunk.** A commit that touched two places in a file added two separate
+    runs of text; their concatenation is contiguous nowhere, so a single flattened block
+    matches nothing and the rejection would resolve as `already-absent` having removed
+    not one line. Each hunk is searched and removed on its own, and a mix of present and
+    absent blocks resolves as `partially-removed` with both halves named — never as a
+    quiet success.
+
 Corrections are recorded through `hub_commit.record()`, never written here directly, so
 they get the same lock, credential scan, atomic write, and trailer discipline as anything
 else that touches a hub. A replacement is two commits (remove, then record the owner's
@@ -97,6 +113,7 @@ from scripts.hub_commit import (  # noqa: E402
     APPEND_ENTRY,
     DIVERGED,
     GIT_TIMEOUT_SECONDS,
+    HEADING,
     NOTHING_TO_PUSH,
     OWNER_CORRECTION,
     PUSH_FAILED,
@@ -116,11 +133,13 @@ from scripts.hub_commit import (  # noqa: E402
     default_backlog_path,
     default_lock_path,
     default_verifier,
+    heading_index,
     identity_env,
     is_divergence,
     read_backlog,
     record,
     run_git,
+    section_end,
 )
 from scripts.hub_paths import HubPathError, hub_dir  # noqa: E402
 from scripts.hub_remote import (  # noqa: E402
@@ -147,6 +166,7 @@ OWNER_AUTHORED = "owner-authored"
 
 # How a rejection was resolved.
 REMOVED = "removed"
+PARTIALLY_REMOVED = "partially-removed"
 REPLACED = "replaced"
 ALREADY_ABSENT = "already-absent"
 NOTHING_TO_REMOVE = "nothing-to-remove"
@@ -387,6 +407,12 @@ def reviewable(change: Change) -> bool:
     would otherwise never be seen. No for commits with no instruction source (the store's
     own initialization, or the owner's git commits from another machine) and no for
     corrections, which are the owner's verdict rather than something awaiting one.
+
+    Excluding `owner-correction` is only sound because that source is unreachable except
+    through the rejection flow below, which writes the matching review note in the same
+    breath. `hub_commit.CLI_SOURCES` is the other half of that invariant: the command line
+    does not offer the value, so an assistant told "record the correction the owner just
+    gave me" cannot mint hub content that never appears here.
     """
     return bool(change.source) and change.source != OWNER_CORRECTION
 
@@ -486,19 +512,60 @@ def summarize(
     return lines
 
 
-def contains_block(current: str, block: Sequence[str]) -> bool:
-    """Whether `block` still appears, line for line, in `current`. Pure.
+def search_window(current: str, section: str | None) -> tuple[list[str], int, int] | None:
+    """The `[lo, hi)` line range a scoped removal would search. Pure.
 
-    Mirrors the matcher `hub_commit._apply_remove` uses — contiguous, compared stripped —
-    so this decision and the removal that acts on it agree. If they ever disagree,
-    `record()` refuses with "nothing was removed" and the rejection is reported as failed;
-    the one outcome that is not possible is a silent no-op marked as resolved.
+    None when the change named a section that is no longer in the file: the recorded
+    content is not where it was put, and looking for it anywhere else is the guess this
+    module does not make.
+    """
+    lines = current.splitlines()
+    if not section:
+        return lines, 0, len(lines)
+    start = heading_index(lines, section)
+    if start is None:
+        return None
+    return lines, start + 1, section_end(lines, start)
+
+
+def count_block(current: str, block: Sequence[str], section: str | None = None) -> int:
+    """How many times `block` appears, line for line, inside the search window. Pure.
+
+    Mirrors the matcher `hub_commit._apply_remove` uses — contiguous, compared stripped,
+    scoped to the same heading — so this decision and the removal that acts on it agree.
+    It *counts* rather than answering yes/no because one match and two matches call for
+    opposite actions: remove, or refuse. A hub repeats itself constantly ("- Renewed the
+    policy.", a bare date, a boilerplate bullet), so "the first match" is not the rejected
+    entry often enough to be a real way to destroy correct knowledge.
     """
     want = [line.strip() for line in block]
     if not want:
-        return False
-    lines = [line.strip() for line in current.splitlines()]
-    return any(lines[i : i + len(want)] == want for i in range(len(lines) - len(want) + 1))
+        return 0
+    found = search_window(current, section)
+    if found is None:
+        return 0
+    lines, lo, hi = found
+    stripped = [line.strip() for line in lines]
+    return sum(1 for i in range(lo, hi - len(want) + 1) if stripped[i : i + len(want)] == want)
+
+
+def removal_scope(block: Sequence[str], section: str | None) -> str | None:
+    """The heading a removal of `block` may be scoped to. Pure.
+
+    None when the block carries a heading of its own. `hub_commit._apply_append` creates a
+    missing section as part of the entry, so a recorded block routinely *starts* with
+    `## Section` — and a section's body never contains its own heading, so scoping such a
+    block to it could only ever match nothing and turn a live rejection into a false
+    `already-absent`. A heading anywhere in the block has the same problem from the other
+    side: it is where `section_end` stops, so the window can cut the block in half.
+
+    Dropping the scope is not dropping the guard. The block must still match exactly once
+    — now across the whole file — and a block that carries a heading line is about as
+    self-locating as hub content gets.
+    """
+    if not section or any(HEADING.match(line) for line in block):
+        return None
+    return section
 
 
 # --- git: reading history and dispositions -------------------------------------------
@@ -618,15 +685,46 @@ def find_change(
     return parse_log(result.stdout)[0]
 
 
-def added_block(
+def trim_blank(lines: Sequence[str]) -> list[str]:
+    """A copy of `lines` with its leading and trailing blank lines dropped. Pure."""
+    lo, hi = 0, len(lines)
+    while lo < hi and not lines[lo].strip():
+        lo += 1
+    while hi > lo and not lines[hi - 1].strip():
+        hi -= 1
+    return list(lines[lo:hi])
+
+
+def split_hunks(diff: str) -> list[list[str]]:
+    """Added lines per hunk of a `--unified=0` diff, one block each. Pure.
+
+    Per hunk, not one flattened list, because a commit that touched two places in a file
+    added two *separate* runs of text and their concatenation is contiguous nowhere. A
+    `replace-section` routinely produces several hunks, and searching for the flattened
+    block finds nothing — which reads as "already absent" and resolves a rejection that
+    removed not one line.
+    """
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in diff.splitlines():
+        if line.startswith("@@"):
+            blocks.append(current)
+            current = []
+        elif line.startswith("+") and not line.startswith("+++"):
+            current.append(line[1:])
+    blocks.append(current)
+    return [trimmed for block in blocks if (trimmed := trim_blank(block))]
+
+
+def added_blocks(
     hub: Path,
     sha: str,
     file: str,
     *,
     runner: GitRunner = default_git_runner,
     timeout: float = GIT_TIMEOUT_SECONDS,
-) -> list[str]:
-    """The lines this commit added to `file`.
+) -> list[list[str]]:
+    """The runs of lines this commit added to `file` — one block per hunk.
 
     Read from the commit's own diff, which is machine-internal: R9 governs what the owner
     is shown, and prose cannot locate text to remove. The lines are used only as a
@@ -637,16 +735,7 @@ def added_block(
     result = run_git(hub, args, runner, timeout)
     if result.returncode != 0:
         raise HubReviewError(f"cannot read what {sha[:8]} changed in {file}: {detail_of(result)}")
-    added = [
-        line[1:]
-        for line in result.stdout.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
-    ]
-    while added and not added[0].strip():
-        added.pop(0)
-    while added and not added[-1].strip():
-        added.pop()
-    return added
+    return split_hunks(result.stdout)
 
 
 # --- pushing the notes ref -----------------------------------------------------------
@@ -865,7 +954,13 @@ def _reject(
     passthrough: dict,
     runner: GitRunner,
 ) -> tuple[str, tuple[str, ...], str]:
-    """Remove the rejected content and, if the owner supplied one, record their value."""
+    """Remove the rejected content and, if the owner supplied one, record their value.
+
+    The removal is scoped to the heading the change recorded and refuses when the block
+    is not unique inside it (`_refuse_if_ambiguous`), and it is applied per *hunk* — a
+    commit that wrote two places gets two removals, and blocks that are already gone are
+    reported as such rather than silently dragging the whole verdict to "resolved".
+    """
     if not change.file:
         raise HubReviewError(
             f"{change.short} names no hub file (no {TRAILER_FILE} trailer), so there is no "
@@ -873,16 +968,25 @@ def _reject(
         )
     target = hub / change.file
     current = target.read_text() if target.is_file() else ""
-    block = added_block(hub, change.sha, change.file, runner=runner)
+    blocks = added_blocks(hub, change.sha, change.file, runner=runner)
+    scopes = [removal_scope(block, change.section) for block in blocks]
+    counts = [count_block(current, b, s) for b, s in zip(blocks, scopes, strict=True)]
+    # Before any correction is committed: one ambiguous block refuses the whole verdict,
+    # so a rejection never lands half-applied on a file it could not read unambiguously.
+    _refuse_if_ambiguous(change, counts, scopes)
+
     value = decision.value.strip()
+    found = [(b, s) for b, s, n in zip(blocks, scopes, counts, strict=True) if n == 1]
+    absent = len(blocks) - len(found)
     corrections: list[str] = []
 
-    if contains_block(current, block):
+    for index, (block, scope) in enumerate(found, 1):
+        part = f", part {index} of {len(found)}" if len(found) > 1 else ""
         corrections.append(
             _correct(
                 hub,
-                Operation(REMOVE_ENTRY, change.file, "\n".join(block)),
-                f"Remove content the owner rejected ({change.short})",
+                Operation(REMOVE_ENTRY, change.file, "\n".join(block), section=scope),
+                f"Remove content the owner rejected ({change.short}){part}",
                 rejection_reason(
                     change,
                     decision.reason.strip(),
@@ -892,13 +996,13 @@ def _reject(
                     else "The owner supplied the correct value, recorded separately.",
                 ),
                 now=now,
-                push=push and not value,
+                # One push at the end of the whole verdict, not one per correction.
+                push=push and not value and index == len(found),
                 **passthrough,
             )
         )
-        resolution = REMOVED
-        detail = f"{change.short} rejected — the recorded content was removed from {change.file}"
-    elif not block:
+
+    if not blocks:
         # The rejected change took content out rather than putting any in. Putting it back
         # is not this module's call: only the owner knows whether the removal was the
         # mistake or the wording was, and `--value` is how they say so.
@@ -909,7 +1013,7 @@ def _reject(
             "automatically; if something went away that should not have, say what it should "
             "say and it will be recorded"
         )
-    else:
+    elif not found:
         resolution = ALREADY_ABSENT
         detail = (
             f"{change.short} rejected — its content is no longer in {change.file} (reworded, "
@@ -917,13 +1021,24 @@ def _reject(
             "to stand in for it. If what is there now is also wrong, reject the change that "
             "wrote it"
         )
+    elif absent:
+        resolution = PARTIALLY_REMOVED
+        detail = (
+            f"{change.short} rejected — that change wrote {len(blocks)} separate places in "
+            f"{change.file}. Removed: {len(found)}. Already gone (reworded, superseded, or "
+            f"removed since): {absent}. Nothing was invented to stand in for the part that "
+            "had gone; if what is there now is also wrong, reject the change that wrote it"
+        )
+    else:
+        resolution = REMOVED
+        detail = f"{change.short} rejected — the recorded content was removed from {change.file}"
 
     if value:
-        section = decision.section or change.section
+        landing = decision.section or change.section
         corrections.append(
             _correct(
                 hub,
-                Operation(APPEND_ENTRY, change.file, value, section=section),
+                Operation(APPEND_ENTRY, change.file, value, section=landing),
                 f"Record the owner's correction to {change.file} ({change.short})",
                 rejection_reason(
                     change,
@@ -937,7 +1052,46 @@ def _reject(
         )
         resolution = REPLACED
         detail = f"{change.short} rejected — replaced in {change.file} with the owner's value"
+        if absent:
+            detail += (
+                f" ({len(found)} of {len(blocks)} recorded place(s) were still there and were "
+                f"removed; {absent} had already gone and nothing was invented to stand in)"
+            )
     return resolution, tuple(corrections), detail
+
+
+def _refuse_if_ambiguous(
+    change: Change, counts: Sequence[int], scopes: Sequence[str | None]
+) -> None:
+    """Refuse the verdict when the recorded content is not unique where it was recorded.
+
+    The alternative — removing the first match — is silent destruction of a correct entry
+    whenever a hub repeats a line, which hubs do constantly. Raising here (rather than
+    resolving as anything) is what leaves the item open: `dispose()` writes the note only
+    after `_reject` returns, so a refusal means no disposition, and the owner is asked
+    again with the detail they need to act.
+
+    The message carries the file, the heading searched, and the number of matches — what
+    the owner needs to take the right one out by hand — but never the matching text: R9
+    still holds, and a duplicated line quoted back is the least useful half of it anyway.
+    """
+    worst = max(counts, default=0)
+    if worst < 2:
+        return
+    scope = scopes[counts.index(worst)]
+    where = (
+        f"under the {scope!r} heading"
+        if scope
+        else "and the change recorded no heading to narrow the search to"
+    )
+    raise HubReviewError(
+        f"{change.short} was NOT removed and is still awaiting your review: the content it "
+        f"recorded appears {worst} times in {change.file} {where}, so there is no way to tell "
+        "which of them this change wrote — and removing the wrong one deletes a correct entry. "
+        "Nothing was changed. Take the right one out by hand with `scripts/hub_commit.py "
+        f"--file {change.file} --remove-entry - --section '<heading>' --summary ... --reason "
+        "...`, then approve or reject this item"
+    )
 
 
 def _finish(

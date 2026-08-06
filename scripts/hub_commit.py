@@ -53,7 +53,18 @@ trailer. Left alone it would either stay invisible to review forever or get swep
 the assistant's commit under the assistant's name — both worse than an honest "this was
 found on disk and nobody claims it". A dirty file whose content trips the credential
 scan is left dirty and reported rather than committed; the assistant's own write still
-proceeds, because the commit is path-scoped.
+proceeds, because the commit is path-scoped — *unless* the flagged file is the very file
+this operation targets. Path-scoping protects the other files, not that one: the commit
+names the target path, so it would sweep the flagged pre-existing content in with the
+new entry, and the added-lines scan cannot catch it (those lines were already on disk, so
+they are not "added"). That case is refused outright, before anything is written.
+
+Who may be named as the instruction source
+------------------------------------------
+`record()` accepts all of `SOURCES`; the command line accepts only `CLI_SOURCES`.
+`owner-correction` is API-only because `hub_review` excludes that source from the review
+queue — it is meaningful solely as the output of the rejection flow, which also writes
+the review note that accounts for it. See `CLI_SOURCES`.
 
 Push, backlog, and divergence
 -----------------------------
@@ -111,6 +122,16 @@ OWNER_DIRECTED = "owner-directed"
 OWNER_CORRECTION = "owner-correction"
 UNATTRIBUTED = "unattributed"
 SOURCES = (AUTONOMOUS, OWNER_DIRECTED, OWNER_CORRECTION)
+
+# What the *command line* may ask for, which is deliberately narrower than `SOURCES`.
+# `owner-correction` is excluded: `hub_review.reviewable()` treats that source as "this
+# commit IS the owner's verdict" and keeps it out of the review queue forever, which is
+# only sound when the value is produced by the rejection flow that also writes the
+# matching review note. Reached from the CLI it would mint hub content that no owner can
+# ever be shown — the one outcome the whole review loop exists to prevent. Restricting
+# the parser rather than the API is what keeps `hub_review._correct()` working unchanged
+# while making the accident unreachable.
+CLI_SOURCES = (AUTONOMOUS, OWNER_DIRECTED)
 
 # Write outcomes.
 COMMITTED = "committed"
@@ -262,6 +283,19 @@ class Reconciliation:
     commit: str | None = None
     committed: tuple[str, ...] = ()
     skipped: tuple[tuple[str, tuple[Finding, ...]], ...] = ()
+
+    def blocking(self, file: str) -> tuple[tuple[str, tuple[Finding, ...]], ...]:
+        """The skipped entries that cover `file` — the ones a write to it must not pass.
+
+        An untracked *directory* is one porcelain record (`sub/`), so a file inside it is
+        covered by that record even though the strings differ.
+        """
+        return tuple((p, f) for p, f in self.skipped if covers(p, file))
+
+
+def covers(path: str, file: str) -> bool:
+    """Whether a working-tree path names `file`, directly or as its directory. Pure."""
+    return file == path or file.startswith(path.rstrip("/") + "/")
 
 
 @dataclass(frozen=True)
@@ -1079,6 +1113,31 @@ def record(
             target = hub_relative(hub, op.file)
             reconciled = reconcile_dirty(hub, runner, now, git_timeout)
 
+            # The reconciler left this very file dirty because its *existing* content is
+            # credential-shaped. Proceeding would path-scope the commit onto that path and
+            # carry the flagged content in with the new entry, past a scan that only ever
+            # looks at added lines. Refuse before touching the file: nothing is written,
+            # nothing is committed, and the flagged content stays where the reconciler
+            # left it — uncommitted, and reported.
+            blocking = reconciled.blocking(op.file)
+            if blocking:
+                findings = tuple(f for _, hits in blocking for f in hits)
+                flagged = ", ".join(p for p, _ in blocking)
+                return WriteResult(
+                    REFUSED,
+                    None,
+                    op.file,
+                    f"refused to record into {op.file}: {flagged} is already sitting "
+                    "uncommitted with credential-shaped content "
+                    f"({'; '.join(str(f) for f in findings)}), and this write commits that "
+                    f"path — the pre-existing content would be committed with it. Nothing "
+                    f"was written and nothing was committed; remove or redact the flagged "
+                    f"content in {flagged} first, then record this again",
+                    findings=findings,
+                    reconciled=reconciled,
+                    lock_note=lock_note,
+                )
+
             prior = target.read_text() if target.is_file() else None
             new = apply_operation(prior or "", op)
             if new == (prior or ""):
@@ -1160,7 +1219,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--section", help="scope the operation to this heading")
     parser.add_argument("--summary", default="", help="subject line: what changed")
     parser.add_argument("--reason", default="", help="why it changed (goes in the message body)")
-    parser.add_argument("--source", choices=SOURCES, default=AUTONOMOUS, help="who asked for it")
+    parser.add_argument(
+        "--source",
+        choices=CLI_SOURCES,
+        default=AUTONOMOUS,
+        help=(
+            "who asked for it: 'autonomous' (the assistant's own judgement) or "
+            "'owner-directed' (the owner asked for this content). To record a CORRECTION "
+            "to something already in the hub, reject the original instead — "
+            "`hub_review.py --reject <id> --reason ... [--value ...]` — which removes the "
+            "wrong content, records the owner's value, and links the two. A correction "
+            "recorded here would never appear for review"
+        ),
+    )
     parser.add_argument("--no-push", action="store_true", help="commit only; do not push")
     parser.add_argument(
         "--retry-push",
@@ -1249,6 +1320,11 @@ def main(argv=None) -> int:
             "are visible to review"
         )
     for path, findings in result.reconciled.skipped:
+        # "left uncommitted" has to be true of the path it names. `record()` refuses the
+        # write when its target is one of these, so a committed path can no longer appear
+        # here — this keeps the claim true by construction rather than by reading that.
+        if result.recorded and covers(path, result.file):
+            continue
         print(
             f"hub-commit WARN: left {path} uncommitted — it is credential-shaped "
             f"({'; '.join(str(f) for f in findings)})",
