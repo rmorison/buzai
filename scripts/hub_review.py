@@ -40,9 +40,12 @@ here advances an item because its neighbours were approved (R10), and there is n
 past everything the owner scrolled by without deciding.
 
 Commits with no `instruction-source` trailer are not review items: they were not recorded
-through the assistant's write path (`make hub-init`'s seed, or the owner's own git
-commits from another machine). Correction commits are excluded too — they *are* the
-owner's verdict, and asking them to review their own correction is a loop.
+through the assistant's write path (the owner's own git commits from another machine).
+Correction commits are excluded too — they *are* the owner's verdict, and asking them to
+review their own correction is a loop. So is the **root commit**: `make hub-init`'s seed
+does carry a trailer (`owner-directed` — the owner ran it), but it is the store's own
+bootstrap rather than anything the assistant recorded, and leaving it in made the
+scaffolding the first item every fresh instance was asked to review.
 
 What a rejection does
 ---------------------
@@ -74,12 +77,23 @@ destroys knowledge quietly rather than loudly.
     policy.", a bare date, a boilerplate bullet — so "remove the first match" removes a
     different, still-correct entry often enough to be a real way to lose knowledge, in
     the one feature whose whole purpose is protecting it.
-  * **One block per hunk.** A commit that touched two places in a file added two separate
-    runs of text; their concatenation is contiguous nowhere, so a single flattened block
-    matches nothing and the rejection would resolve as `already-absent` having removed
-    not one line. Each hunk is searched and removed on its own, and a mix of present and
-    absent blocks resolves as `partially-removed` with both halves named — never as a
-    quiet success.
+  * **One block per hunk, in every file the commit named.** A commit that touched two
+    places added two separate runs of text; their concatenation is contiguous nowhere, so
+    a single flattened block matches nothing and the rejection would resolve as
+    `already-absent` having removed not one line. Each hunk is searched and removed on its
+    own, and a mix of present and absent blocks resolves as `partially-removed` with both
+    halves named — never as a quiet success.
+  * **A block edited within itself is refused, not resolved.** The mirror of the above:
+    one block whose text was *partially* changed since (a line reworded, a line inserted
+    into the middle) no longer matches as a run, so it would count as absent while the
+    rest of its lines are still in the file. That closes the item with the content still
+    there — so it refuses instead, names the surviving lines, and leaves the item open.
+
+`--value` does not change any of this: the owner's value is recorded either way, and the
+resolution keeps saying what actually happened to the old content. `replaced` means it
+came out; when nothing came out the resolution stays `already-absent`, `nothing-to-remove`
+or `partially-removed`, because "replaced" is the one reading of the outcome the owner
+cannot check without opening the file.
 
 Corrections are recorded through `hub_commit.record()`, never written here directly, so
 they get the same lock, credential scan, atomic write, and trailer discipline as anything
@@ -102,7 +116,7 @@ import json
 import re
 import sys
 import textwrap
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -133,6 +147,7 @@ from scripts.hub_commit import (  # noqa: E402
     default_backlog_path,
     default_lock_path,
     default_verifier,
+    detail_of,
     heading_index,
     identity_env,
     is_divergence,
@@ -200,6 +215,9 @@ QUOTED_SECTION = re.compile(r"'([^']+)'")
 
 # `git log` on a branch with no commits is a legitimate empty state, not a broken repo.
 NO_COMMITS = "does not have any commits yet"
+# The same state as `git rev-list` reports it: it resolves HEAD rather than reading the
+# branch, so it fails differently. Both are "the hub is empty", neither is a failure.
+NO_HEAD = "unknown revision"
 NO_NOTE = "no note found"
 
 
@@ -223,10 +241,16 @@ class Change:
     file: str
     operation: str
     source: str
+    files: tuple[str, ...] = ()
 
     @property
     def short(self) -> str:
         return self.sha[:8]
+
+    @property
+    def named_files(self) -> tuple[str, ...]:
+        """Every hub file this commit says it touched. `file` is the first of them."""
+        return self.files or ((self.file,) if self.file else ())
 
     @property
     def section(self) -> str | None:
@@ -241,7 +265,9 @@ class Change:
             lines.extend(wrapped("what", self.changed))
         if self.why:
             lines.extend(wrapped("why", self.why))
-        facts = [f"file: {self.file}" if self.file else "", f"recorded: {self.source}"]
+        named = self.named_files
+        listed = f"file{'s' if len(named) > 1 else ''}: {', '.join(named)}" if named else ""
+        facts = [listed, f"recorded: {self.source}"]
         lines.append("     " + " | ".join(f for f in facts if f))
         return lines
 
@@ -344,8 +370,8 @@ class DispositionResult:
 # --- pure: parsing the log -----------------------------------------------------------
 
 
-def parse_trailers(message: str) -> dict[str, str]:
-    """Trailers from a commit message's last paragraph. Pure.
+def trailer_pairs(message: str) -> list[tuple[str, str]]:
+    """(name, value) for every trailer line, in order, keeping repeats. Pure.
 
     Requires a body: a one-paragraph message whose only line happens to read
     `feat: something` is a subject, not a trailer block, and reading it as one would
@@ -353,11 +379,26 @@ def parse_trailers(message: str) -> dict[str, str]:
     """
     paragraphs = [p for p in message.strip().split("\n\n") if p.strip()]
     if len(paragraphs) < 2:
-        return {}
+        return []
     matched = [TRAILER_LINE.match(line) for line in paragraphs[-1].splitlines() if line.strip()]
     if not matched or not all(matched):
-        return {}
-    return {m.group(1).lower(): m.group(2) for m in matched if m is not None}
+        return []
+    return [(m.group(1).lower(), m.group(2)) for m in matched if m is not None]
+
+
+def parse_trailers(message: str) -> dict[str, str]:
+    """Trailers as a mapping. Pure. A repeated trailer keeps its last value."""
+    return dict(trailer_pairs(message))
+
+
+def trailer_values(message: str, name: str) -> tuple[str, ...]:
+    """Every value of a repeated trailer, in order. Pure.
+
+    `hub-file` is genuinely repeatable: the reconciliation of a dirty tree commits every
+    loose file in one commit and names each of them, and the rejection flow has to act on
+    all of them, not on whichever one the mapping happened to keep.
+    """
+    return tuple(value for key, value in trailer_pairs(message) if key == name)
 
 
 def body_field(message: str, label: str) -> str:
@@ -371,6 +412,7 @@ def body_field(message: str, label: str) -> str:
 def build_change(sha: str, when: str, author: str, message: str) -> Change:
     """One log record -> a `Change`. Pure."""
     trailers = parse_trailers(message)
+    files = trailer_values(message, TRAILER_FILE)
     lines = message.strip().splitlines()
     return Change(
         sha=sha.strip(),
@@ -379,9 +421,10 @@ def build_change(sha: str, when: str, author: str, message: str) -> Change:
         subject=lines[0].strip() if lines else "(no message)",
         changed=body_field(message, "Changed:"),
         why=body_field(message, "Why:"),
-        file=trailers.get(TRAILER_FILE, ""),
+        file=files[0] if files else "",
         operation=trailers.get(TRAILER_OPERATION, ""),
         source=trailers.get(TRAILER_SOURCE, ""),
+        files=files,
     )
 
 
@@ -399,21 +442,31 @@ def parse_log(out: str) -> list[Change]:
     return changes
 
 
-def reviewable(change: Change) -> bool:
+def reviewable(change: Change, roots: Collection[str] = ()) -> bool:
     """Whether this commit is something the owner reviews. Pure.
 
     Yes for anything the assistant's write path recorded — including the `unattributed`
     reconciliation of content found loose on disk, which is precisely the content that
-    would otherwise never be seen. No for commits with no instruction source (the store's
-    own initialization, or the owner's git commits from another machine) and no for
-    corrections, which are the owner's verdict rather than something awaiting one.
+    would otherwise never be seen. Three exclusions:
 
-    Excluding `owner-correction` is only sound because that source is unreachable except
-    through the rejection flow below, which writes the matching review note in the same
-    breath. `hub_commit.CLI_SOURCES` is the other half of that invariant: the command line
-    does not offer the value, so an assistant told "record the correction the owner just
-    gave me" cannot mint hub content that never appears here.
+      * **no instruction source** — the owner's own git commits from another machine.
+      * **`owner-correction`** — those *are* the owner's verdict, not something awaiting
+        one. Sound only because that source is unreachable except through the rejection
+        flow below, which writes the matching review note in the same breath.
+        `hub_commit.CLI_SOURCES` is the other half of that invariant: the command line
+        does not offer the value, so an assistant told "record the correction the owner
+        just gave me" cannot mint hub content that never appears here.
+      * **the root commit** — `hub_init`'s seed. It carries `owner-directed` (the owner
+        did run `make hub-init`), so it is not filtered by source, yet it is the store's
+        own bootstrap rather than recorded knowledge: left in, the first thing every
+        fresh instance asks its owner to review is the scaffolding. Identifying it by
+        being parentless rather than by its subject means nothing has to match on prose.
+
+    `roots` is passed in rather than read from git so this stays pure; `root_commits()`
+    is the reader.
     """
+    if change.sha in roots:
+        return False
     return bool(change.source) and change.source != OWNER_CORRECTION
 
 
@@ -571,12 +624,6 @@ def removal_scope(block: Sequence[str], section: str | None) -> str | None:
 # --- git: reading history and dispositions -------------------------------------------
 
 
-def detail_of(result) -> str:
-    """The most useful single line of a failed git call."""
-    text = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
-    return text.splitlines()[-1]
-
-
 def read_changes(
     hub: Path, *, runner: GitRunner = default_git_runner, timeout: float = GIT_TIMEOUT_SECONDS
 ) -> list[Change]:
@@ -587,6 +634,23 @@ def read_changes(
             return []  # an initialized-but-empty hub is a legitimate state, not a failure
         raise HubReviewError(f"cannot read the hub history: {detail_of(result)}")
     return parse_log(result.stdout)
+
+
+def root_commits(
+    hub: Path, *, runner: GitRunner = default_git_runner, timeout: float = GIT_TIMEOUT_SECONDS
+) -> frozenset[str]:
+    """The parentless commits reachable from HEAD — in a hub, `hub-init`'s seed.
+
+    Raises when history cannot be read, for the same reason `read_changes` does: guessing
+    "no roots" would put the seed commit back in the queue, and guessing anything else
+    would hide a real item.
+    """
+    result = run_git(hub, ["rev-list", "--max-parents=0", "HEAD"], runner, timeout)
+    if result.returncode != 0:
+        if NO_COMMITS in result.stderr or NO_HEAD in result.stderr:
+            return frozenset()
+        raise HubReviewError(f"cannot read the hub's root commit: {detail_of(result)}")
+    return frozenset(line.strip() for line in result.stdout.splitlines() if line.strip())
 
 
 def disposed_shas(
@@ -736,6 +800,61 @@ def added_blocks(
     if result.returncode != 0:
         raise HubReviewError(f"cannot read what {sha[:8]} changed in {file}: {detail_of(result)}")
     return split_hunks(result.stdout)
+
+
+def changed_paths(
+    hub: Path,
+    sha: str,
+    *,
+    runner: GitRunner = default_git_runner,
+    timeout: float = GIT_TIMEOUT_SECONDS,
+) -> tuple[str, ...]:
+    """The files a commit touched, from git rather than from its message. NUL-separated."""
+    args = ["show", "--name-only", "--format=", "--no-color", "-z", sha]
+    result = run_git(hub, args, runner, timeout)
+    if result.returncode != 0:
+        raise HubReviewError(f"cannot read which files {sha[:8]} changed: {detail_of(result)}")
+    return tuple(path for path in result.stdout.split("\0") if path.strip())
+
+
+def rejected_files(
+    hub: Path,
+    change: Change,
+    *,
+    runner: GitRunner = default_git_runner,
+    timeout: float = GIT_TIMEOUT_SECONDS,
+) -> tuple[str, ...]:
+    """The hub files a rejection of `change` has to act on.
+
+    The `hub-file:` trailers are the answer whenever they are there. Two cases fall back
+    to git's own list of what the commit touched:
+
+      * **no trailer at all, but an instruction source.** Reconciliation commits written
+        before the trailer was added are in that state — recorded through the write path,
+        visible to review, and (without this) approvable but never rejectable, which is
+        backwards for the least-trusted content in the store. A commit with *no* source
+        did not come from the write path and is still refused: it is the owner's own git
+        commit or the store's seed, and this flow is not a general-purpose file editor.
+      * **a trailer naming a directory.** git reports an untracked directory as one
+        porcelain record (`sub/`), so that is what reconciliation names; git's per-file
+        list is what a removal can actually open.
+    """
+    named = change.named_files
+    if not named:
+        if not change.source:
+            raise HubReviewError(
+                f"{change.short} names no hub file (no {TRAILER_FILE} trailer) and was not "
+                "recorded through the hub write path, so there is no recorded content to "
+                "remove — it is the store's own seed, or a commit made outside buzai"
+            )
+        named = changed_paths(hub, change.sha, runner=runner, timeout=timeout)
+    elif any(name.endswith("/") or (hub / name).is_dir() for name in named):
+        named = changed_paths(hub, change.sha, runner=runner, timeout=timeout)
+    if not named:
+        raise HubReviewError(
+            f"{change.short} changed no file in the hub, so there is nothing to remove"
+        )
+    return named
 
 
 # --- pushing the notes ref -----------------------------------------------------------
@@ -938,10 +1057,54 @@ def dispose(
             resolution=resolution,
             corrections=corrections,
         )
-    except (HubReviewError, OSError) as e:
-        # OSError too: an unreadable hub file must come back as a failed verdict, not as a
-        # traceback that leaves the caller guessing whether anything was applied.
+    except (HubReviewError, OSError, UnicodeDecodeError) as e:
+        # OSError and UnicodeDecodeError too: an unreadable hub file — missing permissions
+        # or not text at all — must come back as a failed verdict, not as a traceback that
+        # leaves the caller guessing whether anything was applied. UnicodeDecodeError is a
+        # ValueError, so it is not covered by OSError and has to be named.
         return DispositionResult(FAILED, decision.sha, decision.disposition, str(e))
+
+
+@dataclass(frozen=True)
+class RecordedBlock:
+    """One run of lines a rejected commit added, and where a removal would look for it."""
+
+    file: str
+    lines: tuple[str, ...]
+    scope: str | None
+    count: int
+
+    @property
+    def meaningful(self) -> tuple[str, ...]:
+        """The block's content lines — the ones whose presence says anything.
+
+        Blank lines are out because one blank line matches every other. Headings are out
+        because they are structure, not content: `hub_commit._apply_append` creates a
+        missing section *as part of* the entry, so a recorded block routinely opens with
+        `## Section` — and a heading that now sits above whatever was written since is not
+        the rejected content still standing.
+        """
+        return tuple(line for line in self.lines if line.strip() and not HEADING.match(line))
+
+
+def recorded_blocks(
+    hub: Path,
+    change: Change,
+    files: Sequence[str],
+    contents: dict[str, str],
+    *,
+    runner: GitRunner,
+    timeout: float = GIT_TIMEOUT_SECONDS,
+) -> list[RecordedBlock]:
+    """Every block `change` added, across every file it named, with its current count."""
+    blocks: list[RecordedBlock] = []
+    for name in files:
+        for block in added_blocks(hub, change.sha, name, runner=runner, timeout=timeout):
+            scope = removal_scope(block, change.section)
+            blocks.append(
+                RecordedBlock(name, tuple(block), scope, count_block(contents[name], block, scope))
+            )
+    return blocks
 
 
 def _reject(
@@ -957,35 +1120,35 @@ def _reject(
     """Remove the rejected content and, if the owner supplied one, record their value.
 
     The removal is scoped to the heading the change recorded and refuses when the block
-    is not unique inside it (`_refuse_if_ambiguous`), and it is applied per *hunk* — a
-    commit that wrote two places gets two removals, and blocks that are already gone are
-    reported as such rather than silently dragging the whole verdict to "resolved".
+    is not unique inside it (`_refuse_if_ambiguous`) or when only part of it is still
+    there (`_refuse_if_partially_edited`), and it is applied per *hunk* — a commit that
+    wrote two places gets two removals, and blocks that are already gone are reported as
+    such rather than silently dragging the whole verdict to "resolved".
+
+    One commit may name several files (reconciliation commits routinely do), so every
+    file is searched and each block is removed from the file it was recorded in. The
+    owner's `--value`, being one entry, is recorded in the first of them.
     """
-    if not change.file:
-        raise HubReviewError(
-            f"{change.short} names no hub file (no {TRAILER_FILE} trailer), so there is no "
-            "recorded content to remove — it was not written through the hub write path"
-        )
-    target = hub / change.file
-    current = target.read_text() if target.is_file() else ""
-    blocks = added_blocks(hub, change.sha, change.file, runner=runner)
-    scopes = [removal_scope(block, change.section) for block in blocks]
-    counts = [count_block(current, b, s) for b, s in zip(blocks, scopes, strict=True)]
-    # Before any correction is committed: one ambiguous block refuses the whole verdict,
-    # so a rejection never lands half-applied on a file it could not read unambiguously.
-    _refuse_if_ambiguous(change, counts, scopes)
+    files = rejected_files(hub, change, runner=runner)
+    contents = {name: _current_text(hub / name) for name in files}
+    blocks = recorded_blocks(hub, change, files, contents, runner=runner)
+    # Both refusals run before any correction is committed, so a rejection never lands
+    # half-applied on a file it could not read unambiguously.
+    _refuse_if_ambiguous(change, blocks)
+    _refuse_if_partially_edited(change, blocks, contents)
 
     value = decision.value.strip()
-    found = [(b, s) for b, s, n in zip(blocks, scopes, counts, strict=True) if n == 1]
+    found = [block for block in blocks if block.count == 1]
     absent = len(blocks) - len(found)
+    where = ", ".join(files)
     corrections: list[str] = []
 
-    for index, (block, scope) in enumerate(found, 1):
+    for index, block in enumerate(found, 1):
         part = f", part {index} of {len(found)}" if len(found) > 1 else ""
         corrections.append(
             _correct(
                 hub,
-                Operation(REMOVE_ENTRY, change.file, "\n".join(block), section=scope),
+                Operation(REMOVE_ENTRY, block.file, "\n".join(block.lines), section=block.scope),
                 f"Remove content the owner rejected ({change.short}){part}",
                 rejection_reason(
                     change,
@@ -1008,7 +1171,7 @@ def _reject(
         # mistake or the wording was, and `--value` is how they say so.
         resolution = NOTHING_TO_REMOVE
         detail = (
-            f"{change.short} rejected — that change added nothing to {change.file} (it removed "
+            f"{change.short} rejected — that change added nothing to {where} (it removed "
             "or reorganized content), so there is nothing to take out. Nothing was restored "
             "automatically; if something went away that should not have, say what it should "
             "say and it will be recorded"
@@ -1016,7 +1179,7 @@ def _reject(
     elif not found:
         resolution = ALREADY_ABSENT
         detail = (
-            f"{change.short} rejected — its content is no longer in {change.file} (reworded, "
+            f"{change.short} rejected — its content is no longer in {where} (reworded, "
             "superseded, or already removed), so nothing was removed and nothing was invented "
             "to stand in for it. If what is there now is also wrong, reject the change that "
             "wrote it"
@@ -1025,21 +1188,23 @@ def _reject(
         resolution = PARTIALLY_REMOVED
         detail = (
             f"{change.short} rejected — that change wrote {len(blocks)} separate places in "
-            f"{change.file}. Removed: {len(found)}. Already gone (reworded, superseded, or "
+            f"{where}. Removed: {len(found)}. Already gone (reworded, superseded, or "
             f"removed since): {absent}. Nothing was invented to stand in for the part that "
             "had gone; if what is there now is also wrong, reject the change that wrote it"
         )
     else:
         resolution = REMOVED
-        detail = f"{change.short} rejected — the recorded content was removed from {change.file}"
+        detail = f"{change.short} rejected — the recorded content was removed from {where}"
 
     if value:
-        landing = decision.section or change.section
+        landing_file = files[0]
         corrections.append(
             _correct(
                 hub,
-                Operation(APPEND_ENTRY, change.file, value, section=landing),
-                f"Record the owner's correction to {change.file} ({change.short})",
+                Operation(
+                    APPEND_ENTRY, landing_file, value, section=decision.section or change.section
+                ),
+                f"Record the owner's correction to {landing_file} ({change.short})",
                 rejection_reason(
                     change,
                     decision.reason.strip(),
@@ -1050,19 +1215,36 @@ def _reject(
                 **passthrough,
             )
         )
-        resolution = REPLACED
-        detail = f"{change.short} rejected — replaced in {change.file} with the owner's value"
-        if absent:
+        # `replaced` is a claim about what happened to the OLD content, so it is only true
+        # when the old content actually came out. Saying it whenever a value was supplied
+        # told the owner their entry had been replaced when nothing had been removed and
+        # theirs was merely appended — the one reading of the outcome they cannot check
+        # without opening the file. Every other branch keeps its honest resolution and
+        # says, in the detail, that the value was recorded with nothing taken out.
+        if resolution == REMOVED:
+            resolution = REPLACED
+            detail = f"{change.short} rejected — replaced in {landing_file} with the owner's value"
+        elif resolution == PARTIALLY_REMOVED:
             detail += (
-                f" ({len(found)} of {len(blocks)} recorded place(s) were still there and were "
-                f"removed; {absent} had already gone and nothing was invented to stand in)"
+                f". The owner's value was recorded in {landing_file}: {len(found)} of "
+                f"{len(blocks)} recorded place(s) were still there and were removed, {absent} "
+                "had already gone"
+            )
+        else:
+            detail += (
+                f". The owner's value was recorded in {landing_file} even so — nothing was "
+                "removed to make room for it, so check that it reads correctly alongside what "
+                "is already there"
             )
     return resolution, tuple(corrections), detail
 
 
-def _refuse_if_ambiguous(
-    change: Change, counts: Sequence[int], scopes: Sequence[str | None]
-) -> None:
+def _current_text(target: Path) -> str:
+    """A hub file's current content, or empty when it is not there. Raises on binary."""
+    return target.read_text() if target.is_file() else ""
+
+
+def _refuse_if_ambiguous(change: Change, blocks: Sequence[RecordedBlock]) -> None:
     """Refuse the verdict when the recorded content is not unique where it was recorded.
 
     The alternative — removing the first match — is silent destruction of a correct entry
@@ -1075,23 +1257,85 @@ def _refuse_if_ambiguous(
     the owner needs to take the right one out by hand — but never the matching text: R9
     still holds, and a duplicated line quoted back is the least useful half of it anyway.
     """
-    worst = max(counts, default=0)
+    worst = max((block.count for block in blocks), default=0)
     if worst < 2:
         return
-    scope = scopes[counts.index(worst)]
+    block = next(b for b in blocks if b.count == worst)
     where = (
-        f"under the {scope!r} heading"
-        if scope
+        f"under the {block.scope!r} heading"
+        if block.scope
         else "and the change recorded no heading to narrow the search to"
     )
     raise HubReviewError(
         f"{change.short} was NOT removed and is still awaiting your review: the content it "
-        f"recorded appears {worst} times in {change.file} {where}, so there is no way to tell "
+        f"recorded appears {worst} times in {block.file} {where}, so there is no way to tell "
         "which of them this change wrote — and removing the wrong one deletes a correct entry. "
         "Nothing was changed. Take the right one out by hand with `scripts/hub_commit.py "
-        f"--file {change.file} --remove-entry - --section '<heading>' --summary ... --reason "
+        f"--file {block.file} --remove-entry - --section '<heading>' --summary ... --reason "
         "...`, then approve or reject this item"
     )
+
+
+def surviving_lines(block: RecordedBlock, current: str) -> tuple[str, ...]:
+    """Which of a block's lines are still in the file, individually. Pure.
+
+    Line-for-line rather than as a run: this is asked only about a block that no longer
+    matches as a whole, and the question is whether any of what it recorded is still
+    standing. Blank lines carry no information and are ignored — one blank line matches
+    every other blank line in the file.
+    """
+    window = search_window(current, block.scope)
+    if window is None:
+        return ()
+    lines, lo, hi = window
+    present = {line.strip() for line in lines[lo:hi] if line.strip()}
+    return tuple(line for line in block.meaningful if line.strip() in present)
+
+
+def _refuse_if_partially_edited(
+    change: Change, blocks: Sequence[RecordedBlock], contents: dict[str, str]
+) -> None:
+    """Refuse when a block no longer matches but part of what it recorded is still there.
+
+    `PARTIALLY_REMOVED` covers a commit that wrote several *blocks* of which some survive.
+    This is the other half: one block, edited *within* — a line reworded, a line inserted
+    into the middle — so the run no longer matches anywhere and the block counts as absent
+    while the rest of its *content* lines are still sitting in the hub (see
+    `RecordedBlock.meaningful` for why a surviving heading is not one of them). Resolved
+    as `already-absent`
+    the item would be closed with the surviving lines left behind, which is the failure
+    the whole rejection flow exists to prevent: the owner is told the content is gone and
+    it is not.
+
+    Removing the survivors is not an option either — they are no longer the block that was
+    recorded, and taking out lines around an edit somebody made since is a guess about
+    which of them are still wanted. So the verdict is refused and the item stays open,
+    exactly as an ambiguous match does.
+
+    Unlike the ambiguity refusal this *quotes* the surviving lines. They are the only
+    thing that identifies what to act on, they are already sitting in the owner's own
+    file, and there is no diff here — R9 is about not making review mean reading hunks,
+    not about never naming a line the owner has to go and look at.
+    """
+    for block in blocks:
+        if block.count or len(block.meaningful) < 2:
+            continue  # matched, or a single line: gone is gone, with nothing left behind
+        survivors = surviving_lines(block, contents[block.file])
+        if not survivors:
+            continue
+        listed = "\n".join(f"    {line}" for line in survivors)
+        where = f" under the {block.scope!r} heading" if block.scope else ""
+        raise HubReviewError(
+            f"{change.short} was NOT removed and is still awaiting your review: what it "
+            f"recorded in {block.file}{where} has been PARTIALLY EDITED since — the block no "
+            f"longer matches as a whole, but {len(survivors)} of its {len(block.meaningful)} "
+            "line(s) are still there:\n"
+            f"{listed}\n"
+            "Removing those would be a guess about which of them the later edit still meant "
+            "to keep, so nothing was changed. Take out what should go by hand with "
+            f"`scripts/hub_commit.py --file {block.file} --remove-entry - --summary ... "
+            "--reason ...`, then approve or reject this item"
+        )
 
 
 def _finish(
@@ -1168,7 +1412,8 @@ def report_notes(notes: NotesPush) -> None:
 def run_list(hub: Path, limit: int, now: datetime) -> int:
     changes = read_changes(hub)
     noted = disposed_shas(hub)
-    items = [c for c in changes if reviewable(c)]
+    roots = root_commits(hub)
+    items = [c for c in changes if reviewable(c, roots)]
     waiting = [c for c in items if c.sha not in noted]
     shown = waiting[:limit] if limit and limit > 0 else waiting
     print(

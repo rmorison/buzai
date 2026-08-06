@@ -68,9 +68,12 @@ the review note that accounts for it. See `CLI_SOURCES`.
 
 Push, backlog, and divergence
 -----------------------------
-Push failure is never fatal: the commit stands and the sha is recorded in a backlog file
-under `.git/` (count + oldest age, which U5/U6 surface). Retry happens on the next write
-and via `--retry-push` at service start. Divergence — the remote holding commits this
+Every commit is recorded in a backlog file under `.git/` (count + oldest age, which
+U5/U6 surface) the moment it is made, and removed only by a push that succeeded — so
+"unpushed" covers the commit whose push failed *and* the commit whose push was never
+attempted (`--no-push`). Push failure is never fatal: the commit stands, and retry
+happens on the next write and via `--retry-push` at service start. Divergence — the
+remote holding commits this
 repo does not — **halts and surfaces**. It never rebases, merges, or force-pushes:
 pulling remote commits into files the assistant reads back as trusted source of truth is
 a genuine inbound write path, and force-pushing would discard the owner's work.
@@ -94,6 +97,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts.hub_init import DEFAULT_BRANCH  # noqa: E402
 from scripts.hub_paths import HubPathError, hub_dir  # noqa: E402
 from scripts.hub_remote import (  # noqa: E402
     LOCAL_ENV,
@@ -591,8 +595,17 @@ def commit_message(request: WriteRequest) -> str:
 
 
 def reconcile_message(paths: Sequence[str]) -> str:
-    """The message for content found uncommitted in the hub worktree at entry."""
+    """The message for content found uncommitted in the hub worktree at entry.
+
+    Carries one `hub-file:` trailer per reconciled path, for the same reason every other
+    hub commit carries one: without it the review loop can show the item but the
+    *rejection* flow cannot locate anything to remove, so the owner could approve
+    unattributed content and never take it back out — backwards, since content nobody
+    claims is the least trusted thing in the store. The paths stay in the body too: that
+    is what the owner reads, and the trailers are what the machine reads.
+    """
     listed = "\n".join(f"  - {p}" for p in paths)
+    files = "".join(f"{TRAILER_FILE}: {p}\n" for p in paths)
     return (
         "Reconcile uncommitted hub content\n\n"
         f"Changed: committed {len(paths)} file(s) found uncommitted in the hub working "
@@ -601,6 +614,7 @@ def reconcile_message(paths: Sequence[str]) -> str:
         "the host; nobody claims authorship of it, so it is recorded as unattributed "
         "rather than folded into the assistant's own commit.\n\n"
         f"{listed}\n\n"
+        f"{files}"
         f"{TRAILER_SOURCE}: {UNATTRIBUTED}\n"
     )
 
@@ -814,7 +828,13 @@ def identity_env(identity: tuple[str, str], now: datetime) -> dict[str, str | No
     }
 
 
-def _detail(result: GitResult) -> str:
+def detail_of(result: GitResult) -> str:
+    """The most useful single line of a git call, for a message a human will read.
+
+    Public, and the one copy: `hub_review` imports this rather than keeping its own. Two
+    near-identical private helpers drifted apart once already (one of them untyped), and
+    the text they produce is what every failure in both units is reported with.
+    """
     text = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
     return text.splitlines()[-1]
 
@@ -835,14 +855,14 @@ def commit_paths(
     """
     staged = run_git(hub, ["add", "--", *paths], runner, timeout)
     if staged.returncode != 0:
-        raise HubCommitError(f"git add failed: {_detail(staged)}")
+        raise HubCommitError(f"git add failed: {detail_of(staged)}")
     env = identity_env(identity, now)
     committed = run_git(hub, ["commit", "-q", "-m", message, "--", *paths], runner, timeout, env)
     if committed.returncode != 0:
-        raise HubCommitError(f"git commit failed: {_detail(committed)}")
+        raise HubCommitError(f"git commit failed: {detail_of(committed)}")
     head = run_git(hub, ["rev-parse", "HEAD"], runner, timeout)
     if head.returncode != 0:
-        raise HubCommitError(f"cannot read HEAD after committing: {_detail(head)}")
+        raise HubCommitError(f"cannot read HEAD after committing: {detail_of(head)}")
     return head.stdout.strip()
 
 
@@ -850,14 +870,28 @@ def dirty_paths(hub: Path, runner: GitRunner, timeout: float = GIT_TIMEOUT_SECON
     """Paths with uncommitted changes. Raises when the repo cannot be inspected."""
     result = run_git(hub, ["status", "--porcelain", "-z"], runner, timeout)
     if result.returncode != 0:
-        raise HubCommitError(f"cannot read the hub working tree state: {_detail(result)}")
+        raise HubCommitError(f"cannot read the hub working tree state: {detail_of(result)}")
     return parse_porcelain(result.stdout)
 
 
 def current_branch(hub: Path, runner: GitRunner, timeout: float = GIT_TIMEOUT_SECONDS) -> str:
+    """The branch a push would update. Empty string when HEAD is detached.
+
+    The fallback is `hub_init.DEFAULT_BRANCH` rather than a second literal, because the
+    branch `make hub-init` creates is the only thing that fallback can correctly mean;
+    two copies of the name is how a renamed default silently starts pushing to a branch
+    nobody looks at. It applies to the one benign unreadable case — a repo with no commits
+    yet, where `rev-parse HEAD` fails and there is nothing to push anyway.
+
+    A *detached* HEAD is not that case and does not fall back: it is a real state (the
+    owner ran `git checkout <sha>` in the hub), and answering `main` there would push a
+    commit that is on no local branch to `refs/heads/main`. The caller refuses instead.
+    """
     result = run_git(hub, ["rev-parse", "--abbrev-ref", "HEAD"], runner, timeout)
     branch = result.stdout.strip()
-    return branch if result.returncode == 0 and branch and branch != "HEAD" else "main"
+    if result.returncode != 0 or not branch:
+        return DEFAULT_BRANCH
+    return "" if branch == "HEAD" else branch
 
 
 def scan_worktree(hub: Path, paths: Sequence[str]) -> dict[str, tuple[Finding, ...]]:
@@ -973,6 +1007,29 @@ def record_unpushed(path: Path, commit: str | None, now: datetime, error: str) -
     return backlog
 
 
+def register_unpushed(path: Path, commit: str, now: datetime) -> Backlog:
+    """Record a commit as unpushed the moment it exists, before any push is attempted.
+
+    This is what makes the backlog mean "commits that have not been proven to have
+    reached the remote" rather than "commits whose push was tried and failed". A commit
+    recorded with pushing disabled (`--no-push`, and every intermediate correction
+    `hub_review` writes) never reaches `attempt_push`, so registering only on failure
+    left it out of the backlog entirely: `--retry-push` read an empty file, reported
+    "nothing to push", and the commit stayed on the box with no signal anywhere — R7
+    defeated silently.
+
+    Unlike `record_unpushed` this stamps no attempt and no error: none was made. It is
+    idempotent on the sha, so the `record_unpushed` that follows a failed push of the
+    same commit cannot double-count it.
+    """
+    current = read_backlog(path)
+    if commit in [sha for sha, _ in current.pending]:
+        return current
+    updated = Backlog((*current.pending, (commit, now)), current.last_error, current.last_attempt)
+    write_backlog(path, updated)
+    return updated
+
+
 def clear_backlog(path: Path, now: datetime) -> Backlog:
     """Everything on the branch reached the remote, so nothing is pending any more."""
     backlog = Backlog((), "", now)
@@ -1027,6 +1084,14 @@ def attempt_push(
 
     remote = verification.remote or "origin"
     branch = current_branch(hub, runner)
+    if not branch:
+        detached = (
+            "HEAD is detached in the hub repo, so there is no branch this push could "
+            f"update — refusing to guess (pushing HEAD to refs/heads/{DEFAULT_BRANCH} would "
+            "advance a branch this commit is not on). The commit is durable locally; check "
+            "the hub out on a branch (`git -C <hub> switch <branch>`) and run `make hub-push`"
+        )
+        return PushOutcome(PUSH_FAILED, detached, record_unpushed(path, commit, now, detached))
     result = run_git(
         hub,
         [*NO_PROXY_ARGS, "push", remote, f"HEAD:refs/heads/{branch}"],
@@ -1038,7 +1103,7 @@ def attempt_push(
         return PushOutcome(
             PUSHED, f"pushed to {remote} ({verification.url})", clear_backlog(path, now)
         )
-    detail = _detail(result)
+    detail = detail_of(result)
     if is_divergence(result):
         halt = (
             f"remote {remote} has diverged from this hub — it holds commits this repo does "
@@ -1062,8 +1127,15 @@ def retry_push(
 ) -> PushOutcome:
     """Retry the backlog — what `--retry-push` runs at service start.
 
-    A write's own push needs no separate retry: pushing the branch carries every
-    unpushed commit with it, which is why a successful push clears the whole backlog.
+    Trusting an empty backlog file is only sound because `record()` registers every
+    commit it makes as unpushed *before* the push is attempted (`register_unpushed`),
+    and only a successful push clears it. The alternative — comparing HEAD against the
+    remote-tracking ref — was rejected: a hub restored by clone, or one that has only
+    ever been pushed to, may have no usable tracking ref, so answering the question would
+    need a network call before this could decide whether it has anything to do at all.
+
+    One push per branch is still enough: pushing the branch carries every unpushed commit
+    with it, which is why a successful push clears the whole backlog rather than one sha.
     """
     moment = now or datetime.now(UTC)
     path = backlog_path or default_backlog_path(hub)
@@ -1098,6 +1170,12 @@ def record(
     or `refused`, because a caller that mistakes an exception for "probably fine" is how
     a lost fact becomes invisible. `status == COMMITTED` means and only means the content
     is durable in git — the push is reported separately and is allowed to fail.
+
+    Every commit made here — the reconciliation of a dirty tree as well as the write
+    itself — enters the push backlog as soon as it exists, and only a successful push
+    clears it. Registering on *failure* alone made `push=False` (the `--no-push` flag, and
+    every intermediate correction `hub_review` records) produce a commit that nothing
+    knew was unpushed: `--retry-push` saw an empty backlog and reported nothing to send.
     """
     op = request.operation
     if request.source not in SOURCES:
@@ -1105,6 +1183,7 @@ def record(
 
     reconciled = Reconciliation()
     lock_note = ""
+    backlog_file = backlog_path or default_backlog_path(hub)
     try:
         with HubLock(
             lock_path or default_lock_path(hub), timeout=lock_timeout
@@ -1112,6 +1191,10 @@ def record(
             lock_note = lock.recovered_note
             target = hub_relative(hub, op.file)
             reconciled = reconcile_dirty(hub, runner, now, git_timeout)
+            if reconciled.commit:
+                # It is a commit like any other, and the refusal paths below return
+                # without ever reaching a push — so it is registered here or not at all.
+                register_unpushed(backlog_file, reconciled.commit, now)
 
             # The reconciler left this very file dirty because its *existing* content is
             # credential-shaped. Proceeding would path-scope the commit onto that path and
@@ -1138,7 +1221,16 @@ def record(
                     lock_note=lock_note,
                 )
 
-            prior = target.read_text() if target.is_file() else None
+            try:
+                prior = target.read_text() if target.is_file() else None
+            except UnicodeDecodeError as e:
+                # Not an OSError, so it would otherwise escape as a traceback and break
+                # the never-raises contract. `scan_worktree` already treats a non-text
+                # file as none of its business; this says so to the caller instead.
+                raise HubCommitError(
+                    f"{op.file} is not readable as UTF-8 text ({e.reason} at byte "
+                    f"{e.start}) — hub files are text, so nothing was written or committed"
+                ) from e
             new = apply_operation(prior or "", op)
             if new == (prior or ""):
                 raise HubCommitError(
@@ -1176,12 +1268,13 @@ def record(
             except (HubCommitError, OSError):
                 roll_back(target, prior)
                 raise
+            backlog = register_unpushed(backlog_file, sha, now)
     except (HubCommitError, OSError) as e:
         return WriteResult(
             FAILED, None, op.file, str(e), reconciled=reconciled, lock_note=lock_note
         )
 
-    outcome = PushOutcome(PUSH_SKIPPED, "push not attempted")
+    outcome = PushOutcome(PUSH_SKIPPED, "push not attempted", backlog)
     if push:
         outcome = attempt_push(
             hub,
@@ -1189,7 +1282,7 @@ def record(
             verifier=verifier,
             now=now,
             commit=sha,
-            backlog_path=backlog_path,
+            backlog_path=backlog_file,
             timeout=push_timeout,
         )
     return WriteResult(
@@ -1232,7 +1325,11 @@ def build_parser() -> argparse.ArgumentParser:
             "recorded here would never appear for review"
         ),
     )
-    parser.add_argument("--no-push", action="store_true", help="commit only; do not push")
+    parser.add_argument(
+        "--no-push",
+        action="store_true",
+        help="commit only; the commit is still recorded as unpushed, so `make hub-push` sends it",
+    )
     parser.add_argument(
         "--retry-push",
         action="store_true",

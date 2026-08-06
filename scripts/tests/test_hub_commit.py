@@ -10,7 +10,9 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
+from scripts import hub_commit
 from scripts.hub_commit import (
     APPEND_ENTRY,
     AUTONOMOUS,
@@ -39,17 +41,20 @@ from scripts.hub_commit import (
     build_parser,
     commit_message,
     covers,
+    current_branch,
     default_backlog_path,
     default_lock_path,
     entropy,
     main,
     parse_porcelain,
     read_backlog,
+    reconcile_message,
     record,
     record_unpushed,
     retry_push,
     scan_text,
 )
+from scripts.hub_init import DEFAULT_BRANCH
 from scripts.hub_remote import INDETERMINATE, LOCAL_ONLY, PRIVATE, GitResult, Verification
 from scripts.hub_remote import default_git_runner as real_git
 from scripts.tests.env_isolation import assert_injection_suppressed, plant
@@ -998,6 +1003,161 @@ class TestPushBacklog(HubRepoCase):
         backlog = record_unpushed(path, "abc123", NOW + timedelta(minutes=5), "still offline")
         self.assertEqual(backlog.count, 1)
         self.assertEqual(backlog.last_error, "still offline")
+
+
+class TestUnpushedIsRegisteredAtBirthNotOnlyOnFailure(HubRepoCase):
+    """A commit made with pushing disabled is still a commit that has not left the box.
+
+    Verified against the unfixed version: `record(..., push=False)` left the backlog file
+    empty, so `retry_push` reported `nothing-to-push`, `make hub-push` sent nothing, and
+    the commit stayed on this box with no signal anywhere — R7 defeated silently. Every
+    correction `hub_review` records goes through that same path.
+    """
+
+    def pending_shas(self) -> list[str]:
+        return [sha for sha, _ in read_backlog(default_backlog_path(self.hub)).pending]
+
+    def test_a_no_push_write_is_recorded_as_unpushed(self):
+        result = self.append("a fact recorded with pushing disabled")  # push=False
+        self.assertEqual(self.pending_shas(), [result.commit])
+        self.assertEqual(result.push.status, PUSH_SKIPPED)
+        self.assertEqual(result.push.backlog.count, 1)  # and the caller is told
+
+    def test_a_later_retry_really_sends_it_to_the_remote(self):
+        remote = self.bare_remote()
+        result = self.append("a fact recorded with pushing disabled")
+        git("-C", str(self.hub), "remote", "add", "origin", str(remote))
+
+        outcome = retry_push(self.hub, verifier=PRIVATE_REMOTE, now=NOW)
+
+        self.assertEqual(outcome.status, PUSHED, outcome.detail)
+        self.assertIn(result.commit, git("-C", str(remote), "rev-parse", "refs/heads/main"))
+
+    def test_the_reconciliation_commit_is_registered_too(self):
+        # it is a commit like any other, and the refusal paths never reach a push at all
+        (self.hub / "home.md").write_text("# Home\n\n- typed straight into the file\n")
+        result = self.append("a fact")
+        self.assertEqual(self.pending_shas(), [result.reconciled.commit, result.commit])
+
+    def test_a_failed_push_does_not_count_the_same_commit_twice(self):
+        git("-C", str(self.hub), "remote", "add", "origin", str(self.root / "nowhere.git"))
+        result = self.append("a fact recorded while offline", push=True, verifier=PRIVATE_REMOTE)
+        self.assertEqual(result.push.status, PUSH_FAILED)
+        self.assertEqual(self.pending_shas(), [result.commit])
+
+    def test_only_a_successful_push_clears_it(self):
+        remote = self.bare_remote()
+        git("-C", str(self.hub), "remote", "add", "origin", str(remote))
+        self.append("a fact", push=True, verifier=PRIVATE_REMOTE)
+        self.assertEqual(self.pending_shas(), [])
+
+    def test_the_command_line_says_the_commit_has_not_left_the_box(self):
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(self.hub)
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main(["--file", "notes.md", "--append", "- a fact", "--summary", "s", "--no-push"])
+        self.assertEqual(rc, 0)
+        self.assertIn("1 commit(s) unpushed", err.getvalue())
+
+
+class TestNonUtf8HubFile(HubRepoCase):
+    """`record()` documents a never-raises contract and `scan_worktree` already treats a
+    non-text file as none of its business. Verified against the unfixed version: the
+    `target.read_text()` inside the lock raised UnicodeDecodeError — not an OSError, so
+    not caught — and the assistant got a traceback instead of a WriteResult."""
+
+    def setUp(self):
+        super().setUp()
+        self.raw = b"# Notes\n\n- caf\xe9 written in latin-1\n"
+        self.notes.write_bytes(self.raw)
+        git("-C", str(self.hub), "add", "-A")
+        git("-C", str(self.hub), "commit", "-q", "-m", "a hub file that is not utf-8")
+
+    def test_it_comes_back_as_a_failed_write_not_a_traceback(self):
+        result = self.append("a fact")  # must not raise
+        self.assertEqual(result.status, FAILED)
+        self.assertFalse(result.recorded)
+
+    def test_the_failure_names_the_file_as_unreadable(self):
+        result = self.append("a fact")
+        self.assertIn("notes.md", result.detail)
+        self.assertIn("UTF-8", result.detail)
+
+    def test_nothing_was_written_or_committed(self):
+        self.append("a fact")
+        self.assertEqual(self.notes.read_bytes(), self.raw)
+        self.assertEqual(self.commits(), 2)  # the seed and the plant, nothing else
+        self.assertEqual(self.porcelain(), "")
+
+
+class TestPushBranchIsNotASecondLiteral(HubRepoCase):
+    """`hub_init.DEFAULT_BRANCH` is the only thing that fallback can correctly mean.
+
+    Verified against the unfixed version, which returned the literal "main": with the
+    imported name pointed at another branch it still answered "main", which is what a
+    renamed hub-init default would silently push to.
+    """
+
+    def test_the_fallback_is_the_branch_hub_init_creates(self):
+        self.assertEqual(current_branch(self.hub, failing_git("rev-parse")), DEFAULT_BRANCH)
+
+    def test_it_follows_hub_inits_default_rather_than_its_own_copy(self):
+        with mock.patch.object(hub_commit, "DEFAULT_BRANCH", "trunk"):
+            self.assertEqual(current_branch(self.hub, failing_git("rev-parse")), "trunk")
+
+    def test_a_real_branch_is_used_as_it_is(self):
+        git("-C", str(self.hub), "branch", "-m", "personal")
+        self.assertEqual(current_branch(self.hub, real_git), "personal")
+
+
+class TestDetachedHeadIsRefusedRatherThanGuessed(HubRepoCase):
+    """A detached HEAD is a real state — the owner ran `git checkout <sha>` in the hub.
+
+    Verified against the unfixed version: it mapped detached HEAD to the same literal and
+    pushed `HEAD:refs/heads/main`, creating/advancing a branch the commit is not on.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.remote = self.bare_remote()
+        git("-C", str(self.hub), "remote", "add", "origin", str(self.remote))
+        self.append("a fact")
+        git("-C", str(self.hub), "checkout", "-q", "--detach", "HEAD")
+        self.outcome = attempt_push(self.hub, runner=real_git, verifier=PRIVATE_REMOTE, now=NOW)
+
+    def test_the_push_is_refused_and_says_why(self):
+        self.assertEqual(self.outcome.status, PUSH_FAILED)
+        self.assertIn("detached", self.outcome.detail)
+
+    def test_no_branch_was_invented_on_the_remote(self):
+        self.assertEqual(git("-C", str(self.remote), "branch", "--list").strip(), "")
+
+    def test_the_commit_stays_in_the_backlog_for_the_next_attempt(self):
+        self.assertGreaterEqual(self.outcome.backlog.count, 1)
+        self.assertIn("detached", self.outcome.backlog.last_error)
+
+
+class TestReconcileMessageNamesItsFiles(unittest.TestCase):
+    """Without a `hub-file:` trailer the review loop can show unattributed content but the
+    rejection flow cannot locate it — approvable, never rejectable, for the least-trusted
+    content in the store. `test_hub_review` proves the rejection end; this pins the
+    message shape it depends on."""
+
+    MESSAGE = reconcile_message(["home.md", "sub/notes.md"])
+
+    def test_one_trailer_per_reconciled_path(self):
+        trailers = [line for line in self.MESSAGE.splitlines() if line.startswith("hub-file:")]
+        self.assertEqual(trailers, ["hub-file: home.md", "hub-file: sub/notes.md"])
+
+    def test_the_trailer_block_is_still_the_last_paragraph(self):
+        last = self.MESSAGE.strip().split("\n\n")[-1]
+        self.assertTrue(all(":" in line for line in last.splitlines()))
+        self.assertTrue(last.endswith("instruction-source: unattributed"))
+
+    def test_the_owner_facing_body_still_lists_them(self):
+        self.assertIn("  - home.md", self.MESSAGE)
+        self.assertIn("committed 2 file(s)", self.MESSAGE)
 
 
 class TestDivergence(HubRepoCase):

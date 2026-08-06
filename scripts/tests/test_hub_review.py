@@ -16,6 +16,7 @@ from scripts.hub_commit import (
     DIVERGED,
     NOTHING_TO_PUSH,
     OWNER_CORRECTION,
+    OWNER_DIRECTED,
     PUSH_LOCAL_ONLY,
     PUSH_REFUSED,
     PUSHED,
@@ -29,6 +30,8 @@ from scripts.hub_commit import (
     record,
     record_unpushed,
 )
+from scripts.hub_commit import detail_of as commit_detail_of
+from scripts.hub_init import commit_message as hub_init_commit_message
 from scripts.hub_remote import INDETERMINATE, LOCAL_ONLY, PRIVATE, GitResult, Verification
 from scripts.hub_remote import default_git_runner as real_git
 from scripts.hub_review import (
@@ -55,6 +58,7 @@ from scripts.hub_review import (
     dispose,
     disposed_shas,
     duration,
+    find_change,
     main,
     parse_disposition,
     parse_trailers,
@@ -63,11 +67,14 @@ from scripts.hub_review import (
     read_disposition,
     removal_scope,
     reviewable,
+    root_commits,
     run_list,
     split_hunks,
     staleness_warning,
     summarize,
+    trailer_values,
 )
+from scripts.hub_review import detail_of as review_detail_of
 from scripts.tests.env_isolation import assert_injection_suppressed, plant
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -216,7 +223,8 @@ class ReviewRepoCase(unittest.TestCase):
 
     def pending(self) -> list[Change]:
         noted = disposed_shas(self.hub)
-        return [c for c in read_changes(self.hub) if reviewable(c) and c.sha not in noted]
+        roots = root_commits(self.hub)
+        return [c for c in read_changes(self.hub) if reviewable(c, roots) and c.sha not in noted]
 
     def pending_subjects(self) -> list[str]:
         return [c.subject for c in self.pending()]
@@ -725,9 +733,23 @@ class TestRejectingARemoval(ReviewRepoCase):
         self.assertIn("added nothing to notes.md", result.detail)
 
     def test_the_owners_value_is_what_puts_content_back(self):
-        result = self.reject(self.removal, reason="I still need that", value="- seeded fact")
-        self.assertEqual(result.resolution, REPLACED)
+        self.reject(self.removal, reason="I still need that", value="- seeded fact")
         self.assertIn("- seeded fact", self.notes.read_text())
+
+    def test_a_value_does_not_turn_nothing_to_remove_into_replaced(self):
+        """`replaced` is a claim about the OLD content, and here none came out.
+
+        Verified against the version that set REPLACED whenever a value was supplied: the
+        owner was told their content had been replaced by a run that removed nothing and
+        appended their value beside whatever was already there.
+        """
+        result = self.reject(self.removal, reason="I still need that", value="- seeded fact")
+        self.assertEqual(result.resolution, NOTHING_TO_REMOVE)
+        self.assertNotEqual(result.resolution, REPLACED)
+        self.assertIn("nothing was removed to make room for it", result.detail)
+        note = read_disposition(self.hub, self.removal)
+        assert note is not None
+        self.assertEqual(note.resolution, NOTHING_TO_REMOVE)
 
 
 class TestRejectionDoesNotRemoveTheWrongEntry(ReviewRepoCase):
@@ -918,6 +940,269 @@ class TestMultiHunkRejection(ReviewRepoCase):
         note = read_disposition(self.hub, self.sha)
         assert note is not None
         self.assertEqual(note.resolution, PARTIALLY_REMOVED)  # never a plain "removed"
+
+
+class TestUnattributedContentIsRejectableNotOnlyApprovable(ReviewRepoCase):
+    """Content found loose on disk is committed as `unattributed` so review can SEE it —
+    and it is the LEAST trusted thing in the store, so the owner has to be able to take it
+    out. Verified against the unfixed version: the reconcile commit carried no `hub-file:`
+    trailer, so every rejection came back "names no hub file" and the only verdict the
+    owner could actually apply to unclaimed content was *approve*.
+    """
+
+    def setUp(self):
+        super().setUp()
+        (self.hub / "home.md").write_text("# Home\n\n- typed straight into the file\n")
+        self.append("a fact from the assistant")  # triggers U4's dirty-tree reconciliation
+        self.loose = next(c for c in self.pending() if c.source == UNATTRIBUTED)
+
+    def home(self) -> str:
+        return (self.hub / "home.md").read_text()
+
+    def test_the_reconcile_commit_names_the_file_it_swept_up(self):
+        self.assertEqual(self.loose.named_files, ("home.md",))
+
+    def test_rejecting_it_removes_the_content(self):
+        result = self.reject(self.loose.sha, reason="I did not write that and it is wrong")
+        self.assertEqual(result.status, RECORDED, result.detail)
+        self.assertEqual(result.resolution, REMOVED)
+        self.assertNotIn("typed straight into the file", self.home())
+
+    def test_the_verdict_is_recorded_and_the_item_does_not_come_back(self):
+        result = self.reject(self.loose.sha, reason="not mine")
+        note = read_disposition(self.hub, self.loose.sha)
+        assert note is not None
+        self.assertEqual(note.disposition, REJECTED)
+        self.assertEqual(note.corrections, result.corrections)
+        self.assertNotIn(self.loose.sha, [c.sha for c in self.pending()])
+
+    def test_the_assistants_own_fact_is_untouched(self):
+        self.reject(self.loose.sha, reason="not mine")
+        self.assertIn("- a fact from the assistant", self.notes.read_text())
+
+
+class TestRejectingAMultiFileReconciliation(ReviewRepoCase):
+    """One reconcile commit can sweep several loose files, so one rejection has to act on
+    all of them. Verified against a single-`file`-trailer version: only the last file
+    named was searched and the other file's content stayed in the hub."""
+
+    def setUp(self):
+        super().setUp()
+        (self.hub / "home.md").write_text("# Home\n\n- typed straight into the file\n")
+        self.notes.write_text(self.SEED + "- edited by hand\n")
+        self.append("a fact from the assistant")
+        self.loose = next(c for c in self.pending() if c.source == UNATTRIBUTED)
+        self.result = self.reject(self.loose.sha, reason="none of that is mine")
+
+    def test_both_files_are_named_on_the_commit(self):
+        self.assertEqual(sorted(self.loose.named_files), ["home.md", "notes.md"])
+
+    def test_both_files_lose_the_unattributed_content(self):
+        self.assertEqual(self.result.status, RECORDED, self.result.detail)
+        self.assertEqual(self.result.resolution, REMOVED)
+        self.assertNotIn("typed straight into the file", (self.hub / "home.md").read_text())
+        self.assertNotIn("- edited by hand", self.notes.read_text())
+
+    def test_one_removal_commit_per_file(self):
+        self.assertEqual(len(self.result.corrections), 2)
+        for sha in self.result.corrections:
+            self.assertIn(
+                "hub-operation: remove-entry",
+                git("-C", str(self.hub), "log", "-1", "--pretty=%B", sha),
+            )
+
+    def test_the_listing_names_every_file_the_owner_would_be_judging(self):
+        text = "\n".join(self.loose.plain(NOW, 1))
+        self.assertIn("files: ", text)  # plural, and both of them
+        self.assertIn("home.md", text)
+        self.assertIn("notes.md", text)
+
+
+class TestLegacyReconcileCommitsStayRejectable(ReviewRepoCase):
+    """Reconcile commits written before the trailer existed carry no `hub-file:` at all.
+
+    They are already in owners' hubs, so the fix cannot be trailer-only: what git says the
+    commit touched is the fallback. Verified against the trailer-only version: this
+    rejection came back `failed` with "names no hub file" and the content stayed.
+    """
+
+    # The message U4 wrote before `hub-file:` trailers were emitted, kept verbatim.
+    LEGACY = (
+        "Reconcile uncommitted hub content\n\n"
+        "Changed: committed 1 file(s) found uncommitted in the hub working tree before "
+        "this session's write.\n"
+        "Why: content that only exists on disk is invisible to review.\n\n"
+        "  - home.md\n\n"
+        "instruction-source: unattributed\n"
+    )
+
+    def setUp(self):
+        super().setUp()
+        (self.hub / "home.md").write_text("# Home\n\n- typed straight into the file\n")
+        git("-C", str(self.hub), "add", "--", "home.md")
+        git("-C", str(self.hub), "commit", "-q", "-m", self.LEGACY)
+        self.loose = next(c for c in self.pending() if c.source == UNATTRIBUTED)
+
+    def test_the_plant_really_has_no_file_trailer(self):
+        self.assertEqual(self.loose.named_files, ())
+        self.assertEqual(trailer_values(self.LEGACY, "hub-file"), ())
+
+    def test_it_is_still_rejectable_through_what_git_says_it_touched(self):
+        result = self.reject(self.loose.sha, reason="I did not write that")
+        self.assertEqual(result.status, RECORDED, result.detail)
+        self.assertEqual(result.resolution, REMOVED)
+        self.assertNotIn("typed straight into the file", (self.hub / "home.md").read_text())
+
+    def test_a_commit_from_outside_the_write_path_is_still_refused(self):
+        # the fallback is scoped to commits the write path made: a commit with no
+        # instruction source is the owner's own, or the store's seed, and this flow is
+        # not a general-purpose file editor
+        seed = git("-C", str(self.hub), "rev-list", "--max-parents=0", "HEAD").strip()
+        result = self.reject(seed, reason="not mine")
+        self.assertEqual(result.status, FAILED)
+        self.assertIn("names no hub file", result.detail)
+
+
+class TestTheHubInitSeedIsNotAReviewItem(ReviewRepoCase):
+    """`hub_init`'s initial commit carries `instruction-source: owner-directed` — the owner
+    really did run `make hub-init` — so the source filter alone leaves the store's own
+    bootstrap as the first thing every fresh instance asks its owner to review. It is not
+    assistant-recorded knowledge at all.
+
+    Verified against the unfixed version: `Initialize hub store` was item 1 of the listing
+    on a brand-new hub.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # the real message `hub_init` writes, on the repo's root commit
+        git("-C", str(self.hub), "commit", "-q", "--amend", "-m", hub_init_commit_message([]))
+        self.seed = git("-C", str(self.hub), "rev-parse", "HEAD").strip()
+        self.fact = self.append("the boiler was serviced")
+
+    def test_the_seed_really_carries_an_instruction_source(self):
+        # without this the class would pass against a seed the source filter already drops
+        change = find_change(self.hub, self.seed)
+        self.assertEqual(change.source, OWNER_DIRECTED)
+        self.assertTrue(reviewable(change), "the source filter alone does not exclude it")
+
+    def test_the_root_commit_is_excluded(self):
+        self.assertFalse(reviewable(find_change(self.hub, self.seed), root_commits(self.hub)))
+        self.assertEqual(root_commits(self.hub), frozenset({self.seed}))
+
+    def test_the_owner_is_never_asked_to_review_the_bootstrap(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            run_list(self.hub, 10, NOW)
+        text = out.getvalue()
+        self.assertNotIn("Initialize hub store", text)
+        self.assertIn("1 change(s) awaiting review", text)
+
+    def test_recorded_knowledge_is_still_reviewed(self):
+        self.assertEqual([c.sha for c in self.pending()], [self.fact])
+
+
+class MultiLineEntryCase(ReviewRepoCase):
+    """A three-line entry recorded as ONE block, for the two ways it can go stale."""
+
+    SEED = "# Notes\n\n## Health\n\n- baseline\n"
+    ENTRY = "- the dentist is on Oak Street\n- appointments are on Tuesdays\n- ring the bell twice"
+
+    def setUp(self):
+        super().setUp()
+        self.sha = record(
+            self.hub,
+            WriteRequest(
+                Operation(APPEND_ENTRY, "notes.md", self.ENTRY, section="Health"),
+                summary="Record the dentist details",
+                reason="the assistant heard them in conversation",
+            ),
+            now=NOW,
+            push=False,
+        ).commit
+
+
+class TestPartiallyEditedRejectedContent(MultiLineEntryCase):
+    """One block, edited *within* since: a line reworded, the rest still standing.
+
+    `PARTIALLY_REMOVED` covers a commit that wrote several BLOCKS of which some survive.
+    This is the other half and it is not covered by that: the run no longer matches
+    anywhere, so the single block counts as absent and the verdict resolves as
+    `already-absent` — closing the item while the surviving lines sit in the hub. Verified
+    against the version without `_refuse_if_partially_edited`: the rejection came back
+    `recorded` / `already-absent`, the note was written, and two of the three rejected
+    lines were still in notes.md.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.replace_section(
+            "Health",
+            "- baseline\n- the dentist is on Elm Street\n"
+            "- appointments are on Tuesdays\n- ring the bell twice",
+        )
+        self.before = self.notes.read_text()
+        self.commits_before = self.commit_count()
+        self.result = self.reject(self.sha, reason="I never said any of that")
+
+    def test_the_plant_is_one_block_that_no_longer_matches(self):
+        self.assertEqual(len(added_blocks(self.hub, self.sha, "notes.md")), 1)
+        self.assertNotIn("Oak Street", self.before)
+        self.assertIn("- appointments are on Tuesdays", self.before)
+
+    def test_the_verdict_is_refused_rather_than_resolved_as_absent(self):
+        self.assertEqual(self.result.status, FAILED)
+        self.assertNotEqual(self.result.resolution, ALREADY_ABSENT)
+        self.assertEqual(self.result.corrections, ())
+
+    def test_nothing_was_removed_and_nothing_was_committed(self):
+        self.assertEqual(self.notes.read_text(), self.before)
+        self.assertEqual(self.commit_count(), self.commits_before)
+
+    def test_the_item_is_left_open_rather_than_closed_over_surviving_lines(self):
+        self.assertIsNone(read_disposition(self.hub, self.sha))
+        self.assertIn(self.sha, [c.sha for c in self.pending()])
+
+    def test_the_owner_is_told_which_lines_are_still_there(self):
+        self.assertIn("PARTIALLY EDITED", self.result.detail)
+        self.assertIn("2 of its 3 line(s)", self.result.detail)
+        self.assertIn("- appointments are on Tuesdays", self.result.detail)
+        self.assertIn("- ring the bell twice", self.result.detail)
+        self.assertNotIn("Oak Street", self.result.detail)  # that line is genuinely gone
+
+
+class TestWhollySupersededContentStillResolves(MultiLineEntryCase):
+    """The guard must not turn every stale rejection into a refusal: when NOTHING the
+    block recorded is still there, `already-absent` is the honest answer and the item is
+    settled. Its own class, so it never depends on another rejection having failed."""
+
+    def setUp(self):
+        super().setUp()
+        self.replace_section("Health", "- baseline\n- see the practice website")
+        self.before = self.notes.read_text()
+        self.result = self.reject(self.sha, reason="I never said any of that")
+
+    def test_it_resolves_rather_than_refusing(self):
+        self.assertEqual(self.result.status, RECORDED, self.result.detail)
+        self.assertEqual(self.result.resolution, ALREADY_ABSENT)
+
+    def test_the_item_is_settled_and_the_file_untouched(self):
+        self.assertEqual(self.notes.read_text(), self.before)
+        self.assertNotIn(self.sha, [c.sha for c in self.pending()])
+
+
+class TestGitDetailIsOneSharedHelper(unittest.TestCase):
+    """`hub_review` had its own untyped near-copy of `hub_commit._detail`; a third is
+    inlined in `hub_init`. The text is what every failure in both units is reported with,
+    and the copies had already drifted (one typed, one not)."""
+
+    def test_hub_review_uses_hub_commits_helper_rather_than_a_copy(self):
+        self.assertIs(review_detail_of, commit_detail_of)
+
+    def test_it_prefers_stderr_then_stdout_then_the_exit_code(self):
+        self.assertEqual(commit_detail_of(GitResult(1, "out", "one\nfatal: bad")), "fatal: bad")
+        self.assertEqual(commit_detail_of(GitResult(1, "first\nsecond", "")), "second")
+        self.assertEqual(commit_detail_of(GitResult(3, "", "")), "exit 3")
 
 
 class TestReviewScopeMatchesWhatTheCliCanRecord(unittest.TestCase):
@@ -1247,8 +1532,10 @@ class TestMainAgainstARealHub(ReviewRepoCase):
         self.assertIn("no remote is configured", err + out)
 
     def test_a_stale_backlog_leads_the_listing(self):
+        # a sha the write path has not already registered at NOW: the backlog keeps the
+        # first timestamp it saw for a commit, which is the moment it was made
         record_unpushed(
-            default_backlog_path(self.hub), self.sha, NOW - timedelta(days=3), "offline earlier"
+            default_backlog_path(self.hub), "0" * 40, NOW - timedelta(days=3), "offline earlier"
         )
         _, out, _ = self.run_main([])
         warning = [line for line in out.splitlines() if "WARNING" in line]
