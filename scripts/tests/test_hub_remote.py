@@ -21,6 +21,8 @@ from scripts.hub_remote import (
     GitResult,
     anonymous_env,
     anonymous_urls,
+    authenticated_env,
+    authenticated_probe,
     cache_is_usable,
     check,
     classify,
@@ -29,12 +31,19 @@ from scripts.hub_remote import (
     default_cache_path,
     default_git_runner,
     main,
+    no_config_injection,
     origin_credential_violations,
     read_cache,
     redact,
     url_credential_problem,
     verify,
     write_cache,
+)
+from scripts.tests.env_isolation import (
+    INJECTED_ENV,
+    assert_injection_suppressed,
+    child_env,
+    plant,
 )
 
 NOW = datetime(2026, 8, 5, 12, 0, 0, tzinfo=UTC)
@@ -64,32 +73,6 @@ CAPTIVE_PORTAL = GitResult(
     "returned error: <html><head><title>Not Found</title></head><body>The page you "
     "requested was not found on this network.</body></html>",
 )
-
-# What the anonymous probe must not inherit. Values are inert but shaped like the real
-# attack: an insteadOf rewrite that would send the probe somewhere readable, a helper
-# injected through the numbered pairs, and proxies that would answer for the host.
-INJECTED_ENV = {
-    "GIT_CONFIG_COUNT": "2",
-    "GIT_CONFIG_KEY_0": "url.https://buzai-probe.invalid/.insteadOf",
-    "GIT_CONFIG_VALUE_0": "https://github.com/",
-    "GIT_CONFIG_KEY_1": "credential.helper",
-    "GIT_CONFIG_VALUE_1": "!f() { echo password=x; }; f",
-    "GIT_CONFIG_KEY_41": "url.https://buzai-probe.invalid/.insteadOf",
-    "GIT_CONFIG_VALUE_41": "git@github.com:",
-    "GIT_CONFIG_PARAMETERS": "'credential.helper=store'",
-    "GIT_CONFIG": "/nonexistent/attacker.gitconfig",
-    "GIT_PROXY_COMMAND": "/nonexistent/attacker-proxy",
-    "http_proxy": "http://buzai-probe.invalid:8080",
-    "https_proxy": "http://buzai-probe.invalid:8080",
-    "all_proxy": "socks5://buzai-probe.invalid:1080",
-    "HTTP_PROXY": "http://buzai-probe.invalid:8080",
-    "HTTPS_PROXY": "http://buzai-probe.invalid:8080",
-    "ALL_PROXY": "socks5://buzai-probe.invalid:1080",
-}
-
-# Dumps the child's environment as JSON. Run through `default_git_runner` itself, so the
-# assertions cover the real env-construction path rather than a stand-in for it.
-DUMP_ENV = "import json, os; print(json.dumps(dict(os.environ)))"
 
 
 def restore_env(name: str, value: str | None) -> None:
@@ -270,6 +253,47 @@ class TestAnonymousEnv(unittest.TestCase):
             self.assertIsNone(self.ENV[name.upper()], name.upper())
 
 
+class TestAuthenticatedEnv(unittest.TestCase):
+    """Layer 1 applies here too; layer 2 pointedly does not.
+
+    The authenticated probe's SUCCESS is what turns "every anonymous probe was denied"
+    into PRIVATE, so an `insteadOf` rewrite aimed at it manufactures the one verdict
+    that permits a push. It must be injection-proof — while still being able to
+    authenticate, which is why it keeps everything the anonymous probe throws away.
+    """
+
+    ENV = authenticated_env(INJECTED_ENV)
+
+    def test_config_injection_and_proxy_channels_are_unset(self):
+        for name in ("GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"):
+            self.assertIn(name, self.ENV)
+            self.assertIsNone(self.ENV[name], name)
+        for name in ("http_proxy", "https_proxy", "all_proxy", "GIT_PROXY_COMMAND"):
+            self.assertIsNone(self.ENV[name], name)
+            self.assertIsNone(self.ENV[name.upper()], name.upper())
+
+    def test_numbered_config_pairs_are_enumerated_here_as_well(self):
+        for name in ("GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_41"):
+            self.assertIsNone(self.ENV[name], name)
+
+    def test_the_credential_channels_are_deliberately_left_intact(self):
+        # scrubbing these would break the call rather than harden it: the auth probe
+        # and the push exist to exercise this instance's deploy key
+        for name in ("SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_CONFIG_GLOBAL"):
+            self.assertNotIn(name, self.ENV, name)
+
+    def test_it_still_cannot_hang_a_tty_less_service(self):
+        self.assertEqual(self.ENV["GIT_TERMINAL_PROMPT"], "0")
+        self.assertIn("BatchMode=yes", self.ENV["GIT_SSH_COMMAND"])
+
+    def test_the_shared_layer_is_shared_not_reimplemented(self):
+        floor = no_config_injection(INJECTED_ENV)
+        self.assertTrue(floor)
+        for name, value in floor.items():
+            self.assertEqual(self.ENV[name], value, name)
+            self.assertEqual(anonymous_env("/tmp/neutral", INJECTED_ENV)[name], value, name)
+
+
 class TestProbeEnvironmentIsolation(unittest.TestCase):
     """PLANT the injection channels in the PARENT and prove none reaches the child.
 
@@ -279,38 +303,26 @@ class TestProbeEnvironmentIsolation(unittest.TestCase):
     """
 
     def setUp(self):
-        for name, value in INJECTED_ENV.items():
-            self.addCleanup(restore_env, name, os.environ.get(name))
-            os.environ[name] = value
-        result = default_git_runner(
-            ["-c", DUMP_ENV],
-            anonymous_env(tempfile.gettempdir()),
-            30.0,
-            git_bin=sys.executable,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.child = json.loads(result.stdout)
+        plant(self)
 
-    def test_the_plant_is_really_in_the_parent(self):
-        # without this, every assertion below could pass against an env that never
-        # carried the violation — the dead-no-op shape this repo has shipped once
-        for name, value in INJECTED_ENV.items():
-            self.assertEqual(os.environ.get(name), value, name)
+    def test_nothing_injected_reaches_the_anonymous_probes_child(self):
+        assert_injection_suppressed(self, anonymous_env(tempfile.gettempdir()))
 
-    def test_no_injected_variable_reaches_the_child(self):
-        for name in INJECTED_ENV:
-            self.assertNotIn(name, self.child, name)
+    def test_nothing_injected_reaches_the_authenticated_probes_child(self):
+        # the overlay is taken from the real `authenticated_probe` call, not written
+        # out by hand, so a call site that forgot to use it fails here
+        recorder = ScriptedGit()
+        authenticated_probe(Path("/nonexistent/hub"), "origin", recorder, 5.0)
+        self.assertEqual(len(recorder.calls), 1)
+        assert_injection_suppressed(self, recorder.calls[0][1])
 
-    def test_the_pre_existing_suppressions_still_hold(self):
+    def test_the_anonymous_probes_extra_suppressions_still_hold(self):
+        child = child_env(self, anonymous_env(tempfile.gettempdir()))
         for name in ("SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS"):
-            self.assertNotIn(name, self.child, name)
-        self.assertEqual(self.child["GIT_CONFIG_GLOBAL"], os.devnull)
-        self.assertEqual(self.child["GIT_CONFIG_SYSTEM"], os.devnull)
-        self.assertEqual(self.child["GIT_TERMINAL_PROMPT"], "0")
-
-    def test_unrelated_variables_are_left_alone(self):
-        # the overlay suppresses named channels; it is not a scorched-earth empty env
-        self.assertIn("PATH", self.child)
+            self.assertNotIn(name, child, name)
+        self.assertEqual(child["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(child["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(child["GIT_TERMINAL_PROMPT"], "0")
 
 
 class TestAnonymousProbeArgs(HubTempCase):
@@ -333,6 +345,22 @@ class TestAnonymousProbeArgs(HubTempCase):
         # through a channel the environment overlay does not know about is still gone
         for args in self.anon:
             self.assertIn("http.proxy=", self.config_overrides(args))
+
+
+class TestAuthenticatedProbeArgs(unittest.TestCase):
+    def setUp(self):
+        self.git = ScriptedGit()
+        authenticated_probe(Path("/nonexistent/hub"), "origin", self.git, 5.0)
+        self.args = self.git.calls[0][0]
+
+    def test_it_resets_the_proxy_like_the_anonymous_probe(self):
+        overrides = [self.args[i + 1] for i, a in enumerate(self.args) if a == "-c"]
+        self.assertIn("http.proxy=", overrides)
+
+    def test_it_does_not_reset_the_credential_helper(self):
+        # it must be able to authenticate — that success is what distinguishes
+        # "private" from "unreachable"
+        self.assertNotIn("credential.helper=", self.args)
 
 
 # --- classification and the three-way decision -----------------------------------

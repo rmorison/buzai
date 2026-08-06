@@ -18,30 +18,43 @@ R4-compliant credential — an ssh deploy key scoped to the hub repo — has no 
 at all, so `gh repo view` could never succeed and a fail-closed rule would refuse every
 push forever. The two halves were mutually exclusive.
 
-What "anonymous" actually means here
-------------------------------------
-This is the subtle part: a probe that accidentally authenticates reports *private* for
-a *public* repo, which is the one failure that matters. `anonymous_env()` therefore
-suppresses every channel git can obtain a credential through, and the probe argv adds
-one more:
+Two layers of environment suppression, and why they differ
+----------------------------------------------------------
+Every network-facing git call in buzai — the anonymous probe, the authenticated probe,
+and the pushes in `hub_commit` / `hub_review` — is built from `no_config_injection()`.
+The anonymous probe alone adds a second layer on top. The split is deliberate, because
+the two calls need *opposite* things from a credential.
+
+**Layer 1, `no_config_injection()` — for every network-facing call.** These are git
+*config injection* channels: they bypass `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`
+entirely, so pointing those at `os.devnull` does not close them.
+
+  * `GIT_CONFIG_COUNT` + every `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pair,
+    `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` **unset**. One `url.<base>.insteadOf`
+    entry rewrites the URL git actually contacts, which is fatal in *both* directions:
+    it can send the anonymous probe somewhere readable (a private repo reads as
+    public), and it can send the authenticated probe — or the push — to an
+    attacker-chosen host that answers happily. The authenticated probe's *success* is
+    what turns "every anonymous probe was denied" into PRIVATE, so a redirected auth
+    probe manufactures the exact verdict that permits a push. The same channel installs
+    a credential helper that a later `-c credential.helper=` cannot cancel. Pairs are
+    enumerated from the environment rather than assumed to be few: the count is
+    arbitrary.
+  * `http_proxy` / `https_proxy` / `all_proxy` (both cases) and `GIT_PROXY_COMMAND`
+    **unset**, plus `-c http.proxy=` on the command line (`NO_PROXY_ARGS`) — a proxy
+    answers *for* the host, so it decides what the call sees. One that returns 200 for
+    everything makes every repo look public (a refusal, survivable); one that returns a
+    canned error page makes every repo look private (the failure this module exists to
+    prevent); and one in front of a push sends hub content somewhere else entirely.
+
+**Layer 2, the rest of `anonymous_env()` — the anonymous probe only.** A probe that
+accidentally authenticates reports *private* for a *public* repo, so it must be unable
+to obtain a credential at all:
 
   * `-c credential.helper=` — git's idiom for **resetting** the helper list, so no
     helper configured anywhere can run.
   * `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` -> `os.devnull` — `~/.gitconfig` and
     `/etc/gitconfig` contribute no helper, no `insteadOf` rewrite, nothing.
-  * `GIT_CONFIG_COUNT` + every `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pair,
-    `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` **unset** — these are config *injection*
-    channels that bypass the two files above entirely. One `url.<base>.insteadOf` entry
-    rewrites the probe URL to somewhere readable (a private repo then reads as public,
-    or worse: an attacker-chosen host answers for it), and the same channel installs a
-    credential helper that `-c credential.helper=` alone cannot cancel, because a later
-    `-c` on the command line is not what the pairs go through. The pairs are enumerated
-    from the environment rather than assumed to be few: the count is arbitrary.
-  * `http_proxy` / `https_proxy` / `all_proxy` (both cases), `GIT_PROXY_COMMAND`
-    **unset**, plus `-c http.proxy=` — a proxy answers *for* the host, so it decides
-    what the probe sees; a proxy that returns 200 for everything makes every repo look
-    public (a refusal, survivable) and one that returns a canned error page makes every
-    repo look private (the failure this module exists to prevent).
   * `-C <neutral dir>` + `GIT_CEILING_DIRECTORIES` — the probe runs outside any repo,
     so no *repo-local* config applies either (the checkout's would otherwise).
   * `GIT_TERMINAL_PROMPT=0` and `GIT_ASKPASS`/`SSH_ASKPASS` **unset** — git cannot ask
@@ -52,8 +65,14 @@ one more:
   * `BatchMode=yes` and `NumberOfPasswordPrompts=0` — no interactive fallback, so an
     unknown host key fails fast instead of hanging a TTY-less service.
 
-Host-key checking is deliberately **not** weakened: an unknown host fails, and that
-failure is *indeterminate*, never "private".
+None of layer 2 is applied to `authenticated_env()`, and that is not an oversight: the
+authenticated probe and the push *must* reach this instance's deploy key, so scrubbing
+the agent, the askpass channel, the identity options or the user's git config would
+break the very thing they exist to exercise. They keep `GIT_TERMINAL_PROMPT=0` (a
+TTY-less service must fail rather than hang) and `AUTH_SSH`'s `BatchMode=yes`.
+
+Host-key checking is deliberately **not** weakened anywhere: an unknown host fails, and
+that failure is *indeterminate*, never "private".
 
 Which endpoint gets probed matters as much as the environment. Public readability is
 exposed over https (and `git://`), never over ssh — an anonymous ssh probe is refused
@@ -184,7 +203,7 @@ ANON_SSH = (
 AUTH_SSH = "ssh -o BatchMode=yes -o ConnectTimeout=10"
 LOCAL_ENV: dict[str, str | None] = {"GIT_TERMINAL_PROMPT": "0"}
 
-# Environment channels the anonymous probe must not inherit: config injection that
+# Environment channels NO network-facing git call may inherit: config injection that
 # bypasses GIT_CONFIG_GLOBAL/SYSTEM entirely, and proxies, which decide who answers for
 # the host. Each is *unset* rather than emptied — an empty `GIT_CONFIG_PARAMETERS` is
 # parsed, an absent one is not.
@@ -206,6 +225,11 @@ SUPPRESSED_VARS = (
 # would be enough for today's git; matching the pairs too means the suppression does not
 # depend on that implementation detail staying true.
 CONFIG_PAIR_VAR = re.compile(r"^GIT_CONFIG_(?:KEY|VALUE)_\d+$")
+
+# The command-line half of the proxy suppression, shared by every network-facing call.
+# `-c` on the command line outranks every config file, so this holds even where a proxy
+# reached git through a channel the environment overlay does not know about.
+NO_PROXY_ARGS = ("-c", "http.proxy=")
 
 # `host:path`, git's scp-like remote syntax. The `(?!//)` keeps `scheme://…` out.
 SCP_LIKE = re.compile(r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?!//)(?P<path>.+)$")
@@ -345,18 +369,52 @@ def anonymous_urls(url: str) -> list[str]:
 # --- probing and the decision ------------------------------------------------------
 
 
+def no_config_injection(environ: Mapping[str, str] | None = None) -> dict[str, str | None]:
+    """Layer 1: the overlay EVERY network-facing git call needs. See the module docstring.
+
+    Strips the git-config injection channels and the proxy channels, and nothing else —
+    it is the floor, not the whole story, and it is safe for calls that must
+    authenticate because it removes no credential of theirs.
+
+    Pure given `environ` (the parent environment, `os.environ` by default), which is
+    read only to *enumerate* what must be unset: the `GIT_CONFIG_KEY_<n>`/`_VALUE_<n>`
+    pairs are numbered, so the names cannot be written down in advance. A `None` value
+    means unset in the child, which is what `default_git_runner` does.
+    """
+    source = os.environ if environ is None else environ
+    env: dict[str, str | None] = dict.fromkeys(SUPPRESSED_VARS)
+    for name in source:
+        if CONFIG_PAIR_VAR.match(name):
+            env[name] = None
+    return env
+
+
+def authenticated_env(environ: Mapping[str, str] | None = None) -> dict[str, str | None]:
+    """The overlay for git calls that MUST authenticate: the auth probe and the pushes.
+
+    Layer 1 plus the two settings a TTY-less service needs, and deliberately **none** of
+    `anonymous_env`'s credential suppression: these calls exist to exercise this
+    instance's deploy key, so scrubbing the ssh agent, askpass, the identity options or
+    the user's git config would break them rather than harden them.
+    """
+    return {
+        **no_config_injection(environ),
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_SSH_COMMAND": AUTH_SSH,
+    }
+
+
 def anonymous_env(
     neutral_dir: str, environ: Mapping[str, str] | None = None
 ) -> dict[str, str | None]:
-    """The credential- and config-suppressing environment overlay. See the module docstring.
+    """Layer 1 + layer 2: the credential-suppressing overlay, anonymous probe only.
 
-    Pure given `environ` (the parent environment, `os.environ` by default). It is read
-    only to *enumerate* what must be unset: the `GIT_CONFIG_KEY_<n>`/`_VALUE_<n>` pairs
-    are numbered, so the set of names to suppress cannot be written down in advance.
-    A `None` value means unset in the child, which is what `default_git_runner` does.
+    Everything `no_config_injection` removes, plus every channel git could obtain a
+    credential through. See the module docstring for why the authenticated calls must
+    not get this half.
     """
-    source = os.environ if environ is None else environ
-    env: dict[str, str | None] = {
+    return {
+        **no_config_injection(environ),
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS": None,
         "SSH_ASKPASS": None,
@@ -367,33 +425,17 @@ def anonymous_env(
         "GIT_CEILING_DIRECTORIES": neutral_dir,
         "GIT_SSH_COMMAND": ANON_SSH,
     }
-    for name in SUPPRESSED_VARS:
-        env[name] = None
-    for name in source:
-        if CONFIG_PAIR_VAR.match(name):
-            env[name] = None
-    return env
 
 
 def anonymous_probe(url: str, runner: GitRunner, timeout: float) -> GitResult:
     """Read `url`'s ref list as a stranger would. Success means the repo is public.
 
-    The two `-c` resets are belt to the environment's braces: a helper or a proxy that
-    reached git through a channel `anonymous_env` does not know about is still cleared
-    here, and command-line `-c` outranks every config file.
+    The `-c` resets are belt to the environment's braces: a helper or a proxy that
+    reached git through a channel the overlay does not know about is still cleared here,
+    and command-line `-c` outranks every config file.
     """
     neutral = tempfile.gettempdir()
-    args = [
-        "-C",
-        neutral,
-        "-c",
-        "credential.helper=",
-        "-c",
-        "http.proxy=",
-        "ls-remote",
-        url,
-        "HEAD",
-    ]
+    args = ["-C", neutral, "-c", "credential.helper=", *NO_PROXY_ARGS, "ls-remote", url, "HEAD"]
     return runner(args, anonymous_env(neutral), timeout)
 
 
@@ -401,10 +443,12 @@ def authenticated_probe(hub: Path, remote: str, runner: GitRunner, timeout: floa
     """Read the remote's ref list *with* this instance's credential.
 
     Success is what separates "private" from "misconfigured or unreachable": it proves
-    the repository exists, the host answers, and the deploy key works.
+    the repository exists, the host answers, and the deploy key works. Which is exactly
+    why it is injection-suppressed too — an `insteadOf` rewrite pointing this at a host
+    that answers manufactures the one verdict that permits a push.
     """
-    env: dict[str, str | None] = {"GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": AUTH_SSH}
-    return runner(["-C", str(hub), "ls-remote", remote, "HEAD"], env, timeout)
+    args = ["-C", str(hub), *NO_PROXY_ARGS, "ls-remote", remote, "HEAD"]
+    return runner(args, authenticated_env(), timeout)
 
 
 def classify(result: GitResult) -> str:

@@ -99,7 +99,6 @@ from scripts.hub_commit import (  # noqa: E402
     GIT_TIMEOUT_SECONDS,
     NOTHING_TO_PUSH,
     OWNER_CORRECTION,
-    PUSH_ENV,
     PUSH_FAILED,
     PUSH_LOCAL_ONLY,
     PUSH_REFUSED,
@@ -124,7 +123,13 @@ from scripts.hub_commit import (  # noqa: E402
     run_git,
 )
 from scripts.hub_paths import HubPathError, hub_dir  # noqa: E402
-from scripts.hub_remote import LOCAL_ONLY, GitRunner, default_git_runner  # noqa: E402
+from scripts.hub_remote import (  # noqa: E402
+    LOCAL_ONLY,
+    NO_PROXY_ARGS,
+    GitRunner,
+    authenticated_env,
+    default_git_runner,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -677,7 +682,13 @@ def push_notes(
         return NotesPush(PUSH_REFUSED, f"notes push refused: {verification.detail}")
 
     remote = verification.remote or "origin"
-    result = run_git(hub, ["push", remote, f"{NOTES_REF}:{NOTES_REF}"], runner, timeout, PUSH_ENV)
+    result = run_git(
+        hub,
+        [*NO_PROXY_ARGS, "push", remote, f"{NOTES_REF}:{NOTES_REF}"],
+        runner,
+        timeout,
+        authenticated_env(),
+    )
     if result.returncode == 0:
         return NotesPush(PUSHED, f"review dispositions pushed to {remote} ({verification.url})")
     detail = detail_of(result)

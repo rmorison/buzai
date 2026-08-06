@@ -85,12 +85,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.hub_paths import HubPathError, hub_dir  # noqa: E402
 from scripts.hub_remote import (  # noqa: E402
-    AUTH_SSH,
     LOCAL_ENV,
     LOCAL_ONLY,
+    NO_PROXY_ARGS,
     GitResult,
     GitRunner,
     Verification,
+    authenticated_env,
     default_git_runner,
 )
 from scripts.hub_remote import verify as verify_remote  # noqa: E402
@@ -147,7 +148,10 @@ LOCK_TIMEOUT_SECONDS = 30.0
 # the push sits outside the lock.
 PUSH_TIMEOUT_SECONDS = 60.0
 
-PUSH_ENV: dict[str, str | None] = {"GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": AUTH_SSH}
+# The push environment is `hub_remote.authenticated_env()`, called per invocation rather
+# than frozen into a constant here: it enumerates the numbered `GIT_CONFIG_KEY_<n>` pairs
+# out of the *current* environment, and a constant built at import time would miss any
+# that appeared later — and would read as suppression while suppressing nothing.
 
 # Substrings that mean "the remote has commits this repo does not". Recognized so the
 # operation can halt loudly rather than tempting anyone into a rebase or a --force.
@@ -989,7 +993,13 @@ def attempt_push(
 
     remote = verification.remote or "origin"
     branch = current_branch(hub, runner)
-    result = run_git(hub, ["push", remote, f"HEAD:refs/heads/{branch}"], runner, timeout, PUSH_ENV)
+    result = run_git(
+        hub,
+        [*NO_PROXY_ARGS, "push", remote, f"HEAD:refs/heads/{branch}"],
+        runner,
+        timeout,
+        authenticated_env(),
+    )
     if result.returncode == 0:
         return PushOutcome(
             PUSHED, f"pushed to {remote} ({verification.url})", clear_backlog(path, now)

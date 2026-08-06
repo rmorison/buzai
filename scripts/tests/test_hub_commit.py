@@ -34,6 +34,7 @@ from scripts.hub_commit import (
     WriteRequest,
     added_lines,
     apply_operation,
+    attempt_push,
     commit_message,
     default_backlog_path,
     default_lock_path,
@@ -48,6 +49,7 @@ from scripts.hub_commit import (
 )
 from scripts.hub_remote import INDETERMINATE, LOCAL_ONLY, PRIVATE, GitResult, Verification
 from scripts.hub_remote import default_git_runner as real_git
+from scripts.tests.env_isolation import assert_injection_suppressed, plant
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NOW = datetime(2026, 8, 5, 12, 0, 0, tzinfo=UTC)
@@ -794,6 +796,47 @@ class TestHungPushDoesNotBlockWrites(HubRepoCase):
 
 
 # --- push, backlog, divergence ---------------------------------------------------------
+
+
+class TestPushEnvironmentIsolation(HubRepoCase):
+    """The push is a network call carrying a credential — layer 1 applies to it too.
+
+    A `url.<base>.insteadOf` entry injected through `GIT_CONFIG_KEY_<n>` redirects where
+    the push *goes*, which sends hub content to a host of the attacker's choosing. The
+    overlay asserted here is the one `attempt_push` actually handed its runner, so a
+    push that forgot `authenticated_env()` fails this test rather than silently
+    inheriting the rewrite.
+    """
+
+    def setUp(self):
+        super().setUp()
+        plant(self)
+        self.calls = []
+
+        def recorder(args, env, timeout):
+            self.calls.append((list(args), dict(env), timeout))
+            # The push itself is never executed: nothing here may leave the box.
+            return GitResult(0, "", "") if "push" in args else real_git(args, env, timeout)
+
+        outcome = attempt_push(self.hub, runner=recorder, verifier=PRIVATE_REMOTE, now=NOW)
+        self.assertEqual(outcome.status, PUSHED)
+        pushes = [call for call in self.calls if "push" in call[0]]
+        self.assertEqual(len(pushes), 1)
+        self.args, self.env, _ = pushes[0]
+
+    def test_nothing_injected_reaches_the_pushs_child(self):
+        assert_injection_suppressed(self, self.env)
+
+    def test_the_push_resets_the_proxy_on_the_command_line(self):
+        overrides = [self.args[i + 1] for i, a in enumerate(self.args) if a == "-c"]
+        self.assertIn("http.proxy=", overrides)
+
+    def test_the_push_keeps_the_credential_channels_it_needs(self):
+        # unlike the anonymous probe, this call must reach the deploy key
+        for name in ("SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_CONFIG_GLOBAL"):
+            self.assertNotIn(name, self.env, name)
+        self.assertEqual(self.env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertIn("BatchMode=yes", self.env["GIT_SSH_COMMAND"])
 
 
 class TestPushBacklog(HubRepoCase):

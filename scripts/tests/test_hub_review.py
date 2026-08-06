@@ -28,7 +28,8 @@ from scripts.hub_commit import (
     record,
     record_unpushed,
 )
-from scripts.hub_remote import INDETERMINATE, LOCAL_ONLY, PRIVATE, Verification
+from scripts.hub_remote import INDETERMINATE, LOCAL_ONLY, PRIVATE, GitResult, Verification
+from scripts.hub_remote import default_git_runner as real_git
 from scripts.hub_review import (
     ALREADY_ABSENT,
     ALREADY_DISPOSED,
@@ -62,6 +63,7 @@ from scripts.hub_review import (
     staleness_warning,
     summarize,
 )
+from scripts.tests.env_isolation import assert_injection_suppressed, plant
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NOW = datetime(2026, 8, 5, 12, 0, 0, tzinfo=UTC)
@@ -707,6 +709,44 @@ class TestNotesRefIntegrity(ReviewRepoCase):
         )
         with self.assertRaises(HubReviewError):
             read_disposition(self.hub, sha)
+
+
+class TestNotesPushEnvironmentIsolation(ReviewRepoCase):
+    """The notes push is the fourth network-facing call, and gets the same layer 1.
+
+    Dispositions are the owner's words about their own knowledge base, so a redirected
+    notes push leaks exactly what a redirected content push leaks. The overlay asserted
+    here is the one `push_notes` handed its runner.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.approve(self.append("a fact"))
+        plant(self)
+        self.calls = []
+
+        def recorder(args, env, timeout):
+            self.calls.append((list(args), dict(env), timeout))
+            # The push itself is never executed: nothing here may leave the box.
+            return GitResult(0, "", "") if "push" in args else real_git(args, env, timeout)
+
+        outcome = push_notes(self.hub, runner=recorder, verifier=PRIVATE_REMOTE)
+        self.assertEqual(outcome.status, PUSHED, outcome.detail)
+        pushes = [call for call in self.calls if "push" in call[0]]
+        self.assertEqual(len(pushes), 1)
+        self.args, self.env, _ = pushes[0]
+
+    def test_nothing_injected_reaches_the_notes_pushs_child(self):
+        assert_injection_suppressed(self, self.env)
+
+    def test_the_notes_push_resets_the_proxy_on_the_command_line(self):
+        overrides = [self.args[i + 1] for i, a in enumerate(self.args) if a == "-c"]
+        self.assertIn("http.proxy=", overrides)
+
+    def test_the_notes_push_keeps_the_credential_channels_it_needs(self):
+        for name in ("SSH_AUTH_SOCK", "GIT_ASKPASS", "GIT_CONFIG_GLOBAL"):
+            self.assertNotIn(name, self.env, name)
+        self.assertEqual(self.env["GIT_TERMINAL_PROMPT"], "0")
 
 
 class TestNotesPush(ReviewRepoCase):
