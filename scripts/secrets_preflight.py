@@ -48,6 +48,22 @@ plants the violation and proves it fires. `_git_tracked` in particular now runs 
 the file's **own** directory so git discovers whatever repo encloses it, which is the
 only way "tracked by any repo" can be true of `~/.ssh/buzai-hub`.
 
+Every git call is bounded, and times out in the direction its check demands
+---------------------------------------------------------------------------
+`ExecStartPre` runs this on every start, and git has no timeout of its own — while the
+paths involved (`~/.ssh`, the hub store) can be network mounts. An unbounded call is
+therefore a hung start, and `StartLimitBurst=5` turns repeated hung starts into a unit
+that stays `failed`. So every call carries an explicit timeout and every timeout
+degrades the way the split above dictates:
+
+  * **leak checks fail closed.** `_git_tracked` returns a reason string instead of
+    `False`, and `tracked_paths` raises; both become fatal "unverified rather than
+    clean" findings. A leak check that times out must never read as a pass.
+  * **durability checks warn.** `commit_count` and `remotes` raise instead of returning
+    0 / `()` — values that mean "nothing to lose yet" and "nothing has gone off-box" —
+    and `inspect_hub` turns that into a warning, so service start is not blocked by a
+    slow disk.
+
 Legitimate empty states are not violations
 ------------------------------------------
 Per that same learning (§6(f)): a fresh instance with no hub repo, a scaffold-only
@@ -91,6 +107,7 @@ from scripts.hub_commit import (  # noqa: E402
     read_backlog,
 )
 from scripts.hub_init import (  # noqa: E402
+    GIT,
     MARKER,
     SCAFFOLDS,
     HubInitError,
@@ -186,7 +203,24 @@ def perm_problems(paths) -> list[str]:
 
 
 def tracked_problems(paths, is_tracked) -> list[str]:
-    return [f"{p} is tracked by git (secrets must be untracked)" for p in paths if is_tracked(p)]
+    """Secrets a git repo carries. Pure given `is_tracked`.
+
+    `is_tracked` answers True / False / a *reason string* meaning "could not tell" —
+    the shape `_git_tracked` returns when git timed out or could not be run. That third
+    answer is a finding of its own rather than a `False`: this is a leak check, and the
+    one thing it must never do is report "cannot tell" as "clean".
+    """
+    probs = []
+    for p in paths:
+        answer = is_tracked(p)
+        if isinstance(answer, str):
+            probs.append(
+                f"cannot determine whether {p} is tracked by git — treated as unverified "
+                f"rather than clean: {answer}"
+            )
+        elif answer:
+            probs.append(f"{p} is tracked by git (secrets must be untracked)")
+    return probs
 
 
 def problems(secret_files, repo_secrets, creds, is_tracked) -> list[str]:
@@ -220,6 +254,17 @@ def env_file_problems(paths: Iterable[Path]) -> list[str]:
     ]
 
 
+# The one thing an operator hitting this needs to know and cannot guess: `make hub-init`
+# is not only for a fresh instance. The state that produces this finding most often is a
+# migration interrupted half-way — hub repo already there, content still here — and the
+# remedy is the same verb, which resumes. Saying "run `make hub-init`" without this reads
+# as advice that was already followed and did nothing.
+RESUMES = (
+    " — `make hub-init` moves it out of the working tree AND the index, and finishes an "
+    "interrupted migration, so run it even though the hub repo already exists"
+)
+
+
 def hub_content_problems(content: Iterable[str], source: Path, tracked: Iterable[str]) -> list[str]:
     """Personal hub content sitting in the public checkout. Pure. R3/R16.
 
@@ -237,11 +282,12 @@ def hub_content_problems(content: Iterable[str], source: Path, tracked: Iterable
             f"{source / rel} is personal hub content that the PUBLIC repo already tracks — "
             f"it is one push from being published; take it out of the index with "
             f"`git rm --cached {source / rel}` and move the content into the private hub "
-            f"store (`make hub-init` does both)"
+            f"store"
             if rel in staged
             else f"{source / rel} is personal hub content inside the public checkout — hub "
-            f"content lives in the private hub repo; run `make hub-init` to move it out"
+            f"content lives in the private hub repo"
         )
+        + RESUMES
         for rel in content
     ]
 
@@ -269,7 +315,7 @@ def fatal_problems(
     hub_content: Sequence[str],
     hub_path_problem: str | None,
     origin_violations: Sequence[str],
-    is_tracked: Callable[[Path], bool],
+    is_tracked: Callable[[Path], bool | str],
 ) -> list[str]:
     """Every leak condition, in one pure function. Blocks service start.
 
@@ -421,26 +467,36 @@ def _repo_secret_candidates(env_dir: Path = DEPLOY_ENV_DIR) -> list[Path]:
     return sorted(p for p in env_dir.glob("*.env") if not p.name.endswith(".env.example"))
 
 
-def _git_tracked(path) -> bool:
+def _git_tracked(path, *, git_bin: str = GIT, timeout: float = GIT_TIMEOUT_SECONDS) -> bool | str:
     """Is `path` tracked by whatever git repo encloses it — not merely by this checkout?
+
+    True / False, or a *reason string* when git could not answer, which
+    `tracked_problems` turns into an unverified-and-therefore-fatal finding. Silently
+    returning False there would be the worst kind of dead check: a leak test that passes
+    because it never ran.
 
     Run from the file's **own** directory so git discovers the enclosing repository by
     walking up. `git -C REPO_ROOT` could never see `~/.ssh/buzai-hub` in a dotfiles repo
     at `~`, and a check that cannot see its target is the dead no-op this file already
-    shipped once. A nonzero returncode (no repo, path outside it, untracked) is a value,
-    not an exception.
+    shipped once. That reach is also why the call is bounded: the directory is the
+    target's, which may be a network mount, and this runs on every `ExecStartPre`.
+    A nonzero returncode (no repo, path outside it, untracked) is a value, not an error.
     """
     p = Path(path)
     parent = p.parent if p.parent.is_dir() else REPO_ROOT
-    r = subprocess.run(
-        ["git", "-C", str(parent), "ls-files", "--error-unmatch", "--", str(p)],
-        capture_output=True,
-        text=True,
-    )
+    argv = [git_bin, "-C", str(parent), "ls-files", "--error-unmatch", "--", str(p)]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return f"`git ls-files` in {parent} timed out after {timeout}s"
+    except OSError as e:
+        return f"cannot run {git_bin!r} in {parent}: {e}"
     return r.returncode == 0
 
 
-def hub_checkout_problems(source: Path = HUB_SCAFFOLD_DIR) -> list[str]:
+def hub_checkout_problems(
+    source: Path = HUB_SCAFFOLD_DIR, git_bin: str = GIT, timeout: float = GIT_TIMEOUT_SECONDS
+) -> list[str]:
     """Personal hub content found in the checkout's `hubs/`. R3/R16.
 
     What is content and what is a scaffold comes from `hub_init.SCAFFOLDS` — an
@@ -454,7 +510,7 @@ def hub_checkout_problems(source: Path = HUB_SCAFFOLD_DIR) -> list[str]:
         return []
     content = plan_migration(source, SCAFFOLDS)
     try:
-        tracked = tracked_paths(source)
+        tracked = tracked_paths(source, git_bin, timeout)
     except HubInitError as e:
         # Every content file below is still a finding; what cannot be answered is only
         # which of them the index also holds, so the extra remedy is named here rather
@@ -497,28 +553,45 @@ def enclosing_repo(
 
 
 def inspect_hub(
-    hub: Path, runner: GitRunner = default_git_runner, timeout: float = GIT_TIMEOUT_SECONDS
+    hub: Path,
+    runner: GitRunner = default_git_runner,
+    timeout: float = GIT_TIMEOUT_SECONDS,
+    git_bin: str = GIT,
 ) -> HubState:
-    """Read the hub store's durability-relevant state. Never raises."""
+    """Read the hub store's durability-relevant state. Never raises.
+
+    Every reader here is bounded, and a reader that could not answer lands in
+    `inspect_error` — which `warnings_for` reports and which does *not* block start.
+    Durability is the whole subject of this function, so a git that hung must warn; it
+    must not be absorbed into a zero commit count that silences the stale-remote warning.
+    """
     if not hub.is_dir():
         return HubState()
     if not (hub / ".git").exists():
         return HubState(exists=True, enclosing_repo=enclosing_repo(hub, runner, timeout))
     created, marker_error = read_marker(hub)
+    errors: list[str] = []
     try:
-        dirty, inspect_error = tuple(dirty_paths(hub, runner, timeout)), ""
+        dirty: tuple[str, ...] = tuple(dirty_paths(hub, runner, timeout))
     except HubCommitError as e:
-        dirty, inspect_error = (), str(e)
+        dirty = ()
+        errors.append(str(e))
+    try:
+        remote_names: tuple[str, ...] = tuple(remotes(hub, git_bin, timeout))
+        commits = commit_count(hub, git_bin, timeout)
+    except HubInitError as e:
+        remote_names, commits = (), 0
+        errors.append(str(e))
     return HubState(
         exists=True,
         is_repo=True,
         created=created,
         marker_error=marker_error,
-        remotes=tuple(remotes(hub)),
-        commits=commit_count(hub),
+        remotes=remote_names,
+        commits=commits,
         backlog=read_backlog(default_backlog_path(hub)),
         dirty=dirty,
-        inspect_error=inspect_error,
+        inspect_error="; ".join(errors),
         enclosing_repo=enclosing_repo(hub, runner, timeout),
     )
 
@@ -535,7 +608,7 @@ def assess(
     env_dir: Path = DEPLOY_ENV_DIR,
     scaffold_dir: Path = HUB_SCAFFOLD_DIR,
     hub_key: Path = HUB_KEY,
-    is_tracked: Callable[[Path], bool] = _git_tracked,
+    is_tracked: Callable[[Path], bool | str] = _git_tracked,
 ) -> tuple[HubTarget, Findings]:
     """Gather everything and return the verdict for this instance.
 

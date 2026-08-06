@@ -2,12 +2,14 @@ import io
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from scripts.hub_commit import Backlog
+from scripts.hub_init import initialize
 from scripts.hub_remote import default_git_runner as real_git
 from scripts.secrets_preflight import (
     REMOTE_GRACE_SECONDS,
@@ -364,6 +366,16 @@ class TestHubContentInCheckout(unittest.TestCase):
         probs = hub_content_problems(["finance.md"], Path("/repo/hubs"), [])
         self.assertIn("/repo/hubs/finance.md", probs[0])
         self.assertIn("make hub-init", probs[0])
+
+    def test_the_remedy_says_hub_init_resumes_an_existing_store(self):
+        # the state that produces this finding is usually a half-finished migration, so
+        # "run `make hub-init`" alone reads as advice the operator already followed
+        for probs in (
+            hub_content_problems(["finance.md"], Path("/repo/hubs"), []),
+            hub_content_problems(["finance.md"], Path("/repo/hubs"), ["finance.md"]),
+        ):
+            self.assertIn("interrupted migration", probs[0])
+            self.assertIn("even though the hub repo already exists", probs[0])
 
     # --- the hole: content the public repo ALREADY tracks --------------------------
 
@@ -1009,6 +1021,117 @@ class TestAssessComposition(unittest.TestCase):
         git("-C", str(self.checkout), "config", "credential.helper", "store")
         findings = self.findings()
         self.assertEqual(len(findings.fatal), 3, findings.fatal)
+
+    # --- the wedge: an interrupted migration must have a way out --------------------
+
+    def test_the_remedy_the_preflight_names_actually_unblocks_the_service(self):
+        """PLANT: hub repo already created, personal content still in the checkout.
+
+        The preflight is right to block — the content IS a leak — but `make hub-init`
+        used to report "exists" and stop, so nothing could clear it and
+        `StartLimitBurst=5` left the unit failed. This drives both halves.
+        """
+        hub = make_repo(self.home / "hubs")
+        (hub / "README.md").write_text("# Hub store\n")
+        commit_all(hub, "seeded")
+        leak = self.hubs / "finance-and-tax.md"
+        leak.write_text("# Finance\n\n- account 1234\n")
+
+        blocked, _, err = self.run_main()
+        self.assertEqual(blocked, 1)
+        self.assertIn("make hub-init", err)
+        self.assertIn("interrupted migration", err)
+
+        result = initialize(hub, self.hubs, self.now)
+
+        self.assertEqual(result.status, "resumed")
+        self.assertFalse(leak.exists())
+        self.assertEqual((hub / "finance-and-tax.md").read_text(), "# Finance\n\n- account 1234\n")
+        code, out, _ = self.run_main()
+        self.assertEqual(code, 0, out)
+
+
+class TestTimeoutsDegradeInTheDirectionTheCheckDemands(unittest.TestCase):
+    """PLANT: a git that never returns, on the `ExecStartPre` path.
+
+    Unbounded, this is a hung service start, and five of those leave the unit `failed`.
+    Bounded, what matters is the direction each check degrades in: a leak check that
+    cannot answer must NOT pass, and a durability check that cannot answer must warn
+    rather than take the assistant down with it.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.slow = self.root / "slow-git"
+        self.slow.write_text("#!/bin/sh\nsleep 2\n")
+        self.slow.chmod(0o755)
+        self.key = self.root / "buzai-hub"
+        self.key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+        os.chmod(self.key, 0o600)
+
+    def tracked(self, path):
+        return _git_tracked(path, git_bin=str(self.slow), timeout=0.3)
+
+    # --- leak checks fail closed ---------------------------------------------------
+
+    def test_a_hung_tracking_check_answers_with_a_reason_not_with_false(self):
+        started = time.monotonic()
+        answer = self.tracked(self.key)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertIsInstance(answer, str)
+        self.assertIn("timed out", answer)
+
+    def test_a_hung_tracking_check_is_fatal_rather_than_clean(self):
+        probs = tracked_problems([self.key], self.tracked)
+        self.assertEqual(len(probs), 1)
+        self.assertIn("unverified rather than clean", probs[0])
+
+    def test_it_reaches_the_fatal_list_and_blocks_start(self):
+        fatal = fatal_problems(
+            secret_files=[],
+            repo_secrets=[],
+            creds=self.root / "absent.json",
+            hub_credentials=[self.key],
+            hub_content=[],
+            hub_path_problem=None,
+            origin_violations=[],
+            is_tracked=self.tracked,
+        )
+        self.assertEqual(len(fatal), 1, fatal)
+        self.assertTrue(Findings(tuple(fatal)).blocks_start)
+
+    def test_a_missing_git_is_also_unverified_rather_than_clean(self):
+        answer = _git_tracked(self.key, git_bin=str(self.root / "no-such-git"), timeout=0.3)
+        self.assertIsInstance(answer, str)
+        self.assertIn("cannot run", answer)
+
+    def test_a_hung_index_read_leaves_the_checkout_content_check_unverified(self):
+        hubs = self.root / "hubs"
+        hubs.mkdir()
+        (hubs / "finance.md").write_text("# Finance\n")
+        probs = hub_checkout_problems(hubs, str(self.slow), 0.3)
+        self.assertTrue(any("unverified rather than clean" in p for p in probs), probs)
+        self.assertTrue(any(str(hubs / "finance.md") in p for p in probs), probs)
+
+    # --- durability checks warn ----------------------------------------------------
+
+    def test_a_hung_hub_read_warns_and_does_not_block_start(self):
+        hub = make_repo(self.root / "hubs")
+        (hub / "home.md").write_text("# Home\n")
+        commit_all(hub, "first hub entry")
+
+        state = inspect_hub(hub, real_git, git_bin=str(self.slow), timeout=0.3)
+
+        self.assertIn("timed out", state.inspect_error)
+        warns = warnings_for(hub, state, NOW)
+        self.assertTrue(any("timed out" in w for w in warns), warns)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = report(HubTarget(hub, str(hub)), Findings(warnings=tuple(warns)))
+        self.assertEqual(code, 0)
+        self.assertIn("secrets-preflight WARN", err.getvalue())
 
 
 if __name__ == "__main__":

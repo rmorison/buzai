@@ -12,10 +12,22 @@ exact owner-run commands are printed instead, in the style of `install.sh`'s man
 pauses. Re-running after the remote exists reports rather than repeats.
 
 Idempotent and non-destructive, in the sense `scripts/install_hooks.py` uses: an
-existing hub repo is reported and left completely alone — never re-seeded, never
-clobbered — and a non-empty directory that is *not* a repo is refused rather than
-initialized over. Anything that fails before the initial commit rolls back what this
-script created, so a failed run leaves no half-built repo behind.
+existing hub repo is never re-seeded and never clobbered, and a non-empty directory
+that is *not* a repo is refused rather than initialized over. Anything that fails
+before the initial commit rolls back what this script created, so a failed run leaves
+no half-built repo behind.
+
+Resumable, because an interrupted migration is otherwise unescapable
+--------------------------------------------------------------------
+"Existing hub repo" is deliberately **not** a reason to stop before the leftover-content
+check. A run interrupted after the repo exists but before the checkout was cleaned left
+a state neither this module nor `secrets_preflight` could leave: the preflight fataled
+on personal content in the checkout — correctly, it IS a leak — and blocked service
+start, while this script saw a repo and returned "exists", so re-running never finished
+the job. With `StartLimitBurst=5` the unit ends `failed` and the assistant is gone until
+someone hand-fixes it. So an existing repo with content still in the checkout *resumes*:
+the same copy -> commit -> remove sequence, on the files that are left. Idempotence is
+unaffected — a complete instance has nothing left to migrate and changes nothing.
 
 Migration is the one-time move of real hub content out of the public checkout. What
 counts as a scaffold is the explicit `SCAFFOLDS` set and nothing else — pointedly
@@ -62,6 +74,17 @@ SCAFFOLD_DIR = REPO_ROOT / "hubs"
 
 GIT = "git"
 DEFAULT_BRANCH = "main"
+
+# Every call here is bounded. `commit_count`, `remotes` and `tracked_paths` are read by
+# `secrets_preflight` on the systemd `ExecStartPre` path, and the targets can be network
+# mounts; git has no timeout of its own, so an unbounded call turns a stalled filesystem
+# into a hung service start — and with `StartLimitBurst=5`, five of those leave the unit
+# `failed` until a human intervenes. Long enough that a large repo on a slow disk still
+# answers, short enough that five attempts are not five stalled minutes.
+GIT_TIMEOUT_SECONDS = 30.0
+# What `git()` reports when it had to kill git: the shell convention for "timed out".
+TIMEOUT_RETURNCODE = 124
+
 INSTANCE_README = "README.md"
 MARKER = Path(".buzai") / "remote-expected"
 
@@ -87,7 +110,7 @@ class HubInitError(Exception):
 class InitResult:
     """What `initialize` did, so `main` can report it and tests can assert on it."""
 
-    status: str  # "created" | "exists"
+    status: str  # "created" | "resumed" | "exists"
     hub: Path
     seeded: list[str]
     migrated: list[str]
@@ -102,50 +125,84 @@ class InitResult:
 # sites in secrets_preflight.py and publish_gate.py already follow.
 
 
-def git(args: list[str], git_bin: str = GIT) -> subprocess.CompletedProcess:
-    """Run git, capturing output. Raises `HubInitError` only if git cannot be run."""
+def git(
+    args: list[str], git_bin: str = GIT, timeout: float = GIT_TIMEOUT_SECONDS
+) -> subprocess.CompletedProcess:
+    """Run git under a hard timeout. Raises `HubInitError` only if git cannot be run.
+
+    A timeout comes back as a *result* carrying `TIMEOUT_RETURNCODE`, like any other
+    failure, so no caller needs a second error path. What each caller then does with it
+    is where the module's philosophy lives, and it differs on purpose:
+
+      * `commit_count` / `remotes` feed durability checks, and their failure must be
+        visible rather than absorbed — a timed-out commit count read as 0 would silence
+        the very warning it should raise. They raise, and `secrets_preflight` WARNs.
+      * `tracked_paths` feeds a leak check, so its failure is already fatal via `git_ok`:
+        "git could not say" must never be reported as "the repo carries nothing".
+    """
     try:
-        return subprocess.run([git_bin, *args], capture_output=True, text=True)
+        return subprocess.run([git_bin, *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            [git_bin, *args], TIMEOUT_RETURNCODE, "", f"git timed out after {timeout}s"
+        )
     except OSError as e:
         raise HubInitError(
             f"cannot run {git_bin!r}: {e} — git must be installed and on PATH"
         ) from e
 
 
-def git_ok(args: list[str], git_bin: str, what: str) -> str:
+def git_ok(args: list[str], git_bin: str, what: str, timeout: float = GIT_TIMEOUT_SECONDS) -> str:
     """Run git and require success. Returns stdout; raises `HubInitError` on failure."""
-    r = git(args, git_bin)
+    r = git(args, git_bin, timeout)
     if r.returncode != 0:
         detail = (r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}").splitlines()[-1]
         raise HubInitError(f"{what} failed: {detail}")
     return r.stdout
 
 
-def commit_count(hub: Path, git_bin: str = GIT) -> int:
-    """Commits on HEAD; 0 for a repo that has none (rev-list fails on an unborn HEAD)."""
-    r = git(["-C", str(hub), "rev-list", "--count", "HEAD"], git_bin)
+def commit_count(hub: Path, git_bin: str = GIT, timeout: float = GIT_TIMEOUT_SECONDS) -> int:
+    """Commits on HEAD; 0 for a repo that has none (rev-list fails on an unborn HEAD).
+
+    Raises `HubInitError` when git could not answer at all, because 0 is a *meaningful*
+    answer here: the durability check reads it as "no history to lose yet" and stays
+    quiet. A timeout reported as 0 would silence a warning instead of raising one, so it
+    surfaces as an error the caller warns about.
+    """
+    r = git(["-C", str(hub), "rev-list", "--count", "HEAD"], git_bin, timeout)
+    if r.returncode == TIMEOUT_RETURNCODE:
+        raise HubInitError(f"cannot count commits in {hub}: {r.stderr.strip()}")
     return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0
 
 
-def remotes(hub: Path, git_bin: str = GIT) -> list[str]:
-    """Configured remote names — empty means nothing has ever been pushed off-box."""
-    r = git(["-C", str(hub), "remote"], git_bin)
+def remotes(hub: Path, git_bin: str = GIT, timeout: float = GIT_TIMEOUT_SECONDS) -> list[str]:
+    """Configured remote names — empty means nothing has ever been pushed off-box.
+
+    Raises on a timeout for the same reason as `commit_count`: the empty list is what
+    "nothing has ever gone off-box" looks like, and a hung git must not impersonate it.
+    """
+    r = git(["-C", str(hub), "remote"], git_bin, timeout)
+    if r.returncode == TIMEOUT_RETURNCODE:
+        raise HubInitError(f"cannot list the remotes of {hub}: {r.stderr.strip()}")
     return r.stdout.split() if r.returncode == 0 else []
 
 
-def tracked_paths(source: Path, git_bin: str = GIT) -> set[str]:
+def tracked_paths(
+    source: Path, git_bin: str = GIT, timeout: float = GIT_TIMEOUT_SECONDS
+) -> set[str]:
     """Everything git has in its index under `source`, relative to it.
 
     Tracked is **not** the same as scaffold — `SCAFFOLDS` decides that. This answers a
     narrower question: which of the files found under `source` the public repo already
     carries, which is what tells a "move this out" remedy from a "`git rm --cached` this
-    out" one. A failure is fatal rather than an empty set: "git could not say" must not
-    be reported as "the repo carries nothing".
+    out" one. A failure — including a timeout — is fatal rather than an empty set: "git
+    could not say" must not be reported as "the repo carries nothing".
     """
     out = git_ok(
         ["-C", str(source), "ls-files", "-z", "--", "."],
         git_bin,
         f"listing git-tracked files in {source}",
+        timeout,
     )
     return {name for name in out.split("\0") if name}
 
@@ -269,6 +326,22 @@ def commit_message(migrated: Iterable[str]) -> str:
     return f"Initialize hub store\n\n{body}\n\ninstruction-source: owner-directed\n"
 
 
+def resume_message(migrated: Iterable[str]) -> str:
+    """Message for the commit that finishes an interrupted `make hub-init`. Pure.
+
+    Deliberately not `commit_message`: history should record that this content was
+    rescued from the public checkout by a resumed run, not that it was seeded.
+    """
+    moved = list(migrated)
+    return (
+        "Complete the interrupted hub migration\n\n"
+        f"Moved {len(moved)} hub file(s) that were still in the public checkout after an "
+        "interrupted `make hub-init`:\n"
+        + "\n".join(f"  - {m}" for m in moved)
+        + "\n\ninstruction-source: owner-directed\n"
+    )
+
+
 def owner_instructions(hub: Path) -> str:
     """The manual pause: exactly what the owner runs to create and attach the remote.
 
@@ -331,6 +404,77 @@ def _copy_into(source: Path, hub: Path, rel: str) -> None:
         shutil.copy2(source / rel, dest)
     except OSError as e:
         raise HubInitError(f"cannot copy {source / rel} to {dest}: {e}") from e
+
+
+def _copy_unless_identical(source: Path, hub: Path, rel: str) -> None:
+    """Copy one file into the hub repo unless a byte-identical copy is already there.
+
+    An interrupted run can leave the hub's copy already written — even already
+    committed — while the checkout still holds the original; that is exactly the state
+    being resumed, so "already there, byte for byte" is a skip rather than the collision
+    `_copy_into` refuses. A copy that *differs* is still refused: those are two versions
+    of the owner's content and nothing here can know which one is wanted.
+    """
+    dest = hub / rel
+    if not dest.exists():
+        _copy_into(source, hub, rel)
+        return
+    try:
+        identical = dest.read_bytes() == (source / rel).read_bytes()
+    except OSError as e:
+        raise HubInitError(f"cannot compare {source / rel} with {dest}: {e}") from e
+    if identical:
+        return
+    raise HubInitError(
+        f"{dest} already exists and differs from {source / rel} — refusing to overwrite "
+        f"it; compare the two by hand, delete the copy you do not want, then re-run"
+    )
+
+
+def _require_identity(hub: Path, git_bin: str) -> None:
+    """Fail before anything moves if git has no identity to commit with.
+
+    Asked inside the hub repo so the answer accounts for its own config.
+    """
+    if git(["-C", str(hub), "var", "GIT_COMMITTER_IDENT"], git_bin).returncode != 0:
+        raise HubInitError(
+            "git has no commit identity, so the commit would fail — set one: "
+            'git config --global user.name "Your Name" '
+            '&& git config --global user.email "you@example.com"'
+        )
+
+
+def _resume(hub: Path, source: Path, migrate: list[str], git_bin: str) -> InitResult:
+    """Finish an interrupted migration into an existing hub repo, or change nothing.
+
+    The rollback the create path uses is *not* available here — the repo predates this
+    run and wiping it would destroy the owner's knowledge base — so this does the least
+    it can: copy what is missing, commit only the migrated paths, and remove the
+    checkout's copies only after that commit. A failure part-way leaves the content in
+    both places, which the preflight then still reports as a leak and a later re-run
+    still resumes; nothing is ever lost.
+    """
+    if not migrate:
+        return InitResult("exists", hub, [], [], commit_count(hub, git_bin), remotes(hub, git_bin))
+    _require_identity(hub, git_bin)
+    for rel in migrate:
+        _copy_unless_identical(source, hub, rel)
+    git_ok(["-C", str(hub), "add", "--", *migrate], git_bin, "git add")
+    staged = git(["-C", str(hub), "diff", "--cached", "--quiet", "--", *migrate], git_bin)
+    if staged.returncode == 1:  # 1 = something to commit; 0 = the copies are already in
+        git_ok(
+            # Path-scoped, so an unrelated staged change in the hub is not swept in.
+            ["-C", str(hub), "commit", "-q", "-m", resume_message(migrate), "--", *migrate],
+            git_bin,
+            "git commit",
+        )
+    elif staged.returncode != 0:
+        detail = (staged.stderr.strip() or f"exit {staged.returncode}").splitlines()[-1]
+        raise HubInitError(f"cannot tell what is staged in {hub}, so nothing was moved: {detail}")
+    _remove_migrated(source, migrate, git_bin)
+    return InitResult(
+        "resumed", hub, [], migrate, commit_count(hub, git_bin), remotes(hub, git_bin)
+    )
 
 
 def _unstage_migrated(source: Path, migrated: Iterable[str], git_bin: str) -> list[str]:
@@ -400,11 +544,15 @@ def initialize(
     git_bin: str = GIT,
     scaffolds: Iterable[str] = SCAFFOLDS,
 ) -> InitResult:
-    """Create and seed the hub repo at `hub`, or report the one already there.
+    """Create and seed the hub repo at `hub`, resume an interrupted run, or report.
 
     `source` is the checkout's `hubs/` directory. `scaffolds` names what stays there;
     everything else under `source` is personal content and is migrated out of both the
     working tree and the index, tracked or not.
+
+    An existing hub repo does **not** short-circuit that migration — see the module
+    docstring: reporting "exists" while personal content was still in the checkout is
+    the state that wedged service start with no way out.
     """
     probe = git(["--version"], git_bin)
     if probe.returncode != 0:
@@ -412,16 +560,16 @@ def initialize(
 
     if hub.exists() and not hub.is_dir():
         raise HubInitError(f"{hub} exists and is not a directory — refusing to initialize over it")
+    seed = plan_seed(scaffolds)
+    migrate = plan_migration(source, scaffolds)
     if (hub / ".git").exists():
-        return InitResult("exists", hub, [], [], commit_count(hub, git_bin), remotes(hub, git_bin))
+        return _resume(hub, source, migrate, git_bin)
     if hub.is_dir() and any(hub.iterdir()):
         raise HubInitError(
             f"{hub} already exists, is not empty, and is not a git repository — refusing to "
             f"initialize over it; move it aside, or point {ENV_VAR} at another location"
         )
 
-    seed = plan_seed(scaffolds)
-    migrate = plan_migration(source, scaffolds)
     existed = hub.is_dir()
     try:
         hub.mkdir(parents=True, exist_ok=True)
@@ -430,14 +578,8 @@ def initialize(
 
     try:
         git_ok(["-C", str(hub), "init", "-q", "-b", DEFAULT_BRANCH], git_bin, "git init")
-        # Checked here, inside the new repo, so the answer accounts for its config —
-        # and early, so an unset identity fails before anything is moved.
-        if git(["-C", str(hub), "var", "GIT_COMMITTER_IDENT"], git_bin).returncode != 0:
-            raise HubInitError(
-                "git has no commit identity, so the initial commit would fail — set one: "
-                'git config --global user.name "Your Name" '
-                '&& git config --global user.email "you@example.com"'
-            )
+        # Early, so an unset identity fails before anything is moved.
+        _require_identity(hub, git_bin)
         for name in seed:
             _copy_into(source, hub, name)
         (hub / INSTANCE_README).write_text(render_readme(hub, now))
@@ -477,6 +619,15 @@ def main(argv=None) -> int:
         print(
             f"hub-init: {result.hub} is already a hub repo ({result.commits} commit(s)) — "
             "left untouched"
+        )
+    elif result.status == "resumed":
+        print(
+            f"hub-init: {result.hub} was already a hub repo, but a migration had not "
+            f"finished — completed it ({result.commits} commit(s))"
+        )
+        print(
+            f"  migrated: {len(result.migrated)} file(s) out of {SCAFFOLD_DIR}, from the "
+            f"working tree AND the git index — {', '.join(result.migrated)}"
         )
     else:
         print(f"hub-init: created the hub repo at {result.hub} on branch {DEFAULT_BRANCH}")

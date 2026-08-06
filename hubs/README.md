@@ -44,8 +44,20 @@ at a different store than yours.
 
 ## Getting started
 
-Copy the scaffold into your hub store — never alongside it here:
+Run `make hub-init` once: it creates the private hub store outside this checkout,
+seeds `_example-hub.md` into it, and moves out any hub content that is already sitting
+here. (Interrupted half-way? Run it again — it resumes.)
+
+After that, hub content is written by **one** tool, `scripts/hub_commit.py`, which
+takes the write lock, scans for credentials, and records one reviewable commit:
 
 ```bash
-cp hubs/_example-hub.md "${BUZAI_HUBS_DIR:-$HOME/hubs}/finance-and-tax.md"   # then edit
+python3 scripts/hub_commit.py --file finance-and-tax.md \
+  --append "- Filed 2025 return on 2026-03-02" --section "Tax" \
+  --summary "Record when the 2025 return was filed" --source owner-directed
 ```
+
+Naming a file that does not exist yet is how a new hub starts — no `cp` needed, and
+no file is ever created by hand: a hub file written directly bypasses the lock, the
+credential scan, and the provenance trail the review loop depends on. Copy
+`_example-hub.md` only to see the shape a hub takes.

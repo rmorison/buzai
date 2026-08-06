@@ -24,6 +24,36 @@ scaffolds only. A hub file written here is one `git add` away from a public remo
 and `.gitignore` is not a barrier — the resolver refuses any path inside the
 checkout for the same reason.
 
+## How to write to a hub
+
+**`scripts/hub_commit.py` is the only way hub content is written.** One run records
+one change: it takes the lock, applies the operation, scans the added lines for
+credentials, makes one commit with the provenance trailer, and pushes only if the
+remote has been proven private.
+
+```bash
+python3 scripts/hub_commit.py --file <hub>.md --append "- fact" \
+  --section "Section heading" --summary "what changed" --reason "why" \
+  --source autonomous
+```
+
+- **Operations** — exactly one per run: `--append TEXT` (add an entry),
+  `--replace-section TEXT` (replace the body under `--section`), `--remove-entry TEXT`
+  (drop a matching entry). Pass `-` as TEXT to read stdin, so multi-line entries do not
+  have to survive shell quoting.
+- **`--section`** scopes the operation to a heading; `--summary` and `--reason` become
+  the commit subject and body, so write them as the owner will read them.
+- **`--source`** is `autonomous` (your own judgement) or `owner-directed` (the owner
+  asked for this content). There is no correction source on the command line — record a
+  correction by rejecting the original through `scripts/hub_review.py` (below), which
+  removes the wrong content, records the owner's value, and links the two.
+- The file need not exist; naming a new `<domain>.md` starts that hub.
+
+**Never** write a hub file with an editor tool or a shell redirect — not Write, not
+Edit, not `cat >`, not `sed -i`, and not for a "small fix" or a correction. Those
+bypass the lock (two attached sessions clobber each other), the credential scan, and
+the provenance trail, and they produce content no review can ever show the owner.
+
 ## Commit discipline for hub changes
 
 - **One commit per logical hub change.** Not one per session, not one per file
@@ -52,7 +82,9 @@ surface.
 - Record the owner's reason with the correction, so both the original and its
   resolution stay in history.
 
-Ask `scripts/hub_review.py` for the pending list and record each verdict through it.
+Ask `scripts/hub_review.py` for the pending list (`-n <count>`) and record each verdict
+through it: `--approve <sha>`, or `--reject <sha> --reason "<the owner's words>"` plus
+`--value "<the correct value>"` when the fact is being replaced rather than removed.
 Never edit a hub file by hand to resolve a rejection: corrections go through the same
 write path as every other hub change, so they get the same lock, scan, and provenance.
 
@@ -93,7 +125,21 @@ Verdicts are stored per change and travel with the hub repo on their own ref, wh
 git does not push or fetch by default. The verbs handle the push. A restore onto a
 fresh instance needs one extra fetch of the notes refs, so confirm that past verdicts
 came back before calling a restore complete — otherwise every settled item resurfaces
-as pending and the owner reviews their whole history again.
+as pending and the owner reviews their whole history again:
+
+```bash
+# run inside the hub repo — the path `scripts/hub_paths.py` reports, never a guess
+git fetch origin "refs/notes/*:refs/notes/*"
+```
+
+## When history has not reached the remote
+
+A stale backlog means the record exists only on this box — usually an expired
+credential. Report it first and plainly, then run `make hub-push`: it retries the
+unpushed commits and the review dispositions together, in that order, so verdicts never
+go off-box for commits that did not. If it still fails, say why in the owner's terms
+(the remote refused, the credential expired, the box is offline) rather than retrying
+silently — nothing is lost locally, but nothing is backed up either.
 
 ## Keeping this file public-safe
 

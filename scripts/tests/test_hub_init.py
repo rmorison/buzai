@@ -2,6 +2,7 @@ import io
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout, suppress
 from datetime import UTC, datetime
@@ -10,7 +11,9 @@ from pathlib import Path
 from scripts.hub_init import (
     MARKER,
     SCAFFOLDS,
+    TIMEOUT_RETURNCODE,
     HubInitError,
+    commit_count,
     commit_message,
     initialize,
     main,
@@ -18,9 +21,11 @@ from scripts.hub_init import (
     parse_marker,
     plan_migration,
     plan_seed,
+    remotes,
     render_marker,
     tracked_paths,
 )
+from scripts.hub_init import git as git_call
 
 NOW = datetime(2026, 8, 5, 12, 30, 0, tzinfo=UTC)
 NO_GIT = "buzai-definitely-not-a-git-binary"
@@ -250,15 +255,15 @@ class TestSecondRun(HubTempCase):
         self.assertEqual((self.hub / "finance-and-tax.md").read_text(), "owner content\n")
         self.assertEqual(self.commits(), 1)
 
-    def test_second_run_does_not_re_migrate(self):
+    def test_second_run_over_a_clean_checkout_changes_nothing(self):
         (self.source / "finance-and-tax.md").write_text("real content\n")
         self.init()
-        (self.source / "leftover.md").write_text("written after init\n")
 
         result = self.init()
 
         self.assertEqual(result.status, "exists")
-        self.assertTrue((self.source / "leftover.md").exists())  # untouched, not swept up
+        self.assertEqual(result.migrated, [])
+        self.assertEqual(self.commits(), 1)  # no empty follow-up commit
 
     def test_repo_with_a_remote_reports_it(self):
         self.init()
@@ -343,6 +348,136 @@ class TestStagedContentMigration(HubTempCase):
         self.assertEqual((self.hub / "personal.md").read_text(), "# Personal\n")
         self.assertFalse(self.leak.exists())
         self.assertNotIn("hubs/personal.md", self.indexed())
+
+
+class TestResumeInterruptedMigration(HubTempCase):
+    """PLANT: a hub repo that exists while personal content is STILL in the checkout.
+
+    This is what `make hub-init` interrupted mid-migration leaves behind, and it used to
+    be inescapable: the preflight fataled on the content (correctly — it is a leak) and
+    blocked service start, while a re-run saw the repo, reported "exists" and stopped.
+    Five starts later `StartLimitBurst=5` leaves the unit failed for good.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.init()  # the interrupted run got this far
+        self.leak = self.source / "finance-and-tax.md"
+        self.leak.write_text("real hub content\n")  # ...and no further
+        self.result = self.init()
+
+    def test_it_resumes_rather_than_reporting_exists(self):
+        self.assertEqual(self.result.status, "resumed")
+        self.assertEqual(self.result.migrated, ["finance-and-tax.md"])
+
+    def test_the_content_reaches_the_hub_repo(self):
+        self.assertEqual((self.hub / "finance-and-tax.md").read_text(), "real hub content\n")
+
+    def test_the_leak_is_gone_from_the_checkout(self):
+        self.assertFalse(self.leak.exists())
+        self.assertEqual(
+            {p.relative_to(self.source).as_posix() for p in self.source.rglob("*") if p.is_file()},
+            {"README.md", "_example-hub.md"},
+        )
+
+    def test_the_content_is_committed_not_merely_copied(self):
+        self.assertEqual(self.commits(), 2)
+        self.assertIn("finance-and-tax.md", self.committed())
+
+    def test_the_commit_says_what_it_was_and_who_asked(self):
+        body = git("-C", str(self.hub), "log", "-1", "--pretty=%B")
+        self.assertIn("interrupted", body)
+        self.assertIn("finance-and-tax.md", body)
+        self.assertIn("instruction-source: owner-directed", body)
+
+    def test_a_third_run_reports_exists_and_changes_nothing(self):
+        again = self.init()
+        self.assertEqual(again.status, "exists")
+        self.assertEqual(self.commits(), 2)
+
+    def test_the_seeded_scaffold_is_never_re_seeded_by_a_resume(self):
+        self.assertEqual(self.result.seeded, [])
+
+
+class TestResumeAfterInterruptedRemoval(HubTempCase):
+    """PLANT: interrupted one step later — the copy is committed, the original remains."""
+
+    def setUp(self):
+        super().setUp()
+        (self.source / "finance-and-tax.md").write_text("real hub content\n")
+        self.init()
+        self.leak = self.source / "finance-and-tax.md"
+        self.leak.write_text("real hub content\n")  # the removal never happened
+
+    def test_the_identical_copy_is_not_committed_twice(self):
+        result = self.init()
+        self.assertEqual(result.status, "resumed")
+        self.assertEqual(self.commits(), 1)
+        self.assertFalse(self.leak.exists())
+
+    def test_a_differing_copy_is_refused_and_nothing_is_deleted(self):
+        self.leak.write_text("a DIFFERENT version of the owner's content\n")
+        with self.assertRaises(HubInitError) as raised:
+            self.init()
+        self.assertIn("differs", str(raised.exception))
+        self.assertTrue(self.leak.exists())
+        self.assertEqual((self.hub / "finance-and-tax.md").read_text(), "real hub content\n")
+
+
+class TestResumeTakesTrackedContentOutOfTheIndex(HubTempCase):
+    """The worst version of the interrupted state: the public repo already tracks it."""
+
+    def setUp(self):
+        super().setUp()
+        self.init()
+        self.leak = self.track("personal.md", "# Personal\n")
+        self.result = self.init()
+
+    def test_it_is_migrated_de_indexed_and_deleted(self):
+        self.assertEqual(self.result.status, "resumed")
+        self.assertEqual((self.hub / "personal.md").read_text(), "# Personal\n")
+        self.assertFalse(self.leak.exists())
+        self.assertNotIn("hubs/personal.md", self.indexed())
+
+
+class TestGitCallsAreBounded(HubTempCase):
+    """PLANT: a git that never returns — the ExecStartPre hang that ends in a failed unit.
+
+    `secrets_preflight` reads commit counts, remotes and the checkout's index through
+    these functions on every service start, over paths that can be network mounts. What
+    each does with a timeout is the point: durability readers must not report a
+    reassuring value, and the leak reader must not report "nothing tracked".
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.init()
+        self.slow = self.root / "slow-git"
+        self.slow.write_text("#!/bin/sh\nsleep 2\n")
+        self.slow.chmod(0o755)
+
+    def test_a_hung_git_is_killed_and_reported_as_such(self):
+        started = time.monotonic()
+        result = git_call(["--version"], str(self.slow), 0.3)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(result.returncode, TIMEOUT_RETURNCODE)
+        self.assertIn("timed out", result.stderr)
+
+    def test_commit_count_never_reports_zero_commits_for_a_hung_git(self):
+        # 0 is a real answer — "no history to lose yet" — and silences the durability
+        # warning, so a timeout must not be able to impersonate it
+        with self.assertRaises(HubInitError) as raised:
+            commit_count(self.hub, str(self.slow), 0.3)
+        self.assertIn("timed out", str(raised.exception))
+
+    def test_remotes_never_reports_no_remote_for_a_hung_git(self):
+        with self.assertRaises(HubInitError):
+            remotes(self.hub, str(self.slow), 0.3)
+
+    def test_tracked_paths_never_reports_nothing_tracked_for_a_hung_git(self):
+        with self.assertRaises(HubInitError) as raised:
+            tracked_paths(self.source, str(self.slow), 0.3)
+        self.assertIn("timed out", str(raised.exception))
 
 
 class TestRefusals(HubTempCase):

@@ -17,10 +17,11 @@ from scripts.hub_remote import (
     PUBLIC,
     READABLE,
     UNKNOWN,
+    AnonymousEndpoints,
     CacheEntry,
     GitResult,
+    anonymous_endpoints,
     anonymous_env,
-    anonymous_urls,
     authenticated_env,
     authenticated_probe,
     cache_is_usable,
@@ -30,6 +31,7 @@ from scripts.hub_remote import (
     decide,
     default_cache_path,
     default_git_runner,
+    default_host_resolver,
     main,
     no_config_injection,
     origin_credential_violations,
@@ -147,38 +149,200 @@ class HubTempCase(unittest.TestCase):
 
 
 class TestAnonymousUrls(unittest.TestCase):
+    def urls(self, url, resolve_host=None):
+        return list(anonymous_endpoints(url, resolve_host).urls)
+
     def test_https_is_probed_as_is(self):
-        self.assertEqual(anonymous_urls(HTTPS_URL), [HTTPS_URL])
+        self.assertEqual(self.urls(HTTPS_URL), [HTTPS_URL])
 
     def test_embedded_credentials_are_stripped_before_probing(self):
         # probing WITH the token would authenticate, and a private repo would read as public
         self.assertEqual(
-            anonymous_urls("https://user:ghp_secret@github.com/owner/hubs.git"), [HTTPS_URL]
+            self.urls("https://user:ghp_secret@github.com/owner/hubs.git"), [HTTPS_URL]
         )
 
     def test_scp_style_ssh_also_probes_the_https_endpoint(self):
         # public readability is exposed over https, never over ssh — probing only ssh
         # would report "private" for every repo on earth
-        self.assertEqual(
-            anonymous_urls(SSH_URL), [HTTPS_URL.removesuffix(".git") + ".git", SSH_URL]
-        )
+        self.assertEqual(self.urls(SSH_URL), [HTTPS_URL.removesuffix(".git") + ".git", SSH_URL])
 
     def test_ssh_scheme_url_drops_the_ssh_port(self):
         self.assertEqual(
-            anonymous_urls("ssh://git@example.test:2222/owner/hubs.git"),
+            self.urls("ssh://git@example.test:2222/owner/hubs.git"),
             ["https://example.test/owner/hubs.git", "ssh://example.test:2222/owner/hubs.git"],
         )
 
     def test_git_protocol_is_already_anonymous(self):
         self.assertEqual(
-            anonymous_urls("git://example.test/owner/hubs.git"),
+            self.urls("git://example.test/owner/hubs.git"),
             ["git://example.test/owner/hubs.git"],
         )
 
     def test_local_path_has_no_anonymous_endpoint(self):
-        self.assertEqual(anonymous_urls("/srv/git/hubs.git"), [])
-        self.assertEqual(anonymous_urls("file:///srv/git/hubs.git"), [])
-        self.assertEqual(anonymous_urls(""), [])
+        self.assertEqual(self.urls("/srv/git/hubs.git"), [])
+        self.assertEqual(self.urls("file:///srv/git/hubs.git"), [])
+        self.assertEqual(self.urls(""), [])
+
+    def test_a_file_url_is_not_mistaken_for_an_scp_like_remote(self):
+        # `file:/srv/hubs` matches the scp-like shape with host "file"; deriving
+        # https://file/srv/hubs from it would probe a host that does not exist
+        self.assertEqual(anonymous_endpoints("file:/srv/git/hubs.git"), AnonymousEndpoints())
+
+
+class FakeSshConfig:
+    """Stand-in for `ssh -G`: the `Host` -> `HostName` map of a config never read here."""
+
+    def __init__(self, **mapping):
+        self.mapping = mapping
+        self.asked: list[str] = []
+
+    def __call__(self, host):
+        self.asked.append(host)
+        return self.mapping.get(host)
+
+
+# Exactly what `deploy/README.md` has the owner configure: a `Host buzai-hub` block
+# selecting the deploy key, and a remote written in git's scp-like syntax against it.
+ALIAS_URL = "buzai-hub:owner/hubs.git"
+ALIAS_CONFIG = FakeSshConfig(**{"buzai-hub": "github.com"})
+
+
+class TestSshAliasRemote(unittest.TestCase):
+    """PLANT: the remote form the deploy documentation actually produces.
+
+    An alias is not a hostname and `host:path` is not a URL, so this remote used to
+    yield no anonymous endpoint at all — INDETERMINATE, which fails closed, on every
+    push forever, for an owner who followed the instructions exactly.
+    """
+
+    def endpoints(self, url=ALIAS_URL, resolve_host=ALIAS_CONFIG):
+        return anonymous_endpoints(url, resolve_host)
+
+    def test_the_documented_remote_yields_an_https_twin(self):
+        self.assertEqual(
+            list(self.endpoints().urls), ["https://github.com/owner/hubs.git", ALIAS_URL]
+        )
+
+    def test_nothing_is_wrong_with_it(self):
+        self.assertIsNone(self.endpoints().problem)
+
+    def test_the_alias_is_resolved_rather_than_used_as_a_hostname(self):
+        resolver = FakeSshConfig(**{"buzai-hub": "github.com"})
+        urls = anonymous_endpoints(ALIAS_URL, resolver).urls
+        self.assertEqual(resolver.asked, ["buzai-hub"])
+        self.assertFalse([u for u in urls if u.startswith("https://buzai-hub")])
+
+    def test_an_alias_in_an_ssh_scheme_url_is_resolved_too(self):
+        self.assertEqual(
+            list(self.endpoints("ssh://buzai-hub/owner/hubs.git").urls),
+            ["https://github.com/owner/hubs.git", "ssh://buzai-hub/owner/hubs.git"],
+        )
+
+    def test_a_real_hostname_still_works_when_ssh_echoes_it_back(self):
+        # `ssh -G github.com` with no Host block answers "hostname github.com"
+        resolver = FakeSshConfig(**{"github.com": "github.com"})
+        self.assertEqual(list(anonymous_endpoints(SSH_URL, resolver).urls), [HTTPS_URL, SSH_URL])
+
+    def test_an_unresolvable_alias_derives_NO_endpoint(self):
+        # not "just the ssh URL": an anonymous ssh probe is refused for a PUBLIC repo
+        # too, so accepting it alone would manufacture a private verdict
+        self.assertEqual(self.endpoints(resolve_host=FakeSshConfig()).urls, ())
+
+    def test_an_unresolvable_alias_says_so_by_name(self):
+        problem = self.endpoints(resolve_host=FakeSshConfig()).problem or ""
+        self.assertIn("buzai-hub", problem)
+        self.assertIn("ssh -G buzai-hub", problem)
+        self.assertIn("HostName", problem)
+
+
+class TestVerifyAnAliasRemote(HubTempCase):
+    """The same plant, driven through the whole verdict: setup as documented must push."""
+
+    def probed(self, git) -> list[str]:
+        return [args[args.index("ls-remote") + 1] for args in git.probes]
+
+    def test_the_documented_setup_is_verified_private_and_may_push(self):
+        git = ScriptedGit(remote_url=ALIAS_URL)
+        result = self.verify(git, resolve_host=ALIAS_CONFIG)
+        self.assertEqual(result.verdict, PRIVATE)
+        self.assertTrue(result.push_allowed)
+        self.assertIn("https://github.com/owner/hubs.git", self.probed(git))
+
+    def test_a_public_repo_behind_the_alias_is_still_caught(self):
+        # the twin is really probed, not merely derived: this is the refusal that the
+        # whole module exists for, and it is unreachable without resolving the alias
+        git = ScriptedGit(
+            remote_url=ALIAS_URL, anon={"https://github.com/owner/hubs.git": PUBLIC_READ}
+        )
+        self.assertEqual(self.verify(git, resolve_host=ALIAS_CONFIG).verdict, PUBLIC)
+
+    def test_an_unresolvable_alias_refuses_and_names_itself(self):
+        result = self.verify(ScriptedGit(remote_url=ALIAS_URL), resolve_host=FakeSshConfig())
+        self.assertEqual(result.verdict, INDETERMINATE)
+        self.assertFalse(result.push_allowed)
+        self.assertTrue([v for v in result.violations if "buzai-hub" in v], result.violations)
+
+    def test_an_unresolvable_alias_never_probes_the_ssh_endpoint_alone(self):
+        git = ScriptedGit(remote_url=ALIAS_URL)
+        self.verify(git, resolve_host=FakeSshConfig())
+        self.assertEqual([p for p in self.probed(git) if p != "origin"], [])
+
+    def check(self, git, resolve_host):
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = check(self.hub, self.repo, runner=git, now=NOW, resolve_host=resolve_host)
+        return rc, err.getvalue()
+
+    def test_the_documented_setup_passes_hub_remote_check(self):
+        rc, _ = self.check(ScriptedGit(remote_url=ALIAS_URL), ALIAS_CONFIG)
+        self.assertEqual(rc, 0)
+
+    def test_an_unresolvable_alias_fails_hub_remote_check_loudly(self):
+        # the owner learns at setup time instead of discovering a backlog that never drains
+        rc, err = self.check(ScriptedGit(remote_url=ALIAS_URL), FakeSshConfig())
+        self.assertEqual(rc, 1)
+        self.assertIn("buzai-hub", err)
+        self.assertIn("~/.ssh/config", err)
+
+
+class TestDefaultHostResolver(unittest.TestCase):
+    """The real `ssh -G` mechanism, against a stand-in binary.
+
+    Never the real ssh and never the real `~/.ssh/config` — but the subprocess call,
+    the parsing and the timeout are the shipped ones.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.argv = self.dir / "argv"
+
+    def fake_ssh(self, body: str) -> str:
+        path = self.dir / "ssh"
+        path.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {self.argv}\n{body}\n')
+        path.chmod(0o755)
+        return str(path)
+
+    def test_the_hostname_line_is_the_answer(self):
+        ssh = self.fake_ssh("printf 'user git\\nhostname github.com\\nport 22\\n'")
+        self.assertEqual(default_host_resolver("buzai-hub", 10.0, ssh), "github.com")
+        self.assertEqual(self.argv.read_text().split(), ["-G", "buzai-hub"])
+
+    def test_a_config_ssh_refuses_to_parse_is_not_an_answer(self):
+        ssh = self.fake_ssh("echo 'Bad configuration option' >&2; exit 255")
+        self.assertIsNone(default_host_resolver("buzai-hub", 10.0, ssh))
+
+    def test_output_without_a_hostname_is_not_an_answer(self):
+        self.assertIsNone(default_host_resolver("h", 10.0, self.fake_ssh("printf 'user git\\n'")))
+
+    def test_a_missing_ssh_binary_is_not_an_answer(self):
+        self.assertIsNone(default_host_resolver("h", 10.0, str(self.dir / "no-such-ssh")))
+
+    def test_a_hung_ssh_is_killed_rather_than_stalling_every_push(self):
+        started = time.monotonic()
+        self.assertIsNone(default_host_resolver("h", 0.3, self.fake_ssh("sleep 5")))
+        self.assertLess(time.monotonic() - started, 3.0)
 
 
 class TestUrlCredentialProblem(unittest.TestCase):

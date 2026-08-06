@@ -76,9 +76,30 @@ that failure is *indeterminate*, never "private".
 
 Which endpoint gets probed matters as much as the environment. Public readability is
 exposed over https (and `git://`), never over ssh — an anonymous ssh probe is refused
-for a public repo just as loudly as for a private one. So `anonymous_urls()` derives
-the https endpoint from an ssh remote and probes both; a read on *either* proves the
-repo is public.
+for a public repo just as loudly as for a private one. So `anonymous_endpoints()`
+derives the https endpoint from an ssh remote and probes both; a read on *either*
+proves the repo is public.
+
+Deriving that twin from the documented remote, and why `ssh -G`
+---------------------------------------------------------------
+`deploy/README.md` has the owner give the hub remote an **ssh config alias** — a `Host`
+block naming the deploy key — so the remote reads `buzai-hub:owner/hubs.git`. Two things
+have to be right for that to work, and neither was:
+
+  * git's scp-like `host:path` syntax is not a URL and has no `//`, so `urlsplit` reads
+    `buzai-hub` as a *scheme*. Rejecting on "unknown scheme" before trying the scp-like
+    form threw the documented remote away. The scp-like branch is therefore tried for
+    anything that is not one of git's own transports.
+  * a `Host` alias is not a hostname. `https://buzai-hub/owner/hubs.git` resolves
+    nowhere, so even correct parsing yields a twin that can only ever be UNKNOWN.
+
+So the host token is resolved through `ssh -G <host>` — ssh's own answer to "what does
+this name mean after ~/.ssh/config", computed locally with no connection made — and the
+twin is built from the resulting `HostName`. When that cannot be answered the endpoint
+list is **empty**, never "just the ssh URL": an anonymous ssh probe is refused for a
+public repo too, so accepting it alone would manufacture a PRIVATE verdict. An empty
+list refuses, and the reason travels as a violation so `make hub-remote-check` names the
+alias at setup time instead of leaving the owner with a backlog that never drains.
 
 Three outcomes, never two
 -------------------------
@@ -124,7 +145,7 @@ touch the network. `hub_init`'s marker parsing *is* reused, for the local-only r
 The authenticated probe sets `GIT_SSH_COMMAND`, which **overrides** `core.sshCommand`.
 The hub deploy key must therefore be configured through `~/.ssh/config` (a `Host` alias
 with `IdentityFile`), not through `core.sshCommand`. `deploy/README.md` documents it
-that way.
+that way, and that alias must carry a `HostName` line — see the derivation notes above.
 """
 
 from __future__ import annotations
@@ -148,10 +169,14 @@ from scripts.hub_paths import HubPathError, hub_dir  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GIT = "git"
+SSH = "ssh"
 
 # One probe is a single TCP conversation; anything slower than this is a hung network,
 # and a hung probe must never block the caller (git has no default network timeout).
 PROBE_TIMEOUT_SECONDS = 20.0
+# `ssh -G` parses config and connects to nothing, so this only has to cover a pathological
+# include chain — but it runs on the push path, so it is bounded like everything else.
+HOST_RESOLVE_TIMEOUT_SECONDS = 10.0
 # Bounds how long a flip to public can go unnoticed. Cheap to re-verify (one ls-remote),
 # and pushes are infrequent, so this is kept short rather than convenient.
 CACHE_TTL_SECONDS = 3600.0
@@ -234,6 +259,13 @@ NO_PROXY_ARGS = ("-c", "http.proxy=")
 # `host:path`, git's scp-like remote syntax. The `(?!//)` keeps `scheme://…` out.
 SCP_LIKE = re.compile(r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?!//)(?P<path>.+)$")
 
+# git's own transports. Anything whose `urlsplit` scheme is NOT one of these is a
+# candidate for the scp-like form, because `buzai-hub:owner/hubs.git` — the alias form
+# `deploy/README.md` tells the owner to use — parses as scheme `buzai-hub`. The list
+# matters in the other direction too: `file:/srv/hubs` would otherwise match SCP_LIKE
+# with host `file`, and yield a probe URL for a host that does not exist.
+TRANSPORT_SCHEMES = frozenset({"http", "https", "git", "ssh", "ftp", "ftps", "file"})
+
 
 @dataclass(frozen=True)
 class GitResult:
@@ -248,6 +280,10 @@ class GitResult:
 # (argv after the git binary, env overlay where None means *unset*, timeout seconds)
 GitRunner = Callable[[Sequence[str], Mapping[str, str | None], float], GitResult]
 
+# A remote's ssh host token -> the real hostname it means, or None when that cannot be
+# answered. Injected so no test ever reads the real `~/.ssh/config`.
+HostResolver = Callable[[str], str | None]
+
 
 @dataclass(frozen=True)
 class CacheEntry:
@@ -259,6 +295,20 @@ class CacheEntry:
 
 
 @dataclass(frozen=True)
+class AnonymousEndpoints:
+    """Where to probe as a stranger, and — when that list is empty — why it is.
+
+    `problem` is the owner-facing sentence for a remote whose anonymous endpoint cannot
+    be derived at all. It is carried rather than swallowed because the alternative is a
+    verdict of INDETERMINATE with no cause named, which reads as a transient network
+    blip while actually being permanent: every push refused, forever.
+    """
+
+    urls: tuple[str, ...] = ()
+    problem: str | None = None
+
+
+@dataclass(frozen=True)
 class Verification:
     """The answer to "may hub history be pushed to this remote right now?"."""
 
@@ -267,11 +317,15 @@ class Verification:
     url: str | None  # always redacted — safe to print into the journal
     detail: str
     source: str  # "probe" | "cache"
+    # Conditions the owner must fix before any push can happen: a credential embedded in
+    # the remote URL, or a remote whose anonymous endpoint cannot be derived. Each is
+    # reported by name so it is fixed at `make hub-remote-check` rather than discovered
+    # as a backlog that never drains.
     violations: tuple[str, ...] = ()
 
     @property
     def push_allowed(self) -> bool:
-        """Only a proven-private remote with no credential violation may be pushed to."""
+        """Only a proven-private remote with no outstanding violation may be pushed to."""
         return self.verdict == PRIVATE and not self.violations
 
 
@@ -339,31 +393,86 @@ def url_credential_problem(url: str) -> str | None:
     return None
 
 
-def anonymous_urls(url: str) -> list[str]:
-    """Endpoints to probe as a stranger, or [] when none can be derived. Pure.
+def default_host_resolver(
+    host: str, timeout: float = HOST_RESOLVE_TIMEOUT_SECONDS, ssh_bin: str = SSH
+) -> str | None:
+    """The real hostname `host` means after `~/.ssh/config`, or None. Never raises.
+
+    `ssh -G <host>` is ssh's own answer: it applies the config exactly as a connection
+    would — `Host` blocks, `Match`, `Include` — and prints the effective settings without
+    contacting anything. A `HostName` line is what a `Host` alias exists to supply; a
+    name with no block of its own comes back as itself, which is the right answer too.
+
+    None means "ssh could not say" — no ssh binary, a config it refuses to parse, or a
+    hang. The caller must treat that as *unverifiable*, never as "the alias is fine".
+    """
+    try:
+        completed = subprocess.run(
+            [ssh_bin, "-G", host], capture_output=True, text=True, timeout=timeout
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if completed.returncode != 0:
+        return None
+    for line in completed.stdout.splitlines():
+        key, _, value = line.strip().partition(" ")
+        if key.lower() == "hostname":
+            return value.strip() or None
+    return None
+
+
+def _ssh_endpoints(
+    host: str, path: str, ssh_url: str, resolve_host: HostResolver | None
+) -> AnonymousEndpoints:
+    """The https twin of an ssh remote, plus the ssh remote itself.
+
+    The twin is what can prove the repo public, so failing to derive it must produce an
+    empty list and a named reason — not the ssh URL on its own, which is refused for
+    public and private repos alike and would therefore read as proof of privacy.
+    """
+    hostname = resolve_host(host) if resolve_host is not None else host
+    if not hostname:
+        return AnonymousEndpoints(
+            (),
+            f"the hub remote's ssh host {host!r} could not be resolved to a real hostname "
+            f"(`ssh -G {host}` gave no usable HostName), so the anonymous https endpoint "
+            f"cannot be derived and every push will be refused; give it a `Host {host}` "
+            f"block with a `HostName` line in ~/.ssh/config (see deploy/README.md), or "
+            f"point the remote at the provider's real ssh URL",
+        )
+    return AnonymousEndpoints((f"https://{hostname}/{path.lstrip('/')}", redact(ssh_url)))
+
+
+def anonymous_endpoints(url: str, resolve_host: HostResolver | None = None) -> AnonymousEndpoints:
+    """Endpoints to probe as a stranger. Pure given `resolve_host`.
 
     Public readability is served over https / `git://`, never over ssh, so an ssh remote
     contributes its https twin *and* itself: a read on either proves the repo is public.
     An empty list is not "safe", it is unverifiable — `decide` turns it into a refusal.
+
+    `resolve_host` is None for the parsing-only view (the host token is taken at face
+    value); `verify` passes the real resolver. See the module docstring for why an ssh
+    config alias makes that resolution load-bearing rather than cosmetic.
     """
     raw = url.strip()
     if not raw:
-        return []
+        return AnonymousEndpoints()
     split = urlsplit(raw)
     scheme = split.scheme.lower()
     if scheme in ("http", "https", "git"):
-        return [redact(raw)]
+        return AnonymousEndpoints((redact(raw),))
     if scheme == "ssh":
         if not split.hostname or not split.path:
-            return []
-        return [f"https://{split.hostname}{split.path}", redact(raw)]
-    if scheme:
-        return []  # file://, or anything else with no anonymous network endpoint
+            return AnonymousEndpoints()
+        return _ssh_endpoints(split.hostname, split.path, raw, resolve_host)
+    if scheme in TRANSPORT_SCHEMES:
+        return AnonymousEndpoints()  # file://, ftp:// — no anonymous endpoint to derive
+    # Not one of git's transports, so `scheme` may well be an ssh config alias: this is
+    # git's scp-like `host:path`, which has no `//` and is not a URL at all.
     match = SCP_LIKE.match(raw)
     if match:
-        host, path = match.group("host"), match.group("path").lstrip("/")
-        return [f"https://{host}/{path}", raw]
-    return []  # a bare local path
+        return _ssh_endpoints(match.group("host"), match.group("path"), raw, resolve_host)
+    return AnonymousEndpoints()  # a bare local path
 
 
 # --- probing and the decision ------------------------------------------------------
@@ -663,11 +772,15 @@ def verify(
     ttl_seconds: float = CACHE_TTL_SECONDS,
     timeout: float = PROBE_TIMEOUT_SECONDS,
     use_cache: bool = True,
+    resolve_host: HostResolver = default_host_resolver,
 ) -> Verification:
     """May hub history be pushed to `hub`'s remote?
 
     `use_cache=False` forces a fresh probe — what service start and `make hub-remote-check`
     want. The push path leaves it True so a burst of writes costs one verification.
+
+    `resolve_host` is the seam for `~/.ssh/config` alias resolution, injected so tests
+    never read the real file.
     """
     name, raw_url = hub_remote(hub, runner, timeout)
     if name is None:
@@ -690,7 +803,9 @@ def verify(
         detail = f"{url} verified private at {entry.verified_at.isoformat(timespec='seconds')}"
         return Verification(PRIVATE, name, url, detail, "cache", violations)
 
-    anon = [(u, classify(anonymous_probe(u, runner, timeout))) for u in anonymous_urls(raw_url)]
+    endpoints = anonymous_endpoints(raw_url, resolve_host)
+    violations += tuple(v for v in (endpoints.problem,) if v)
+    anon = [(u, classify(anonymous_probe(u, runner, timeout))) for u in endpoints.urls]
     auth = classify(authenticated_probe(hub, name, runner, timeout))
     verdict, reason = decide(anon, auth)
     if verdict == PRIVATE:
@@ -721,6 +836,7 @@ def check(
     use_cache: bool = False,
     ttl_seconds: float = CACHE_TTL_SECONDS,
     timeout: float = PROBE_TIMEOUT_SECONDS,
+    resolve_host: HostResolver = default_host_resolver,
 ) -> int:
     """Report the verdict; 1 when a push must be refused for a PRIVACY reason.
 
@@ -735,6 +851,7 @@ def check(
         ttl_seconds=ttl_seconds,
         timeout=timeout,
         use_cache=use_cache,
+        resolve_host=resolve_host,
     )
     origin = origin_credential_violations(repo_root, runner, timeout)
     failed = False

@@ -84,6 +84,18 @@ populated **before** the first push — every git invocation on this path runs
 non-interactively (`GIT_TERMINAL_PROMPT=0`, ssh `BatchMode=yes`), so an unknown
 host key fails fast rather than hanging a TTY-less service.
 
+**The alias block must carry a `HostName` line** (the one above does). The privacy
+probe has to reach the *public* https endpoint of the same repository — public
+readability is never exposed over ssh — and it derives that endpoint by asking
+`ssh -G buzai-hub` what the alias really points at. Without a `HostName` there is no
+real host to derive it from, and the check refuses rather than guessing: it names the
+alias and fails `make hub-remote-check` at setup time, so it can never turn into a
+queue of commits that silently never leave the box. Verify the alias resolves:
+
+```bash
+ssh -G buzai-hub | grep '^hostname '     # must print the provider's real host
+```
+
 The key is a secret like any other, and the preflight treats it as one: `~/.ssh/buzai-hub`
 must be **0600** and **untracked by any git repo** — a dotfiles repo at `~` that tracks it
 publishes write access to your knowledge base. Both are fatal at service start. The path is
@@ -138,7 +150,10 @@ resolved and then splits its findings two ways:
   before), plus: a real `.env` under `deploy/env/`, personal hub content inside the
   checkout's `hubs/`, a hub path inside or containing the checkout, a hub deploy key
   that is not 0600 or is tracked, and a credential helper configured for the **public**
-  origin.
+  origin. Personal content in `hubs/` is cleared by `make hub-init` — which **resumes**
+  a migration interrupted half-way, so run it even though the hub repo already exists.
+  A check that could not answer (git timed out) is reported as *unverified* and is
+  fatal too: on the leak side, "cannot tell" never reads as "clean".
 - **`WARN:` — durability conditions exit 0 and never block start.** A hub store with no
   remote past its grace period, unpushed commits, a dirty hub working tree, a git repo
   nested above the hub directory. With `StartLimitBurst=5` above, failing on those would
