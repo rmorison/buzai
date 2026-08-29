@@ -318,9 +318,34 @@ class TestApplyOperation(unittest.TestCase):
             apply_operation(self.DOC, Operation("rewrite-everything", "home.md", "x"))
 
     def test_empty_text_is_refused(self):
-        for kind in (APPEND_ENTRY, REMOVE_ENTRY):
-            with self.assertRaises(HubCommitError):
-                apply_operation(self.DOC, Operation(kind, "home.md", "  \n "))
+        # Every operation, not a hand-listed subset: this test used to name only append
+        # and remove, and the replace gap it left through was a content-loss bug.
+        for kind in (APPEND_ENTRY, REMOVE_ENTRY, REPLACE_SECTION):
+            with self.subTest(kind=kind):
+                with self.assertRaises(HubCommitError):
+                    apply_operation(self.DOC, Operation(kind, "home.md", "  \n ", "Vehicles"))
+
+    def test_empty_replace_of_a_trailing_section_does_not_truncate_the_file(self):
+        # The worst shape: the section runs to EOF, so deleting its body deletes
+        # everything below the heading — and the commit message says "replaced".
+        with self.assertRaises(HubCommitError) as cm:
+            apply_operation(self.DOC, Operation(REPLACE_SECTION, "home.md", "", "Pets"))
+        self.assertIn("--remove-entry", str(cm.exception))
+
+    def test_empty_replace_of_a_middle_section_does_not_empty_it(self):
+        with self.assertRaises(HubCommitError):
+            apply_operation(self.DOC, Operation(REPLACE_SECTION, "home.md", "", "Vehicles"))
+
+    def test_empty_replace_of_a_missing_section_does_not_create_an_empty_one(self):
+        with self.assertRaises(HubCommitError):
+            apply_operation(self.DOC, Operation(REPLACE_SECTION, "home.md", "", "Boats"))
+
+    def test_replace_of_a_trailing_section_still_works_with_real_content(self):
+        # The guard refuses empty text, not trailing sections.
+        out = apply_operation(
+            self.DOC, Operation(REPLACE_SECTION, "home.md", "- a cat", section="Pets")
+        )
+        self.assertEqual(out, "# Home\n\n## Vehicles\n\n- blue car\n\n## Pets\n\n- a cat\n")
 
 
 class TestAddedLines(unittest.TestCase):

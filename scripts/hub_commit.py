@@ -439,6 +439,18 @@ def _apply_replace(lines: list[str], op: Operation) -> str:
     if not op.section:
         raise HubCommitError("replace-section needs a section name")
     block = _entry_lines(op.text)
+    if not block:
+        # An empty replacement is never a legitimate instruction: it is empty stdin, a
+        # command substitution that produced nothing, or a heredoc that collapsed. Left
+        # unguarded it silently deletes the whole section body, and for the LAST section
+        # in a file that is "truncate everything below this heading" — the largest
+        # content-loss path in the write API, arriving with an approving commit message.
+        # Emptying a section is a removal, and removals say so: --remove-entry, or a
+        # rejection through hub_review.py.
+        raise HubCommitError(
+            f"nothing to put under {op.section!r} — the replacement text is empty; "
+            f"use --remove-entry to delete content, never an empty --replace-section"
+        )
     start = heading_index(lines, op.section)
     if start is None:
         return render(_insert_after(lines, len(lines), [f"## {op.section}", "", *block]))
@@ -1326,7 +1338,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--file", help="hub file to change, relative to the hub repo")
     what = parser.add_mutually_exclusive_group()
     what.add_argument("--append", metavar="TEXT", help="append an entry ('-' reads stdin)")
-    what.add_argument("--replace-section", metavar="TEXT", help="replace --section's body")
+    what.add_argument(
+        "--replace-section",
+        metavar="TEXT",
+        help="replace --section's body (never empty — use --remove-entry to delete)",
+    )
     what.add_argument("--remove-entry", metavar="TEXT", help="remove a matching entry")
     parser.add_argument("--section", help="scope the operation to this heading")
     parser.add_argument("--summary", default="", help="subject line: what changed")
