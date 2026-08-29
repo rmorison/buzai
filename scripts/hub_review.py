@@ -1464,6 +1464,15 @@ def main(argv=None) -> int:
     print(f"hub-review: hubs resolve to {location}")
     hub = location.path
     if not (hub / ".git").exists():
+        # `--push-notes` is the ExecStartPost drain; see the matching branch in
+        # `hub_commit.main`. A listing or a verdict is owner-invoked and still fails.
+        if args.push_notes:
+            print(
+                f"hub-review WARN: {hub} is not a hub repo yet — no dispositions to push; "
+                "run `make hub-init`",
+                file=sys.stderr,
+            )
+            return 0
         print(
             f"hub-review FAIL: {hub} is not a hub repo yet — run `make hub-init`", file=sys.stderr
         )

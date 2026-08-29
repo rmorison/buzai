@@ -1420,6 +1420,16 @@ def main(argv=None) -> int:
         return 1
     print(f"hub-commit: hubs resolve to {location}")
     if not (location.path / ".git").exists():
+        # `--retry-push` is the ExecStartPost drain: with no store there is nothing queued,
+        # which is an expected pre-`hub-init` state rather than a failure. Every other
+        # invocation was asked to RECORD something and cannot, so it still fails loudly.
+        if args.retry_push:
+            print(
+                f"hub-commit WARN: {location.path} is not a hub repo yet — nothing to push; "
+                "run `make hub-init`",
+                file=sys.stderr,
+            )
+            return 0
         print(
             f"hub-commit FAIL: {location.path} is not a hub repo yet — run `make hub-init`",
             file=sys.stderr,

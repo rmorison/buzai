@@ -1330,6 +1330,24 @@ class TestMain(unittest.TestCase):
             self.assertIn("make hub-init", err.getvalue())
             self.assertFalse((Path(tmp) / "hubs").exists())
 
+    def test_retry_push_on_an_uninitialized_hub_warns_and_exits_0(self):
+        """The ExecStartPost drain on an instance that has not run `make hub-init`.
+
+        There is nothing queued, because there is no store — an expected state for every
+        instance between `make setup` and `make hub-init`, not a failure. `FAIL` here
+        would spend the word reserved for leak conditions on a routine one.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+            os.environ["BUZAI_HUBS_DIR"] = str(Path(tmp) / "hubs")
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = main(["--retry-push"])
+            self.assertEqual(rc, 0)
+            self.assertIn("hub-commit WARN", err.getvalue())
+            self.assertNotIn("FAIL", err.getvalue())
+            self.assertFalse((Path(tmp) / "hubs").exists())
+
 
 class TestMainAgainstARealHub(HubRepoCase):
     """`main` against a hub with no remote — nothing here can reach the network."""

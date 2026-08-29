@@ -1040,6 +1040,33 @@ class TestMain(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("hub-remote FAIL", err.getvalue())
 
+    def test_an_uninitialized_hub_warns_and_exits_0(self):
+        """This module is the unit's ExecStartPre. It verifies a remote; with no store
+        there is no remote to verify, which is the state of every instance between
+        `make setup` and `make hub-init` — a note, not a leak.
+
+        `FAIL` was reserved for "personal content is exposed"; printing it at every start
+        on a routine state teaches the owner to skim past the one word that must not be
+        skimmed. Same split as `secrets_preflight.report`.
+        """
+        previous = os.environ.get("BUZAI_HUBS_DIR")
+        self.addCleanup(
+            lambda: (
+                os.environ.__setitem__("BUZAI_HUBS_DIR", previous)
+                if previous is not None
+                else os.environ.pop("BUZAI_HUBS_DIR", None)
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["BUZAI_HUBS_DIR"] = str(Path(tmp) / "hubs")
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = main([])
+            self.assertEqual(rc, 0)
+            self.assertIn("hub-remote WARN", err.getvalue())
+            self.assertNotIn("FAIL", err.getvalue())
+            self.assertFalse((Path(tmp) / "hubs").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

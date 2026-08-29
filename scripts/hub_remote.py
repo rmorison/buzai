@@ -939,11 +939,17 @@ def main(argv=None) -> int:
         return 1
     print(f"hub-remote: hubs resolve to {location}")
     if not (location.path / ".git").exists():
+        # Not a leak, and not a failure: this is every instance between `make setup` and
+        # `make hub-init`, and this module runs as ExecStartPre. `FAIL` here spends the
+        # one word reserved for "personal content is exposed" on an expected state, and
+        # trains the owner to skim past it in the journal. Same severity split as
+        # `secrets_preflight.report`: leak conditions FAIL, everything else warns.
         print(
-            f"hub-remote FAIL: {location.path} is not a hub repo yet — run `make hub-init`",
+            f"hub-remote WARN: {location.path} is not a hub repo yet — nothing to verify; "
+            "run `make hub-init`",
             file=sys.stderr,
         )
-        return 1
+        return 0
     return check(location.path, REPO_ROOT, runner=default_git_runner, now=datetime.now(UTC))
 
 

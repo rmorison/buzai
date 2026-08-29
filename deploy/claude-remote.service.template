@@ -67,10 +67,12 @@ ExecStartPre=%h/buzai/.venv/bin/python %h/buzai/scripts/secrets_preflight.py
 # restart would keep pushing against a verdict nobody re-checked. This runs a fresh
 # anonymous probe and rewrites or EVICTS the cached verdict; a non-private answer leaves
 # no usable cache entry, so the pushes below refuse and queue instead of proceeding.
-# The leading '-' means the outcome can never affect service start: a repo that is not
-# yet created, a network that is down, a verdict of "public" — none of those are reasons
-# to take the assistant off the air, they are reasons not to push. Bounded: every probe
-# carries PROBE_TIMEOUT_SECONDS (20s) and the ssh-alias resolution 10s.
+# The leading '-' means the outcome can never affect service start: a network that is
+# down, a verdict of "public" — neither is a reason to take the assistant off the air,
+# they are reasons not to push. A store that does not exist yet does not even reach that
+# net: the script warns and exits 0, so the journal reserves `FAIL:` for conditions that
+# are actually wrong rather than printing it at every start before `make hub-init`.
+# Bounded: every probe carries PROBE_TIMEOUT_SECONDS (20s) and the ssh-alias resolution 10s.
 ExecStartPre=-%h/buzai/.venv/bin/python %h/buzai/scripts/hub_remote.py
 
 # The start job now spans the preflight, a privacy re-verification and two pushes, and
