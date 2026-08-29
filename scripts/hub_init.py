@@ -4,7 +4,13 @@
 store: it creates the resolved hub directory (see `scripts/hub_paths.py` — the one
 place that path is computed), `git init`s it, seeds the tracked scaffolds, writes a
 README describing *this instance's* store, moves any real hub markdown that is still
-sitting in the checkout out to the new repo, and makes the initial commit.
+sitting in the checkout out to the new repo, and commits.
+
+That last step is **two** commits, not one: a parentless seed holding scaffolding
+only, then a child commit holding whatever was migrated. `hub_review` keeps the seed
+out of the owner's review queue by detecting that it is parentless, so content folded
+into it would never be reviewable — and migrated content is the owner's own knowledge,
+which is precisely what the review loop exists to show them.
 
 It deliberately **stops before the remote**. Creating that repository is the single
 step where a wrong flag publishes the knowledge base, so it is never automated: the
@@ -107,10 +113,12 @@ SCAFFOLDS: frozenset[str] = frozenset({"README.md", "_example-hub.md"})
 # what the commit *is*: scaffolding this script wrote, never something awaiting a verdict.
 #
 # `hub_review`'s root-commit exclusion still carries that job today and is unchanged — a
-# distinct source is the groundwork for retiring it, not a replacement made here. Note the
-# asymmetry with `resume_message`, which stays `owner-directed` deliberately: that commit
-# migrates the owner's REAL hub content out of the public checkout, and content the owner
-# should see is content the owner should be able to review.
+# distinct source is the groundwork for retiring it, not a replacement made here.
+#
+# Nothing the owner should review is ever committed under this source. Migration — first
+# run or resumed — is a separate, non-root commit stamped `owner-directed`, because it
+# moves the owner's REAL hub content out of the public checkout, and content the owner
+# should see is content the owner should be able to review. See `migration_message`.
 BOOTSTRAP_SOURCE = "store-bootstrap"
 
 
@@ -363,21 +371,45 @@ other than `~/hubs`, clone it there and set `{ENV_VAR}` in the service unit.
 """
 
 
-def commit_message(migrated: Iterable[str]) -> str:
-    """Initial-commit message. Pure.
+def _moved_list(migrated: Iterable[str]) -> str:
+    """The bullet list of migrated paths, as both migration messages render it. Pure."""
+    return "\n".join(f"  - {m}" for m in migrated)
+
+
+def commit_message() -> str:
+    """SEED-commit message — scaffolding only. Pure.
+
+    Takes no migration, because the seed commit carries none: migrated content gets its
+    own commit on top (`migration_message`). That split is not cosmetic. `hub_review`
+    excludes the root commit from the review queue by detecting that it is parentless,
+    so anything committed here is invisible to the owner forever — which is right for
+    scaffolding and wrong for the owner's own knowledge.
 
     Carries the instruction-source trailer from the start, and it is `BOOTSTRAP_SOURCE`
     rather than `owner-directed`: history should say this commit is the store's own
     scaffolding, not knowledge recorded at the owner's request. See `BOOTSTRAP_SOURCE`.
     """
-    moved = list(migrated)
     body = "Seeded from the buzai public scaffolds by `make hub-init`."
-    if moved:
-        body += (
-            f"\n\nMoved {len(moved)} existing hub file(s) out of the public checkout:\n"
-            + "\n".join(f"  - {m}" for m in moved)
-        )
     return f"Initialize hub store\n\n{body}\n\ninstruction-source: {BOOTSTRAP_SOURCE}\n"
+
+
+def migration_message(migrated: Iterable[str]) -> str:
+    """Message for the commit that moves found content out of the checkout. Pure.
+
+    A CHILD of the seed, never part of it, and `owner-directed` rather than
+    `BOOTSTRAP_SOURCE` — this is the owner's real knowledge being rescued from a public
+    repo, and it is exactly the content review exists to show them. Both properties are
+    load-bearing: `hub_review` drops the parentless commit, and drops nothing by source
+    except `owner-correction`.
+    """
+    moved = list(migrated)
+    return (
+        "Move existing hub content out of the public checkout\n\n"
+        f"`make hub-init` found {len(moved)} hub file(s) under the checkout's `hubs/` and "
+        "moved them into this private store:\n"
+        + _moved_list(moved)
+        + "\n\ninstruction-source: owner-directed\n"
+    )
 
 
 def resume_message(migrated: Iterable[str]) -> str:
@@ -391,7 +423,7 @@ def resume_message(migrated: Iterable[str]) -> str:
         "Complete the interrupted hub migration\n\n"
         f"Moved {len(moved)} hub file(s) that were still in the public checkout after an "
         "interrupted `make hub-init`:\n"
-        + "\n".join(f"  - {m}" for m in moved)
+        + _moved_list(moved)
         + "\n\ninstruction-source: owner-directed\n"
     )
 
@@ -639,12 +671,23 @@ def initialize(
         (hub / INSTANCE_README).write_text(render_readme(hub, now))
         (hub / MARKER).parent.mkdir(parents=True, exist_ok=True)
         (hub / MARKER).write_text(render_marker(now))
-        for rel in migrate:
-            _copy_into(source, hub, rel)
         git_ok(["-C", str(hub), "add", "-A"], git_bin, "git add")
-        git_ok(
-            ["-C", str(hub), "commit", "-q", "-m", commit_message(migrate)], git_bin, "git commit"
-        )
+        git_ok(["-C", str(hub), "commit", "-q", "-m", commit_message()], git_bin, "git commit")
+        # Migration is a SECOND commit, deliberately. `hub_review` drops the parentless
+        # commit from the review queue, so folding the owner's own content into the seed
+        # would hide it from review permanently — the one class of content review exists
+        # for. Committing it as a child makes it reviewable like any other hub change,
+        # which is what the resume path has always done.
+        if migrate:
+            for rel in migrate:
+                _copy_into(source, hub, rel)
+            # Path-scoped, matching `_resume`: only the migrated paths are swept in.
+            git_ok(["-C", str(hub), "add", "--", *migrate], git_bin, "git add")
+            git_ok(
+                ["-C", str(hub), "commit", "-q", "-m", migration_message(migrate), "--", *migrate],
+                git_bin,
+                "git commit",
+            )
     except Exception:
         _rollback(hub, existed)
         raise

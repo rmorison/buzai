@@ -438,7 +438,7 @@ declares Bash (and therefore git) a blind spot.
 **a. Create the store.** One idempotent verb:
 
 ```bash
-make hub-init      # creates + seeds the hub repo, makes the initial commit, prints the next step
+make hub-init      # creates + seeds the hub repo, commits, prints the next step
 ```
 
 It creates the resolved directory, `git init`s it, copies the tracked scaffolds in,

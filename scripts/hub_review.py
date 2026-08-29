@@ -461,6 +461,8 @@ def reviewable(change: Change, roots: Collection[str] = ()) -> bool:
         own bootstrap rather than recorded knowledge: left in, the first thing every
         fresh instance asks its owner to review is the scaffolding. Identifying it by
         being parentless rather than by its subject means nothing has to match on prose.
+        It excludes the seed and *only* the seed: `hub_init` commits content migrated out
+        of the public checkout as a child of it, exactly so this stays true.
 
     `roots` is passed in rather than read from git so this stays pure; `root_commits()`
     is the reader.

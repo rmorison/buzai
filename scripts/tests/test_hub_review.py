@@ -33,6 +33,7 @@ from scripts.hub_commit import (
 from scripts.hub_commit import detail_of as commit_detail_of
 from scripts.hub_init import BOOTSTRAP_SOURCE
 from scripts.hub_init import commit_message as hub_init_commit_message
+from scripts.hub_init import migration_message as hub_init_migration_message
 from scripts.hub_remote import INDETERMINATE, LOCAL_ONLY, PRIVATE, GitResult, Verification
 from scripts.hub_remote import default_git_runner as real_git
 from scripts.hub_review import (
@@ -1084,7 +1085,7 @@ class TestTheHubInitSeedIsNotAReviewItem(ReviewRepoCase):
     def setUp(self):
         super().setUp()
         # the real message `hub_init` writes, on the repo's root commit
-        git("-C", str(self.hub), "commit", "-q", "--amend", "-m", hub_init_commit_message([]))
+        git("-C", str(self.hub), "commit", "-q", "--amend", "-m", hub_init_commit_message())
         self.seed = git("-C", str(self.hub), "rev-parse", "HEAD").strip()
         self.fact = self.append("the boiler was serviced")
 
@@ -1098,6 +1099,20 @@ class TestTheHubInitSeedIsNotAReviewItem(ReviewRepoCase):
     def test_the_root_commit_is_excluded(self):
         self.assertFalse(reviewable(find_change(self.hub, self.seed), root_commits(self.hub)))
         self.assertEqual(root_commits(self.hub), frozenset({self.seed}))
+
+    def test_content_hub_init_migrated_is_still_reviewable(self):
+        """The other half of the exclusion: it must drop the seed and nothing else.
+
+        `hub_init` used to fold content migrated out of the public checkout INTO the seed
+        commit, so this exclusion hid the owner's own knowledge from review permanently —
+        the one class of content the loop exists for. `hub_init` now commits a migration
+        as a CHILD of the seed; this is the assertion that pins why.
+        """
+        git("-C", str(self.hub), "commit", "-q", "--allow-empty", "-m",
+            hub_init_migration_message(["finance-and-tax.md"]))
+        moved = git("-C", str(self.hub), "rev-parse", "HEAD").strip()
+        self.assertNotIn(moved, root_commits(self.hub))
+        self.assertTrue(reviewable(find_change(self.hub, moved), root_commits(self.hub)))
 
     def test_the_owner_is_never_asked_to_review_the_bootstrap(self):
         out = io.StringIO()

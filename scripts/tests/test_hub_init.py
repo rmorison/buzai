@@ -16,6 +16,7 @@ from scripts.hub_init import (
     HubInitError,
     commit_count,
     commit_message,
+    migration_message,
     detail_of,
     git_ok,
     initialize,
@@ -267,7 +268,9 @@ class TestSecondRun(HubTempCase):
 
         self.assertEqual(result.status, "exists")
         self.assertEqual(result.migrated, [])
-        self.assertEqual(self.commits(), 1)  # no empty follow-up commit
+        # 2 = the seed plus the one migration commit the FIRST run made; the point is
+        # that this second run added no third, empty one.
+        self.assertEqual(self.commits(), 2)
 
     def test_repo_with_a_remote_reports_it(self):
         self.init()
@@ -295,10 +298,35 @@ class TestMigration(HubTempCase):
         )
         self.assertFalse((self.source / "trip").exists())  # emptied directory pruned
 
-    def test_migrated_content_is_in_the_initial_commit(self):
-        self.assertEqual(self.commits(), 1)
+    def root_sha(self) -> str:
+        return git("-C", str(self.hub), "rev-list", "--max-parents=0", "HEAD").strip()
+
+    def test_migrated_content_is_committed(self):
         self.assertIn("finance-and-tax.md", self.committed())
         self.assertIn("trip/notes.md", self.committed())
+
+    def test_migration_is_a_child_commit_not_the_parentless_seed(self):
+        # This test used to assert commits() == 1, which encoded the bug: hub_review
+        # excludes the parentless commit, so migrated content folded into the seed was
+        # invisible to review forever.
+        self.assertEqual(self.commits(), 2)
+        roots = git("-C", str(self.hub), "rev-list", "--max-parents=0", "HEAD").split()
+        self.assertEqual(roots, [self.root_sha()])
+        # HEAD is the migration, and its parent is the seed — the shape hub_review needs.
+        head = git("-C", str(self.hub), "rev-parse", "HEAD").strip()
+        self.assertNotEqual(head, self.root_sha())
+        self.assertEqual(git("-C", str(self.hub), "rev-parse", "HEAD^").strip(), self.root_sha())
+
+    def test_the_seed_commit_holds_no_migrated_content(self):
+        seeded = git("-C", str(self.hub), "ls-tree", "-r", "--name-only", self.root_sha())
+        self.assertNotIn("finance-and-tax.md", seeded)
+        self.assertNotIn("trip/notes.md", seeded)
+        self.assertIn("_example-hub.md", seeded)
+
+    def test_the_migration_commit_is_reviewable_by_source(self):
+        body = git("-C", str(self.hub), "log", "-1", "--pretty=%B")
+        self.assertIn("instruction-source: owner-directed", body)
+        self.assertNotIn(BOOTSTRAP_SOURCE, body)
 
     def test_commit_message_names_what_moved(self):
         body = git("-C", str(self.hub), "log", "-1", "--pretty=%B")
@@ -416,7 +444,7 @@ class TestResumeAfterInterruptedRemoval(HubTempCase):
     def test_the_identical_copy_is_not_committed_twice(self):
         result = self.init()
         self.assertEqual(result.status, "resumed")
-        self.assertEqual(self.commits(), 1)
+        self.assertEqual(self.commits(), 2)  # seed + the first run's migration, nothing new
         self.assertFalse(self.leak.exists())
 
     def test_a_differing_copy_is_refused_and_nothing_is_deleted(self):
@@ -568,12 +596,13 @@ class TestOwnerInstructions(unittest.TestCase):
 
 
 class TestCommitMessage(unittest.TestCase):
-    def test_no_migration_message_is_quiet_about_it(self):
-        self.assertNotIn("Moved", commit_message([]))
+    def test_the_seed_message_never_mentions_migration(self):
+        # The seed commit carries scaffolding only; migration is its own commit.
+        self.assertNotIn("moved", commit_message().casefold())
 
-    def test_migration_is_listed(self):
-        message = commit_message(["finance-and-tax.md"])
-        self.assertIn("Moved 1 existing hub file(s)", message)
+    def test_migration_is_listed_in_its_own_message(self):
+        message = migration_message(["finance-and-tax.md"])
+        self.assertIn("1 hub file(s)", message)
         self.assertIn("finance-and-tax.md", message)
 
 
@@ -630,11 +659,18 @@ class TestTheSeedIsNotStampedLikeRecordedKnowledge(unittest.TestCase):
     """
 
     def test_the_seed_carries_the_bootstrap_source(self):
-        self.assertIn(f"instruction-source: {BOOTSTRAP_SOURCE}", commit_message([]))
+        self.assertIn(f"instruction-source: {BOOTSTRAP_SOURCE}", commit_message())
 
     def test_the_bootstrap_source_is_distinct_from_owner_directed(self):
         self.assertNotEqual(BOOTSTRAP_SOURCE, "owner-directed")
-        self.assertNotIn("owner-directed", commit_message(["finance-and-tax.md"]))
+        self.assertNotIn("owner-directed", commit_message())
+
+    def test_the_first_run_migration_commit_is_owner_directed_and_reviewable(self):
+        # the same guard as the resume path below: migrating real content is not
+        # bootstrapping, on the first run just as much as on a resumed one
+        moved = migration_message(["finance-and-tax.md"])
+        self.assertIn("instruction-source: owner-directed", moved)
+        self.assertNotIn(BOOTSTRAP_SOURCE, moved)
 
     def test_the_resume_commit_stays_owner_directed_and_reviewable(self):
         # the guard: migrating real content is not bootstrapping, and must not be relabelled
