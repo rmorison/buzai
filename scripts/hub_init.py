@@ -727,7 +727,10 @@ def main(argv=None) -> int:
             f"working tree AND the git index — {', '.join(result.migrated)}"
         )
     else:
-        print(f"hub-init: created the hub repo at {result.hub} on branch {DEFAULT_BRANCH}")
+        print(
+            f"hub-init: created the hub repo at {result.hub} on branch {DEFAULT_BRANCH} "
+            f"({result.commits} commit(s))"
+        )
         print(f"  seeded:   {', '.join(result.seeded) or 'nothing (no scaffolds tracked)'}")
         if result.migrated:
             print(
@@ -735,7 +738,15 @@ def main(argv=None) -> int:
                 f"working tree AND the git index — {', '.join(result.migrated)}"
             )
         print(f"  marker:   {MARKER} (creation timestamp; the durability check reads it)")
-        print(f"  commit:   {result.commits} initial commit")
+        # Two commits, not "N initial commits": the seed is scaffolding that review skips,
+        # and the migration is the owner's own content, committed separately so it IS
+        # reviewed. Reporting them as one would hide the one the owner has to look at.
+        print("  commit:   the seed commit (scaffolding only; review skips it)")
+        if result.migrated:
+            print(
+                f"  commit:   a separate migration commit moving {len(result.migrated)} "
+                "file(s) — it will appear in `make hub-review`"
+            )
 
     if result.remotes:
         print(f"hub-init: remote(s) configured: {', '.join(result.remotes)}")

@@ -1396,6 +1396,42 @@ class TestMainAgainstARealHub(HubRepoCase):
         self.assertIn("committed", out)
         self.assertIn("- a fact", self.notes.read_text())
 
+    def test_empty_stdin_to_replace_section_is_refused_end_to_end(self):
+        """`--replace-section -` with nothing on stdin, through the real CLI path.
+
+        The unit tests on `apply_operation` prove the guard; this proves the route a
+        session actually takes reaches it — `read_text_arg` turning `-` into stdin, and
+        `record` turning the refusal into a FAIL rather than a commit. "Notes" is the LAST
+        (only) section in the seed, the case where an empty replacement is "truncate
+        everything below this heading".
+        """
+        self.addCleanup(setattr, sys, "stdin", sys.stdin)
+        for label, stdin in (("empty", ""), ("whitespace-only", "  \n\t\n\n")):
+            with self.subTest(stdin=label):
+                before, commits = self.notes.read_text(), self.commits()
+                sys.stdin = io.StringIO(stdin)
+
+                rc, _, err = self.run_main(
+                    [
+                        "--file",
+                        "notes.md",
+                        "--replace-section",
+                        "-",
+                        "--section",
+                        "Notes",
+                        "--summary",
+                        "s",
+                        "--no-push",
+                    ]
+                )
+
+                self.assertEqual(rc, 1)
+                self.assertIn("hub-commit FAIL", err)
+                self.assertIn("--remove-entry", err)  # the refusal names the real verb
+                self.assertEqual(self.notes.read_text(), before)
+                self.assertEqual(self.commits(), commits)
+                self.assertEqual(self.porcelain(), "")
+
 
 class TestOwnerCorrectionIsNotACommandLineChoice(HubRepoCase):
     """`hub_review.reviewable()` excludes `owner-correction` from the review queue: it is

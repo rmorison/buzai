@@ -1,5 +1,6 @@
 import io
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -7,7 +8,9 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout, suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest import mock
 
+from scripts import hub_init
 from scripts.hub_init import (
     BOOTSTRAP_SOURCE,
     MARKER,
@@ -582,6 +585,79 @@ class TestErrorPaths(HubTempCase):
         self.assertEqual((self.source / "finance-and-tax.md").read_text(), "real hub content\n")
 
 
+class TestFailedMigrationCommitAfterTheSeedLanded(HubTempCase):
+    """PLANT: the seed commit succeeds, then the SEPARATE migration commit fails.
+
+    Since the seed/migration split there is a window the single-commit version never had:
+    a repo with real history exists, and the owner's content has been copied into it but
+    not committed. The rollback has to treat that repo as this run's to discard — a
+    leftover `.git` would send the next run down `_resume` over a half-built store — and
+    the checkout's copies have to survive in the working tree AND the index, because
+    they are removed only after the migration commit lands.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.leak = self.track("personal.md", "# Personal\n")  # committed: the index case
+        self.untracked = self.source / "finance-and-tax.md"
+        self.untracked.write_text("real hub content\n")
+        self.seed_count = self.root / "seed-commits-at-failure"
+        # Delegates to real git and refuses only a `commit` that names a migrated path,
+        # which the seed commit never does. Before refusing it records how many commits
+        # the hub already has, so the test can prove the seed really had landed rather
+        # than failing earlier and exercising the old single-commit rollback instead.
+        real = shutil.which("git")
+        self.shim = self.root / "migration-commit-fails-git"
+        self.shim.write_text(
+            "#!/bin/sh\n"
+            'is_commit=""; names_migrated=""\n'
+            'for a in "$@"; do\n'
+            '  [ "$a" = commit ] && is_commit=1\n'
+            '  [ "$a" = personal.md ] && names_migrated=1\n'
+            "done\n"
+            'if [ -n "$is_commit" ] && [ -n "$names_migrated" ]; then\n'
+            f'  "{real}" -C "$2" rev-list --count HEAD > "{self.seed_count}"\n'
+            '  echo "fatal: injected migration-commit failure" >&2\n'
+            "  exit 1\n"
+            "fi\n"
+            f'exec "{real}" "$@"\n'
+        )
+        self.shim.chmod(0o755)
+
+    def test_the_run_fails_and_leaves_nothing_behind_but_the_checkout(self):
+        with self.assertRaises(HubInitError) as raised:
+            self.init(git_bin=str(self.shim))
+
+        self.assertIn("injected migration-commit failure", str(raised.exception))
+        # the seed had committed when the migration commit was refused
+        self.assertEqual(self.seed_count.read_text().strip(), "1")
+        # the half-built repo is gone, so the next run creates rather than resumes
+        self.assertFalse(self.hub.exists())
+        # the owner's content is still where it was: on disk and in the public index
+        self.assertEqual(self.leak.read_text(), "# Personal\n")
+        self.assertEqual(self.untracked.read_text(), "real hub content\n")
+        self.assertIn("hubs/personal.md", self.indexed())
+
+    def test_a_clean_rerun_produces_the_seed_and_a_reviewable_migration(self):
+        with self.assertRaises(HubInitError):
+            self.init(git_bin=str(self.shim))
+
+        result = self.init()
+
+        self.assertEqual(result.status, "created")
+        self.assertEqual(result.migrated, ["finance-and-tax.md", "personal.md"])
+        self.assertEqual(self.commits(), 2)
+        root = git("-C", str(self.hub), "rev-list", "--max-parents=0", "HEAD").strip()
+        self.assertEqual(git("-C", str(self.hub), "rev-parse", "HEAD^").strip(), root)
+        # the migrated content lives in the child commit, not in the seed review skips
+        self.assertLessEqual({"finance-and-tax.md", "personal.md"}, self.committed())
+        seeded = git("-C", str(self.hub), "ls-tree", "-r", "--name-only", root).split()
+        self.assertNotIn("personal.md", seeded)
+        self.assertNotIn("finance-and-tax.md", seeded)
+        self.assertFalse(self.leak.exists())
+        self.assertNotIn("hubs/personal.md", self.indexed())
+
+
 class TestOwnerInstructions(unittest.TestCase):
     TEXT = owner_instructions(Path("/home/owner/hubs"))
 
@@ -738,6 +814,51 @@ class TestMain(unittest.TestCase):
             rc = main()
         self.assertEqual(rc, 1)
         self.assertIn("hub-init FAIL", err.getvalue())
+
+
+class TestMainReportsTheCommitsItMade(HubTempCase):
+    """What `main` prints after a first run has to match the history it just made.
+
+    It used to print `commit:   {count} initial commit`, which was true only while the
+    seed and migration were one commit. After the split a first run that migrates makes
+    two, and "2 initial commit" told the owner nothing about the one that needs review.
+
+    `main` has no injection point for the checkout, so the scaffold directory is patched
+    to this test's stand-in (as `test_hub_commit` does for `DEFAULT_BRANCH`) and the hub
+    location is pointed into the tempdir. Neither the real checkout nor ~/hubs is touched.
+    """
+
+    def run_main(self) -> str:
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(self.hub)
+        out = io.StringIO()
+        with mock.patch.object(hub_init, "SCAFFOLD_DIR", self.source):
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                rc = main()
+        self.assertEqual(rc, 0)
+        return out.getvalue()
+
+    def test_a_first_run_with_migration_reports_both_commits(self):
+        (self.source / "finance-and-tax.md").write_text("real hub content\n")
+
+        out = self.run_main()
+
+        self.assertEqual(self.commits(), 2)  # the history the output has to describe
+        # the exact old phrasing; the owner instructions legitimately say "initial commit"
+        self.assertNotIn("2 initial commit", out)
+        self.assertIn("(2 commit(s))", out)
+        self.assertIn("the seed commit", out)
+        self.assertIn("migration commit moving 1 file(s)", out)
+        self.assertIn("make hub-review", out)
+
+    def test_a_first_run_without_migration_reports_only_the_seed(self):
+        out = self.run_main()
+
+        self.assertEqual(self.commits(), 1)
+        self.assertNotIn("1 initial commit", out)
+        self.assertIn("(1 commit(s))", out)
+        self.assertIn("the seed commit", out)
+        self.assertNotIn("migration commit", out)
 
 
 if __name__ == "__main__":
