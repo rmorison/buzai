@@ -1330,23 +1330,54 @@ class TestMain(unittest.TestCase):
             self.assertIn("make hub-init", err.getvalue())
             self.assertFalse((Path(tmp) / "hubs").exists())
 
-    def test_retry_push_on_an_uninitialized_hub_warns_and_exits_0(self):
-        """The ExecStartPost drain on an instance that has not run `make hub-init`.
+    def run_uninitialized(self, argv) -> tuple[int, str]:
+        """main() against a hub location inside a tempdir that has no store yet."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(Path(tmp.name) / "hubs")
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main(argv)
+        self.assertFalse((Path(tmp.name) / "hubs").exists())
+        return rc, err.getvalue()
 
-        There is nothing queued, because there is no store — an expected state for every
-        instance between `make setup` and `make hub-init`, not a failure. `FAIL` here
-        would spend the word reserved for leak conditions on a routine one.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
-            os.environ["BUZAI_HUBS_DIR"] = str(Path(tmp) / "hubs")
-            err = io.StringIO()
-            with redirect_stdout(io.StringIO()), redirect_stderr(err):
-                rc = main(["--retry-push"])
-            self.assertEqual(rc, 0)
-            self.assertIn("hub-commit WARN", err.getvalue())
-            self.assertNotIn("FAIL", err.getvalue())
-            self.assertFalse((Path(tmp) / "hubs").exists())
+    def test_retry_push_on_an_uninitialized_hub_fails_when_run_by_hand(self):
+        """`make hub-push` runs exactly `--retry-push`, and CLAUDE.md tells the assistant to
+        run it. Exit 0 there reads as "the backlog reached the remote" on a box where no
+        store exists, so without the service flag a missing store is a failure."""
+        rc, err = self.run_uninitialized(["--retry-push"])
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-commit FAIL", err)
+        self.assertIn("not a hub repo yet", err)
+
+    def test_the_service_flag_makes_a_missing_store_a_note(self):
+        """Only the unit passes `--if-initialized`; before `make hub-init` its drain has
+        nothing to drain. Note tier, like secrets_preflight's "no hub store" line — not
+        WARN, which is for durability conditions, and not FAIL."""
+        rc, err = self.run_uninitialized(["--retry-push", "--if-initialized"])
+        self.assertEqual(rc, 0)
+        self.assertIn("hub-commit: ", err)
+        self.assertIn("not a hub repo yet", err)
+        self.assertNotIn("WARN", err)
+        self.assertNotIn("FAIL", err)
+
+    def test_the_service_flag_never_excuses_a_refused_hub_path(self):
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(REPO_ROOT)  # inside the public checkout
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main(["--retry-push", "--if-initialized"])
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-commit FAIL", err.getvalue())
+
+    def test_the_service_flag_only_applies_to_the_drain(self):
+        # A write that cannot be recorded must never exit 0, flag or not. Run against a
+        # tempdir location so a regressed guard can never reach the real hub store.
+        argv = ["--file", "notes.md", "--append", "- x", "--summary", "s", "--if-initialized"]
+        with self.assertRaises(SystemExit) as raised:
+            self.run_uninitialized(argv)
+        self.assertEqual(raised.exception.code, 2)
 
 
 class TestMainAgainstARealHub(HubRepoCase):

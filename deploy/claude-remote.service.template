@@ -70,10 +70,12 @@ ExecStartPre=%h/buzai/.venv/bin/python %h/buzai/scripts/secrets_preflight.py
 # The leading '-' means the outcome can never affect service start: a network that is
 # down, a verdict of "public" — neither is a reason to take the assistant off the air,
 # they are reasons not to push. A store that does not exist yet does not even reach that
-# net: the script warns and exits 0, so the journal reserves `FAIL:` for conditions that
-# are actually wrong rather than printing it at every start before `make hub-init`.
+# net: `--if-initialized`, passed HERE and never by `make hub-remote-check`, makes that
+# state a plain note with exit 0, the same tier secrets_preflight uses for it, so the
+# journal keeps `FAIL:` and `WARN` for conditions that are actually wrong instead of
+# printing one at every start before `make hub-init`. Run by hand, a missing store fails.
 # Bounded: every probe carries PROBE_TIMEOUT_SECONDS (20s) and the ssh-alias resolution 10s.
-ExecStartPre=-%h/buzai/.venv/bin/python %h/buzai/scripts/hub_remote.py
+ExecStartPre=-%h/buzai/.venv/bin/python %h/buzai/scripts/hub_remote.py --if-initialized
 
 # The start job now spans the preflight, a privacy re-verification and two pushes, and
 # every one of them is network-facing. systemd's 90s default would kill a start whose
@@ -106,8 +108,11 @@ ExecStart=%h/.local/bin/claude remote-control --name buzai-assistant --spawn=sam
 # either — a note must never reach the remote ahead of the correction commit it refers
 # to. Both calls re-verify privacy themselves and refuse unless the verdict is PRIVATE
 # (the ExecStartPre above has just refreshed it), and both are bounded — 60s per push,
-# 30s per local git call — so neither can hang this unit.
-ExecStartPost=-/bin/sh -c '%h/buzai/.venv/bin/python %h/buzai/scripts/hub_commit.py --retry-push && %h/buzai/.venv/bin/python %h/buzai/scripts/hub_review.py --push-notes'
+# 30s per local git call — so neither can hang this unit. Each carries `--if-initialized`
+# for the same reason as the privacy refresh: before `make hub-init` there is nothing to
+# drain, which is a note here. `make hub-push` omits it on purpose, so an owner who runs
+# it on a box with no store gets a failure rather than a success that drained nothing.
+ExecStartPost=-/bin/sh -c '%h/buzai/.venv/bin/python %h/buzai/scripts/hub_commit.py --retry-push --if-initialized && %h/buzai/.venv/bin/python %h/buzai/scripts/hub_review.py --push-notes --if-initialized'
 
 Restart=always
 RestartSec=10s

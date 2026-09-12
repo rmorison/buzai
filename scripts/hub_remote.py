@@ -158,6 +158,7 @@ that way, and that alias must carry a `HostName` line — see the derivation not
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -931,7 +932,25 @@ def check(
     return 1 if failed else 0
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="hub_remote.py",
+        description="Prove the hub remote is PRIVATE (anonymous readability probe) and exit.",
+    )
+    parser.add_argument(
+        "--if-initialized",
+        action="store_true",
+        help=(
+            "for the service unit ONLY: a hub store that does not exist yet is reported as "
+            "a note and exits 0. Without it a missing store fails, so `make "
+            "hub-remote-check` never reports a store that is not there as verified"
+        ),
+    )
+    return parser
+
+
 def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
     try:
         location = hub_dir()
     except HubPathError as e:
@@ -939,17 +958,27 @@ def main(argv=None) -> int:
         return 1
     print(f"hub-remote: hubs resolve to {location}")
     if not (location.path / ".git").exists():
-        # Not a leak, and not a failure: this is every instance between `make setup` and
-        # `make hub-init`, and this module runs as ExecStartPre. `FAIL` here spends the
-        # one word reserved for "personal content is exposed" on an expected state, and
-        # trains the owner to skim past it in the journal. Same severity split as
-        # `secrets_preflight.report`: leak conditions FAIL, everything else warns.
+        # Every instance between `make setup` and `make hub-init` is here, and this module
+        # is the unit's ExecStartPre, so a FAIL at each start would spend the word the
+        # journal reserves for something actually wrong on a routine state. That downgrade
+        # belongs to the unit alone, via `--if-initialized`, and is the NOTE tier of
+        # `secrets_preflight.report` (untagged, as it prints "no hub store on this
+        # instance"): its three tiers are note for a legitimate empty state, WARN for a
+        # durability condition, FAIL for a leak or something that could not be done. Run
+        # by hand as `make hub-remote-check`, the owner asked for a proof, and "there is
+        # no store to prove anything about" is a failure to give one.
+        if args.if_initialized:
+            print(
+                f"hub-remote: {location.path} is not a hub repo yet — nothing to verify "
+                "(run `make hub-init`)",
+                file=sys.stderr,
+            )
+            return 0
         print(
-            f"hub-remote WARN: {location.path} is not a hub repo yet — nothing to verify; "
-            "run `make hub-init`",
+            f"hub-remote FAIL: {location.path} is not a hub repo yet — run `make hub-init`",
             file=sys.stderr,
         )
-        return 0
+        return 1
     return check(location.path, REPO_ROOT, runner=default_git_runner, now=datetime.now(UTC))
 
 

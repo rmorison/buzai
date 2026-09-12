@@ -22,15 +22,34 @@ import unittest
 from pathlib import Path
 
 from scripts.hub_commit import build_parser as commit_parser
+from scripts.hub_remote import build_parser as remote_parser
 from scripts.hub_review import build_parser as review_parser
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = REPO_ROOT / "deploy" / "claude-remote.service.template"
+MAKEFILE = REPO_ROOT / "Makefile"
+
+# The flag that turns "no hub store yet" from a failure into a note. It belongs to the
+# unit alone: the same scripts run by hand as `make hub-push` / `make hub-remote-check`
+# must fail on a missing store, or they report success on one that is not there.
+SERVICE_FLAG = "--if-initialized"
 
 # systemd's default. The start job now spans a preflight, a privacy probe and two
 # pushes, so a unit that keeps the default can have a *running* assistant killed for
 # being slow — which is the opposite of what these lines are for.
 SYSTEMD_DEFAULT_START_TIMEOUT = 90
+
+
+def make_recipe(target: str) -> list[str]:
+    """The recipe lines of one Makefile target, stripped, in file order."""
+    lines = MAKEFILE.read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(f"{target}:"))
+    recipe = []
+    for line in lines[start + 1 :]:
+        if not line.startswith("\t"):
+            break
+        recipe.append(line.strip())
+    return recipe
 
 
 def directives(name: str) -> list[str]:
@@ -56,12 +75,12 @@ class TestTheServiceStartGuaranteesAreWired(unittest.TestCase):
 
     def test_the_privacy_verdict_is_re_verified(self):
         self.assertTrue(
-            any(p.endswith("scripts/hub_remote.py") for p in self.pre),
+            any("scripts/hub_remote.py" in p for p in self.pre),
             f"nothing re-verifies the remote at start: {self.pre}",
         )
 
     def test_the_re_verification_cannot_block_start(self):
-        refresh = next(p for p in self.pre if p.endswith("scripts/hub_remote.py"))
+        refresh = next(p for p in self.pre if "scripts/hub_remote.py" in p)
         self.assertTrue(refresh.startswith("-"), "a 'do not push' answer must not end the service")
 
     def test_it_is_an_ExecStartPre_so_it_precedes_every_push(self):
@@ -102,6 +121,47 @@ class TestTheServiceStartGuaranteesAreWired(unittest.TestCase):
         self.assertEqual(len(values), 1, values)
         seconds = int(values[0].rstrip("s"))
         self.assertGreater(seconds, SYSTEMD_DEFAULT_START_TIMEOUT)
+
+
+class TestOnlyTheUnitExcusesAMissingStore(unittest.TestCase):
+    """c74c3d6 made these three scripts exit 0 on a missing hub store unconditionally, to
+    keep `FAIL:` out of the journal at every start before `make hub-init`. But the Makefile
+    runs the same commands for the owner, so `make hub-push` and `make hub-remote-check`
+    reported success on a store that did not exist. The downgrade is now a flag, and these
+    tests hold it to the unit and away from the Makefile."""
+
+    def invocations(self, script: str) -> list[str]:
+        """Each command in the unit that runs `script`, split on the `&&` chain."""
+        lines = directives("ExecStartPre") + directives("ExecStartPost")
+        return [part for line in lines for part in line.split("&&") if script in part]
+
+    def arguments(self, command: str) -> list[str]:
+        # tokens without the `sh -c '...'` quoting, which clings to the last one
+        return [token.strip("'\"") for token in command.split()]
+
+    def test_the_privacy_refresh_passes_the_flag(self):
+        (refresh,) = self.invocations("scripts/hub_remote.py")
+        self.assertIn(SERVICE_FLAG, self.arguments(refresh))
+
+    def test_both_drains_pass_the_flag(self):
+        for script in ("scripts/hub_commit.py", "scripts/hub_review.py"):
+            (drain,) = self.invocations(script)
+            self.assertIn(SERVICE_FLAG, self.arguments(drain), drain)
+
+    def test_the_owner_run_targets_do_not(self):
+        for target, script in (
+            ("hub-push", "scripts/hub_commit.py --retry-push"),
+            ("hub-push", "scripts/hub_review.py --push-notes"),
+            ("hub-remote-check", "scripts/hub_remote.py"),
+        ):
+            recipe = " ".join(make_recipe(target))
+            self.assertIn(script, recipe, target)  # the target still runs the script
+            self.assertNotIn(SERVICE_FLAG, recipe, target)
+
+    def test_every_script_accepts_the_flag(self):
+        self.assertTrue(commit_parser().parse_args(["--retry-push", SERVICE_FLAG]).if_initialized)
+        self.assertTrue(review_parser().parse_args(["--push-notes", SERVICE_FLAG]).if_initialized)
+        self.assertTrue(remote_parser().parse_args([SERVICE_FLAG]).if_initialized)
 
 
 class TestTheUnitOnlyNamesThingsThatExist(unittest.TestCase):

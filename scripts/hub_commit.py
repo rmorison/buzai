@@ -1370,6 +1370,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="push any unpushed commits and exit (run this at service start)",
     )
+    parser.add_argument(
+        "--if-initialized",
+        action="store_true",
+        help=(
+            "with --retry-push, for the service unit ONLY: a hub store that does not exist "
+            "yet is reported as a note and exits 0. Without it a missing store fails, so "
+            "`make hub-push` never reports success on a store that is not there"
+        ),
+    )
     return parser
 
 
@@ -1412,7 +1421,11 @@ def report_push(outcome: PushOutcome, now: datetime) -> None:
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.if_initialized and not args.retry_push:
+        # A write that cannot be recorded must never exit 0, whoever is asking.
+        parser.error("--if-initialized only applies to --retry-push (the service-start drain)")
     try:
         location = hub_dir()
     except HubPathError as e:
@@ -1420,13 +1433,18 @@ def main(argv=None) -> int:
         return 1
     print(f"hub-commit: hubs resolve to {location}")
     if not (location.path / ".git").exists():
-        # `--retry-push` is the ExecStartPost drain: with no store there is nothing queued,
-        # which is an expected pre-`hub-init` state rather than a failure. Every other
-        # invocation was asked to RECORD something and cannot, so it still fails loudly.
-        if args.retry_push:
+        # Only the service unit's ExecStartPost drain passes `--if-initialized`. Before
+        # `make hub-init` it has nothing queued, an expected state, so it gets
+        # secrets_preflight's NOTE tier: the untagged line that script prints for "no hub
+        # store on this instance". Its three tiers are note (a legitimate empty state), WARN
+        # (a durability condition) and FAIL (a leak, or something that could not be done),
+        # and this is not WARN. Everyone else fails, `make hub-push` included: it runs this
+        # exact command, and an owner or assistant reading exit 0 there concludes the
+        # backlog reached the remote when no store even exists.
+        if args.if_initialized:
             print(
-                f"hub-commit WARN: {location.path} is not a hub repo yet — nothing to push; "
-                "run `make hub-init`",
+                f"hub-commit: {location.path} is not a hub repo yet — nothing to push "
+                "(run `make hub-init`)",
                 file=sys.stderr,
             )
             return 0

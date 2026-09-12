@@ -1396,6 +1396,14 @@ def build_parser() -> argparse.ArgumentParser:
         "-n", "--limit", type=int, default=10, help="how many pending items to show"
     )
     parser.add_argument("--no-push", action="store_true", help="do not push anything off-box")
+    parser.add_argument(
+        "--if-initialized",
+        action="store_true",
+        help=(
+            "with --push-notes, for the service unit ONLY: a hub store that does not exist "
+            "yet is reported as a note and exits 0. Without it a missing store fails"
+        ),
+    )
     return parser
 
 
@@ -1456,7 +1464,11 @@ def run_disposition(hub: Path, args: argparse.Namespace, now: datetime) -> int:
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.if_initialized and not args.push_notes:
+        # A listing or a verdict with no store to act on must never exit 0.
+        parser.error("--if-initialized only applies to --push-notes (the service-start drain)")
     try:
         location = hub_dir()
     except HubPathError as e:
@@ -1465,12 +1477,13 @@ def main(argv=None) -> int:
     print(f"hub-review: hubs resolve to {location}")
     hub = location.path
     if not (hub / ".git").exists():
-        # `--push-notes` is the ExecStartPost drain; see the matching branch in
-        # `hub_commit.main`. A listing or a verdict is owner-invoked and still fails.
-        if args.push_notes:
+        # Only the unit's ExecStartPost drain passes `--if-initialized`, and it gets the
+        # note tier; see the matching branch in `hub_commit.main`. `make hub-push` runs
+        # `--push-notes` without it, so there a missing store still fails.
+        if args.if_initialized:
             print(
-                f"hub-review WARN: {hub} is not a hub repo yet — no dispositions to push; "
-                "run `make hub-init`",
+                f"hub-review: {hub} is not a hub repo yet — no dispositions to push "
+                "(run `make hub-init`)",
                 file=sys.stderr,
             )
             return 0

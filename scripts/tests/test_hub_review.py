@@ -1586,22 +1586,50 @@ class TestMain(unittest.TestCase):
             self.assertIn("make hub-init", err.getvalue())
             self.assertFalse((Path(tmp) / "hubs").exists())
 
-    def test_push_notes_on_an_uninitialized_hub_warns_and_exits_0(self):
-        """The other half of the ExecStartPost chain; see the matching hub_commit test.
+    def run_uninitialized(self, argv) -> tuple[int, str]:
+        """main() against a hub location inside a tempdir that has no store yet."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(Path(tmp.name) / "hubs")
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main(argv)
+        self.assertFalse((Path(tmp.name) / "hubs").exists())
+        return rc, err.getvalue()
 
-        The listing above still exits 1: the owner asked to see their pending changes and
-        there is no store to read. This path was asked to drain a queue that cannot exist.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
-            os.environ["BUZAI_HUBS_DIR"] = str(Path(tmp) / "hubs")
-            err = io.StringIO()
-            with redirect_stdout(io.StringIO()), redirect_stderr(err):
-                rc = main(["--push-notes"])
-            self.assertEqual(rc, 0)
-            self.assertIn("hub-review WARN", err.getvalue())
-            self.assertNotIn("FAIL", err.getvalue())
-            self.assertFalse((Path(tmp) / "hubs").exists())
+    def test_push_notes_on_an_uninitialized_hub_fails_when_run_by_hand(self):
+        """The second half of `make hub-push`; see the matching hub_commit test. Without the
+        service flag, "no store" is not "no dispositions waiting"."""
+        rc, err = self.run_uninitialized(["--push-notes"])
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-review FAIL", err)
+        self.assertIn("not a hub repo yet", err)
+
+    def test_the_service_flag_makes_a_missing_store_a_note(self):
+        rc, err = self.run_uninitialized(["--push-notes", "--if-initialized"])
+        self.assertEqual(rc, 0)
+        self.assertIn("hub-review: ", err)
+        self.assertIn("not a hub repo yet", err)
+        self.assertNotIn("WARN", err)
+        self.assertNotIn("FAIL", err)
+
+    def test_the_service_flag_never_excuses_a_refused_hub_path(self):
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(REPO_ROOT)  # inside the public checkout
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main(["--push-notes", "--if-initialized"])
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-review FAIL", err.getvalue())
+
+    def test_the_service_flag_only_applies_to_the_drain(self):
+        # A listing or a verdict with no store to act on must never exit 0, flag or not.
+        # Run against a tempdir location so a regressed guard never reads the real store.
+        for argv in (["--if-initialized"], ["--approve", "0" * 8, "--if-initialized"]):
+            with self.assertRaises(SystemExit) as raised:
+                self.run_uninitialized(argv)
+            self.assertEqual(raised.exception.code, 2, argv)
 
 
 class TestMainAgainstARealHub(ReviewRepoCase):

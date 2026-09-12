@@ -1040,15 +1040,7 @@ class TestMain(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("hub-remote FAIL", err.getvalue())
 
-    def test_an_uninitialized_hub_warns_and_exits_0(self):
-        """This module is the unit's ExecStartPre. It verifies a remote; with no store
-        there is no remote to verify, which is the state of every instance between
-        `make setup` and `make hub-init` — a note, not a leak.
-
-        `FAIL` was reserved for "personal content is exposed"; printing it at every start
-        on a routine state teaches the owner to skim past the one word that must not be
-        skimmed. Same split as `secrets_preflight.report`.
-        """
+    def point_hubs_at(self, path: Path) -> None:
         previous = os.environ.get("BUZAI_HUBS_DIR")
         self.addCleanup(
             lambda: (
@@ -1057,15 +1049,45 @@ class TestMain(unittest.TestCase):
                 else os.environ.pop("BUZAI_HUBS_DIR", None)
             )
         )
-        with tempfile.TemporaryDirectory() as tmp:
-            os.environ["BUZAI_HUBS_DIR"] = str(Path(tmp) / "hubs")
-            err = io.StringIO()
-            with redirect_stdout(io.StringIO()), redirect_stderr(err):
-                rc = main([])
-            self.assertEqual(rc, 0)
-            self.assertIn("hub-remote WARN", err.getvalue())
-            self.assertNotIn("FAIL", err.getvalue())
-            self.assertFalse((Path(tmp) / "hubs").exists())
+        os.environ["BUZAI_HUBS_DIR"] = str(path)
+
+    def run_uninitialized(self, argv) -> tuple[int, str]:
+        """main() against a hub location inside a tempdir that has no store yet."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.point_hubs_at(Path(tmp.name) / "hubs")
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main(argv)
+        self.assertFalse((Path(tmp.name) / "hubs").exists())
+        return rc, err.getvalue()
+
+    def test_an_uninitialized_hub_fails_when_run_by_hand(self):
+        """`make hub-remote-check` is "prove the hub remote is PRIVATE". With no store there
+        is nothing proven, and exit 0 would read as a pass."""
+        rc, err = self.run_uninitialized([])
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-remote FAIL", err)
+        self.assertIn("not a hub repo yet", err)
+
+    def test_the_service_flag_makes_a_missing_store_a_note(self):
+        """The unit's ExecStartPre passes `--if-initialized`: before `make hub-init` that is
+        a routine state, printed at secrets_preflight's note tier — not WARN, which is for
+        durability conditions, and not FAIL."""
+        rc, err = self.run_uninitialized(["--if-initialized"])
+        self.assertEqual(rc, 0)
+        self.assertIn("hub-remote: ", err)
+        self.assertIn("not a hub repo yet", err)
+        self.assertNotIn("WARN", err)
+        self.assertNotIn("FAIL", err)
+
+    def test_the_service_flag_never_excuses_a_refused_hub_path(self):
+        self.point_hubs_at(Path(__file__).resolve().parents[2])  # the checkout
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main(["--if-initialized"])
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-remote FAIL", err.getvalue())
 
 
 if __name__ == "__main__":
