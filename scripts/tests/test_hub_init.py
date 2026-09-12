@@ -566,6 +566,68 @@ class TestResumeTakesTrackedContentOutOfTheIndex(HubTempCase):
         self.assertNotIn("hubs/personal.md", self.indexed())
 
 
+class TestMigratedPathsAreTakenLiterally(HubTempCase):
+    """PLANT: migrated files git would refuse to add by name — one matched by an ignore
+    rule, one whose name starts with `:` (pathspec magic).
+
+    Path-scoped `git add -- <path>` exits 1 for an ignored path and 128 for `:notes.md`.
+    On the create path that rolled the store back and left the content in the public
+    checkout, so every re-run failed identically while the preflight kept blocking
+    service start on the leak. `git rm --cached -- :notes.md` in the checkout failed the
+    same way, but only after the hub commit — so a resume found the copy identical and
+    failed at that line again. Both paths, both names, are asserted here.
+
+    The ignore rule comes from an isolated global config — a `core.excludesFile` — which
+    is the case a checkout-level `.gitignore` check would never see.
+    """
+
+    IGNORED = "private.local.md"
+    MAGIC = ":notes.md"
+
+    def setUp(self):
+        super().setUp()
+        excludes = self.root / "global-excludes"
+        excludes.write_text("*.local.md\n")
+        config = self.root / "global-gitconfig"
+        config.write_text(f"[core]\n\texcludesFile = {excludes}\n")
+        self.addCleanup(restore_env, "GIT_CONFIG_GLOBAL", os.environ.get("GIT_CONFIG_GLOBAL"))
+        os.environ["GIT_CONFIG_GLOBAL"] = str(config)
+
+    def plant(self) -> None:
+        (self.source / self.IGNORED).write_text("ignored hub content\n")
+        self.track(self.MAGIC, "magic-named hub content\n")  # in the checkout's index too
+
+    def assert_moved(self, result) -> None:
+        self.assertEqual(sorted(result.migrated), sorted([self.IGNORED, self.MAGIC]))
+        self.assertEqual(result.migration_commits, 2)
+        self.assertLessEqual({self.IGNORED, self.MAGIC}, self.committed())
+        self.assertEqual((self.hub / self.MAGIC).read_text(), "magic-named hub content\n")
+        self.assertFalse((self.source / self.IGNORED).exists())
+        self.assertFalse((self.source / self.MAGIC).exists())
+        self.assertNotIn(f"hubs/{self.MAGIC}", self.indexed())
+        self.assertEqual(git("-C", str(self.hub), "status", "--porcelain"), "")
+
+    def test_the_ignore_rule_really_applies(self):
+        # without this the class could pass against a config git never read
+        probe = subprocess.run(
+            ["git", "-C", str(self.checkout), "check-ignore", "-q", f"hubs/{self.IGNORED}"]
+        )
+        self.assertEqual(probe.returncode, 0)
+
+    def test_the_create_path_moves_both(self):
+        self.plant()
+        result = self.init()
+        self.assertEqual(result.status, "created")
+        self.assert_moved(result)
+
+    def test_the_resume_path_moves_both(self):
+        self.init()
+        self.plant()
+        result = self.init()
+        self.assertEqual(result.status, "resumed")
+        self.assert_moved(result)
+
+
 class TestGitCallsAreBounded(HubTempCase):
     """PLANT: a git that never returns — the ExecStartPre hang that ends in a failed unit.
 
@@ -701,13 +763,17 @@ class TestFailedMigrationCommitAfterTheSeedLanded(HubTempCase):
         self.shim = self.root / "migration-commit-fails-git"
         self.shim.write_text(
             "#!/bin/sh\n"
-            'is_commit=""; names_migrated=""\n'
+            # the repo is whatever follows `-C`, not a fixed position: global options
+            # such as `--literal-pathspecs` come before it
+            'is_commit=""; names_migrated=""; repo=""; prev=""\n'
             'for a in "$@"; do\n'
+            '  [ "$prev" = -C ] && repo="$a"\n'
             '  [ "$a" = commit ] && is_commit=1\n'
             '  [ "$a" = personal.md ] && names_migrated=1\n'
+            '  prev="$a"\n'
             "done\n"
             'if [ -n "$is_commit" ] && [ -n "$names_migrated" ]; then\n'
-            f'  "{real}" -C "$2" rev-list --count HEAD > "{self.seed_count}"\n'
+            f'  "{real}" -C "$repo" rev-list --count HEAD > "{self.seed_count}"\n'
             '  echo "fatal: injected migration-commit failure" >&2\n'
             "  exit 1\n"
             "fi\n"

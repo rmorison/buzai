@@ -99,6 +99,18 @@ GIT_TIMEOUT_SECONDS = 30.0
 # What `git()` reports when it had to kill git: the shell convention for "timed out".
 TIMEOUT_RETURNCODE = 124
 
+# Global git option for every call that names a migrated path. Those paths are owner
+# content this script enumerated file by file, so git must take each name as exactly that
+# name. Without it, a name starting with `:` is parsed as pathspec magic (`git add -- :x`
+# exits 128), and glob characters match patterns rather than the file. Paired with
+# `add -f` because a path matched by any ignore rule — a global `core.excludesFile`
+# included — made the add exit 1. Either one failed every run the same way: the create
+# path rolled back, the content stayed in the public checkout, and the preflight kept
+# blocking service start on it. (Before migration was path-scoped, `add -A` skipped an
+# ignored file silently and the checkout copy was then deleted: loss, not a wedge. `-f`
+# on the named path is what avoids both.)
+LITERAL_PATHSPECS = "--literal-pathspecs"
+
 INSTANCE_README = "README.md"
 MARKER = Path(".buzai") / "remote-expected"
 
@@ -582,12 +594,17 @@ def _commit_migrated(hub: Path, rel: str, message: str, git_bin: str) -> bool:
     single path, never a list. Every git call is path-scoped to it, so an unrelated
     staged change in the hub is not swept into a commit that names only this file.
 
+    Every call is `LITERAL_PATHSPECS`, and the add is `-f`: `rel` is a file this run chose
+    to move, by name, so neither an ignore rule nor pathspec magic in its name gets a say
+    in whether it moves. See `LITERAL_PATHSPECS` for what each used to do.
+
     "Nothing staged" is a skip, not an error: on a resume, the interrupted run may have
     committed this exact copy already, and committing it again would put a second, empty
     review item in front of the owner for content they have already been shown.
     """
-    git_ok(["-C", str(hub), "add", "--", rel], git_bin, f"git add {rel}")
-    staged = git(["-C", str(hub), "diff", "--cached", "--quiet", "--", rel], git_bin)
+    repo = [LITERAL_PATHSPECS, "-C", str(hub)]
+    git_ok([*repo, "add", "-f", "--", rel], git_bin, f"git add {rel}")
+    staged = git([*repo, "diff", "--cached", "--quiet", "--", rel], git_bin)
     if staged.returncode == 0:  # 0 = this copy is already committed
         return False
     if staged.returncode != 1:  # 1 = something to commit; anything else = git could not say
@@ -595,7 +612,7 @@ def _commit_migrated(hub: Path, rel: str, message: str, git_bin: str) -> bool:
             f"cannot tell whether {rel} is already committed in {hub}, so nothing was removed "
             f"from the checkout: {detail_of(staged)}"
         )
-    git_ok(["-C", str(hub), "commit", "-q", "-m", message, "--", rel], git_bin, f"git commit {rel}")
+    git_ok([*repo, "commit", "-q", "-m", message, "--", rel], git_bin, f"git commit {rel}")
     return True
 
 
@@ -641,12 +658,18 @@ def _unstage_migrated(source: Path, migrated: Iterable[str], git_bin: str) -> li
     staged = sorted({name for name in listed.stdout.split("\0") if name} & set(migrated))
     if not staged:
         return []
-    removed = git(["-C", str(source), "rm", "--cached", "-f", "-q", "--", *staged], git_bin)
+    # Literal for the same reason as `_commit_migrated`: a tracked `:notes.md` was refused
+    # here as pathspec magic AFTER the hub commit, so every re-run resumed, found the copy
+    # identical, and failed at this same line — the content stuck in the public index.
+    removed = git(
+        [LITERAL_PATHSPECS, "-C", str(source), "rm", "--cached", "-f", "-q", "--", *staged],
+        git_bin,
+    )
     if removed.returncode != 0:
         raise HubInitError(
             "the hub repo was created and committed, but these files are still in the "
-            f"public checkout's git index — remove them by hand with `git -C {source} rm "
-            f"--cached -f -- {' '.join(staged)}`: {detail_of(removed)}"
+            f"public checkout's git index — remove them by hand with `git {LITERAL_PATHSPECS} "
+            f"-C {source} rm --cached -f -- {' '.join(staged)}`: {detail_of(removed)}"
         )
     return staged
 
