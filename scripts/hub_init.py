@@ -6,11 +6,16 @@ place that path is computed), `git init`s it, seeds the tracked scaffolds, write
 README describing *this instance's* store, moves any real hub markdown that is still
 sitting in the checkout out to the new repo, and commits.
 
-That last step is **two** commits, not one: a parentless seed holding scaffolding
-only, then a child commit holding whatever was migrated. `hub_review` keeps the seed
-out of the owner's review queue by detecting that it is parentless, so content folded
-into it would never be reviewable — and migrated content is the owner's own knowledge,
-which is precisely what the review loop exists to show them.
+That last step is **1 + N** commits: a parentless seed holding scaffolding only, then
+one child commit *per migrated file*. `hub_review` keeps the seed out of the owner's
+review queue by detecting that it is parentless, so content folded into it would never
+be reviewable — and migrated content is the owner's own knowledge, which is precisely
+what the review loop exists to show them. One commit per file, rather than one for the
+whole migration, because a review item is the unit the owner approves or rejects: a
+single commit naming no file read out as a bare subject with no what or why, and
+rejecting it removed the content of *every* migrated file at once. Each migration commit
+carries the `Changed:` / `Why:` lines and the one `hub-file:` trailer the review loop
+reads, in the shape `hub_commit.reconcile_message` established.
 
 It deliberately **stops before the remote**. Creating that repository is the single
 step where a wrong flag publishes the knowledge base, so it is never automated: the
@@ -116,10 +121,21 @@ SCAFFOLDS: frozenset[str] = frozenset({"README.md", "_example-hub.md"})
 # distinct source is the groundwork for retiring it, not a replacement made here.
 #
 # Nothing the owner should review is ever committed under this source. Migration — first
-# run or resumed — is a separate, non-root commit stamped `owner-directed`, because it
-# moves the owner's REAL hub content out of the public checkout, and content the owner
-# should see is content the owner should be able to review. See `migration_message`.
+# run or resumed — is one non-root commit per migrated file, stamped `owner-directed`,
+# because it moves the owner's REAL hub content out of the public checkout, and content
+# the owner should see is content the owner should be able to review — file by file, so
+# one verdict never lands on another file's content. See `migration_message`.
 BOOTSTRAP_SOURCE = "store-bootstrap"
+
+# The trailers the review loop reads off a hub commit, and the source migration carries.
+# `hub_commit` owns all three (`TRAILER_FILE`, `TRAILER_SOURCE`, `OWNER_DIRECTED`); they
+# are spelled again here only because importing them is a cycle — see `detail_of`. The
+# spellings are pinned together by a test, and the pin is load-bearing: a drifted
+# `hub-file` name would not error anywhere, it would just make every migration item read
+# out with no file and fall back to git's own path list on rejection.
+TRAILER_FILE = "hub-file"
+TRAILER_SOURCE = "instruction-source"
+MIGRATION_SOURCE = "owner-directed"
 
 
 class HubInitError(Exception):
@@ -141,6 +157,10 @@ class InitResult:
     migrated: list[str]
     commits: int
     remotes: list[str]
+    # Commits this run made for migrated files — one per file, except that a resume skips
+    # a file the interrupted run had already committed byte for byte. Reported separately
+    # from `commits` (all of HEAD) so `main` can say how many review items were just added.
+    migration_commits: int = 0
 
 
 # --- git plumbing ---------------------------------------------------------------
@@ -371,15 +391,10 @@ other than `~/hubs`, clone it there and set `{ENV_VAR}` in the service unit.
 """
 
 
-def _moved_list(migrated: Iterable[str]) -> str:
-    """The bullet list of migrated paths, as both migration messages render it. Pure."""
-    return "\n".join(f"  - {m}" for m in migrated)
-
-
 def commit_message() -> str:
     """SEED-commit message — scaffolding only. Pure.
 
-    Takes no migration, because the seed commit carries none: migrated content gets its
+    Takes no migration, because the seed commit carries none: each migrated file gets its
     own commit on top (`migration_message`). That split is not cosmetic. `hub_review`
     excludes the root commit from the review queue by detecting that it is parentless,
     so anything committed here is invisible to the owner forever — which is right for
@@ -393,38 +408,68 @@ def commit_message() -> str:
     return f"Initialize hub store\n\n{body}\n\ninstruction-source: {BOOTSTRAP_SOURCE}\n"
 
 
-def migration_message(migrated: Iterable[str]) -> str:
-    """Message for the commit that moves found content out of the checkout. Pure.
+def _one_file_message(subject: str, changed: str, why: str, rel: str) -> str:
+    """A single-file migration message in the shape the review loop reads. Pure.
+
+    Modelled on `hub_commit.reconcile_message`: `hub_review.build_change` fills the item's
+    what, why and file ONLY from the `Changed:` line, the `Why:` line and the `hub-file:`
+    trailer, so a message without them reads out as a bare subject — which is what the
+    old whole-migration commit did. Each of `changed` and `why` must stay on one line
+    (`body_field` reads one), and `changed` must carry no single quotes: `Change.section`
+    reads a quoted name there as the heading a rejection is scoped to.
+    """
+    return (
+        f"{subject}\n\n"
+        f"Changed: {changed}\n"
+        f"Why: {why}\n\n"
+        f"{TRAILER_FILE}: {rel}\n"
+        f"{TRAILER_SOURCE}: {MIGRATION_SOURCE}\n"
+    )
+
+
+# Why every migration commit exists, said once for both paths. It names the leak rather
+# than the mechanism, because the owner reads it on a phone to decide whether to keep the
+# file — and says why the file is its own item, so one verdict is visibly one file's.
+_MIGRATION_WHY = (
+    "it was sitting under the public checkout's hubs/ directory, one `git add` away from a "
+    "public remote, and personal hub content lives only in this private store. It is "
+    "committed on its own so it can be approved or rejected without touching any other "
+    "migrated file."
+)
+
+
+def migration_message(rel: str) -> str:
+    """Message for the commit that moves ONE found file out of the checkout. Pure.
 
     A CHILD of the seed, never part of it, and `owner-directed` rather than
     `BOOTSTRAP_SOURCE` — this is the owner's real knowledge being rescued from a public
     repo, and it is exactly the content review exists to show them. Both properties are
     load-bearing: `hub_review` drops the parentless commit, and drops nothing by source
-    except `owner-correction`.
+    except `owner-correction`. One file per message is load-bearing too: a rejection acts
+    on every file a commit names, so a shared commit made one "no" empty them all.
     """
-    moved = list(migrated)
-    return (
-        "Move existing hub content out of the public checkout\n\n"
-        f"`make hub-init` found {len(moved)} hub file(s) under the checkout's `hubs/` and "
-        "moved them into this private store:\n"
-        + _moved_list(moved)
-        + "\n\ninstruction-source: owner-directed\n"
+    return _one_file_message(
+        f"Move the {rel} hub out of the public checkout",
+        f"moved the hub file {rel} out of the public buzai checkout into this private "
+        "store during `make hub-init`.",
+        _MIGRATION_WHY,
+        rel,
     )
 
 
-def resume_message(migrated: Iterable[str]) -> str:
-    """Message for the commit that finishes an interrupted `make hub-init`. Pure.
+def resume_message(rel: str) -> str:
+    """Message for the commit that finishes an interrupted `make hub-init`, for ONE file. Pure.
 
-    Deliberately not `commit_message`: history should record that this content was
-    rescued from the public checkout by a resumed run, not that it was seeded.
+    Deliberately not `migration_message`: history should record that this content was
+    rescued from the public checkout by a resumed run, after an interruption left it
+    behind — which is the one thing that explains why it arrived later than the seed.
     """
-    moved = list(migrated)
-    return (
-        "Complete the interrupted hub migration\n\n"
-        f"Moved {len(moved)} hub file(s) that were still in the public checkout after an "
-        "interrupted `make hub-init`:\n"
-        + _moved_list(moved)
-        + "\n\ninstruction-source: owner-directed\n"
+    return _one_file_message(
+        f"Complete the interrupted migration of the {rel} hub",
+        f"moved the hub file {rel}, left in the public buzai checkout by an interrupted "
+        "`make hub-init`, into this private store.",
+        _MIGRATION_WHY,
+        rel,
     )
 
 
@@ -530,37 +575,50 @@ def _require_identity(hub: Path, git_bin: str) -> None:
         )
 
 
+def _commit_migrated(hub: Path, rel: str, message: str, git_bin: str) -> bool:
+    """Stage and commit ONE migrated path as its own commit. Returns whether it committed.
+
+    One commit per file is the whole point — see the module docstring — so this takes a
+    single path, never a list. Every git call is path-scoped to it, so an unrelated
+    staged change in the hub is not swept into a commit that names only this file.
+
+    "Nothing staged" is a skip, not an error: on a resume, the interrupted run may have
+    committed this exact copy already, and committing it again would put a second, empty
+    review item in front of the owner for content they have already been shown.
+    """
+    git_ok(["-C", str(hub), "add", "--", rel], git_bin, f"git add {rel}")
+    staged = git(["-C", str(hub), "diff", "--cached", "--quiet", "--", rel], git_bin)
+    if staged.returncode == 0:  # 0 = this copy is already committed
+        return False
+    if staged.returncode != 1:  # 1 = something to commit; anything else = git could not say
+        raise HubInitError(
+            f"cannot tell whether {rel} is already committed in {hub}, so nothing was removed "
+            f"from the checkout: {detail_of(staged)}"
+        )
+    git_ok(["-C", str(hub), "commit", "-q", "-m", message, "--", rel], git_bin, f"git commit {rel}")
+    return True
+
+
 def _resume(hub: Path, source: Path, migrate: list[str], git_bin: str) -> InitResult:
     """Finish an interrupted migration into an existing hub repo, or change nothing.
 
     The rollback the create path uses is *not* available here — the repo predates this
     run and wiping it would destroy the owner's knowledge base — so this does the least
-    it can: copy what is missing, commit only the migrated paths, and remove the
-    checkout's copies only after that commit. A failure part-way leaves the content in
-    both places, which the preflight then still reports as a leak and a later re-run
-    still resumes; nothing is ever lost.
+    it can: copy what is missing, commit each migrated path on its own, and remove the
+    checkout's copies only after EVERY one of those commits. A failure part-way leaves the
+    content in both places, which the preflight then still reports as a leak and a later
+    re-run still resumes — skipping the files already committed; nothing is ever lost.
     """
     if not migrate:
         return InitResult("exists", hub, [], [], commit_count(hub, git_bin), remotes(hub, git_bin))
     _require_identity(hub, git_bin)
+    # Every copy first, so a differing copy is refused before any commit is made.
     for rel in migrate:
         _copy_unless_identical(source, hub, rel)
-    git_ok(["-C", str(hub), "add", "--", *migrate], git_bin, "git add")
-    staged = git(["-C", str(hub), "diff", "--cached", "--quiet", "--", *migrate], git_bin)
-    if staged.returncode == 1:  # 1 = something to commit; 0 = the copies are already in
-        git_ok(
-            # Path-scoped, so an unrelated staged change in the hub is not swept in.
-            ["-C", str(hub), "commit", "-q", "-m", resume_message(migrate), "--", *migrate],
-            git_bin,
-            "git commit",
-        )
-    elif staged.returncode != 0:
-        raise HubInitError(
-            f"cannot tell what is staged in {hub}, so nothing was moved: {detail_of(staged)}"
-        )
+    made = sum(_commit_migrated(hub, rel, resume_message(rel), git_bin) for rel in migrate)
     _remove_migrated(source, migrate, git_bin)
     return InitResult(
-        "resumed", hub, [], migrate, commit_count(hub, git_bin), remotes(hub, git_bin)
+        "resumed", hub, [], migrate, commit_count(hub, git_bin), remotes(hub, git_bin), made
     )
 
 
@@ -673,28 +731,40 @@ def initialize(
         (hub / MARKER).write_text(render_marker(now))
         git_ok(["-C", str(hub), "add", "-A"], git_bin, "git add")
         git_ok(["-C", str(hub), "commit", "-q", "-m", commit_message()], git_bin, "git commit")
-        # Migration is a SECOND commit, deliberately. `hub_review` drops the parentless
+        # Migration is NOT part of the seed, deliberately. `hub_review` drops the parentless
         # commit from the review queue, so folding the owner's own content into the seed
         # would hide it from review permanently — the one class of content review exists
-        # for. Committing it as a child makes it reviewable like any other hub change,
-        # which is what the resume path has always done.
-        if migrate:
-            for rel in migrate:
-                _copy_into(source, hub, rel)
-            # Path-scoped, matching `_resume`: only the migrated paths are swept in.
-            git_ok(["-C", str(hub), "add", "--", *migrate], git_bin, "git add")
-            git_ok(
-                ["-C", str(hub), "commit", "-q", "-m", migration_message(migrate), "--", *migrate],
-                git_bin,
-                "git commit",
-            )
+        # for. And it is one commit PER FILE, not one for the lot: a rejection acts on
+        # every file its commit names, so a shared commit turned one "no" into emptying
+        # every migrated file. Each child is reviewable like any other hub change.
+        for rel in migrate:
+            _copy_into(source, hub, rel)
+        made = sum(_commit_migrated(hub, rel, migration_message(rel), git_bin) for rel in migrate)
     except Exception:
         _rollback(hub, existed)
         raise
 
+    # Only after every migration commit has landed: until then the checkout's copies are
+    # the owner's content, and the rollback above has just discarded the hub's.
     _remove_migrated(source, migrate, git_bin)
     return InitResult(
-        "created", hub, seed, migrate, commit_count(hub, git_bin), remotes(hub, git_bin)
+        "created", hub, seed, migrate, commit_count(hub, git_bin), remotes(hub, git_bin), made
+    )
+
+
+def migration_commits_line(made: int) -> str:
+    """How `main` reports the migration commits a run made. Pure.
+
+    Names the count and the review consequence together, because the count alone does not
+    tell the owner what to do next: each of these is its own item in `make hub-review`.
+    Zero is only reachable on a resume whose files were all committed before the
+    interruption, and saying so explains why the checkout was cleaned with no new commit.
+    """
+    if not made:
+        return "no new commit — every file was already committed before the interruption"
+    return (
+        f"{made} migration commit(s), one per migrated file — each is its own item in "
+        "`make hub-review`, approved or rejected on its own"
     )
 
 
@@ -726,6 +796,7 @@ def main(argv=None) -> int:
             f"  migrated: {len(result.migrated)} file(s) out of {SCAFFOLD_DIR}, from the "
             f"working tree AND the git index — {', '.join(result.migrated)}"
         )
+        print(f"  commit:   {migration_commits_line(result.migration_commits)}")
     else:
         print(
             f"hub-init: created the hub repo at {result.hub} on branch {DEFAULT_BRANCH} "
@@ -738,15 +809,12 @@ def main(argv=None) -> int:
                 f"working tree AND the git index — {', '.join(result.migrated)}"
             )
         print(f"  marker:   {MARKER} (creation timestamp; the durability check reads it)")
-        # Two commits, not "N initial commits": the seed is scaffolding that review skips,
-        # and the migration is the owner's own content, committed separately so it IS
-        # reviewed. Reporting them as one would hide the one the owner has to look at.
+        # Not "N initial commits": the seed is scaffolding that review skips, and each
+        # migration commit is one file of the owner's own content, committed separately so
+        # it IS reviewed. Reporting them as one would hide the ones the owner has to look at.
         print("  commit:   the seed commit (scaffolding only; review skips it)")
         if result.migrated:
-            print(
-                f"  commit:   a separate migration commit moving {len(result.migrated)} "
-                "file(s) — it will appear in `make hub-review`"
-            )
+            print(f"  commit:   {migration_commits_line(result.migration_commits)}")
 
     if result.remotes:
         print(f"hub-init: remote(s) configured: {', '.join(result.remotes)}")

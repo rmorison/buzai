@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
-from scripts import hub_init
+from scripts import hub_commit, hub_init
 from scripts.hub_init import (
     BOOTSTRAP_SOURCE,
     MARKER,
@@ -34,6 +34,7 @@ from scripts.hub_init import (
     tracked_paths,
 )
 from scripts.hub_init import git as git_call
+from scripts.hub_review import build_change
 
 NOW = datetime(2026, 8, 5, 12, 30, 0, tzinfo=UTC)
 NO_GIT = "buzai-definitely-not-a-git-binary"
@@ -308,17 +309,24 @@ class TestMigration(HubTempCase):
         self.assertIn("finance-and-tax.md", self.committed())
         self.assertIn("trip/notes.md", self.committed())
 
-    def test_migration_is_a_child_commit_not_the_parentless_seed(self):
-        # This test used to assert commits() == 1, which encoded the bug: hub_review
+    def migration_shas(self) -> list[str]:
+        """Every non-root commit, oldest first — on a fresh store, the migration commits."""
+        out = git("-C", str(self.hub), "rev-list", "--reverse", "--min-parents=1", "HEAD")
+        return out.split()
+
+    def test_migration_is_child_commits_not_the_parentless_seed(self):
+        # This test once asserted commits() == 1, which encoded the first bug: hub_review
         # excludes the parentless commit, so migrated content folded into the seed was
-        # invisible to review forever.
-        self.assertEqual(self.commits(), 2)
+        # invisible to review forever. It then asserted 2, which encoded the second: one
+        # commit for every migrated file. The shape is 1 + N.
+        self.assertEqual(self.commits(), 1 + len(self.result.migrated))
         roots = git("-C", str(self.hub), "rev-list", "--max-parents=0", "HEAD").split()
         self.assertEqual(roots, [self.root_sha()])
-        # HEAD is the migration, and its parent is the seed — the shape hub_review needs.
-        head = git("-C", str(self.hub), "rev-parse", "HEAD").strip()
-        self.assertNotEqual(head, self.root_sha())
-        self.assertEqual(git("-C", str(self.hub), "rev-parse", "HEAD^").strip(), self.root_sha())
+        # the first migration commit's parent is the seed — the shape hub_review needs
+        first = self.migration_shas()[0]
+        self.assertEqual(
+            git("-C", str(self.hub), "rev-parse", f"{first}^").strip(), self.root_sha()
+        )
 
     def test_the_seed_commit_holds_no_migrated_content(self):
         seeded = git("-C", str(self.hub), "ls-tree", "-r", "--name-only", self.root_sha())
@@ -326,14 +334,34 @@ class TestMigration(HubTempCase):
         self.assertNotIn("trip/notes.md", seeded)
         self.assertIn("_example-hub.md", seeded)
 
-    def test_the_migration_commit_is_reviewable_by_source(self):
-        body = git("-C", str(self.hub), "log", "-1", "--pretty=%B")
-        self.assertIn("instruction-source: owner-directed", body)
-        self.assertNotIn(BOOTSTRAP_SOURCE, body)
+    def test_every_migration_commit_is_reviewable_by_source(self):
+        for sha in self.migration_shas():
+            body = git("-C", str(self.hub), "log", "-1", "--pretty=%B", sha)
+            self.assertIn("instruction-source: owner-directed", body)
+            self.assertNotIn(BOOTSTRAP_SOURCE, body)
 
-    def test_commit_message_names_what_moved(self):
-        body = git("-C", str(self.hub), "log", "-1", "--pretty=%B")
-        self.assertIn("finance-and-tax.md", body)
+    def test_each_migrated_file_is_exactly_one_commit_that_names_it(self):
+        """PLANT: two migrated files, one of them nested.
+
+        One commit for the whole migration read out in review as a bare subject — no
+        what, no why, no file — and rejecting it emptied every migrated file at once. Each
+        file is now its own commit, touching only that file and saying so in the
+        `Changed:` / `Why:` lines and the one `hub-file:` trailer the review loop reads.
+        """
+        shas = self.migration_shas()
+        self.assertEqual(len(shas), 2)
+        for sha, rel in zip(shas, ["finance-and-tax.md", "trip/notes.md"], strict=True):
+            touched = git("-C", str(self.hub), "show", "--name-only", "--format=", sha).split()
+            self.assertEqual(touched, [rel])
+            body = git("-C", str(self.hub), "log", "-1", "--pretty=%B", sha)
+            self.assertIn(f"Changed: moved the hub file {rel} ", body)
+            self.assertIn("Why: ", body)
+            self.assertEqual(body.count("hub-file: "), 1, body)
+            self.assertIn(f"hub-file: {rel}\n", body)
+
+    def test_the_result_counts_one_migration_commit_per_file(self):
+        self.assertEqual(self.result.migration_commits, 2)
+        self.assertEqual(self.result.commits, 3)
 
 
 class TestCommittedContentMigration(HubTempCase):
@@ -457,6 +485,69 @@ class TestResumeAfterInterruptedRemoval(HubTempCase):
         self.assertIn("differs", str(raised.exception))
         self.assertTrue(self.leak.exists())
         self.assertEqual((self.hub / "finance-and-tax.md").read_text(), "real hub content\n")
+
+
+class TestResumeCommitsEachFileOnItsOwn(HubTempCase):
+    """PLANT: an interrupted run that had committed ONE file's copy, with a second left.
+
+    The per-path staged check is what keeps a resume from re-committing the first file —
+    which would put a second, empty-diff review item in front of the owner — while still
+    giving the second file its own commit, naming only it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        (self.source / "finance-and-tax.md").write_text("real hub content\n")
+        self.init()  # seed + finance-and-tax.md's migration commit
+        (self.source / "finance-and-tax.md").write_text("real hub content\n")  # not removed
+        (self.source / "trip").mkdir()
+        (self.source / "trip" / "notes.md").write_text("folder hub content\n")
+        self.result = self.init()
+
+    def test_only_the_file_not_yet_committed_gets_a_commit(self):
+        self.assertEqual(self.result.status, "resumed")
+        self.assertEqual(self.result.migrated, ["finance-and-tax.md", "trip/notes.md"])
+        self.assertEqual(self.result.migration_commits, 1)
+        self.assertEqual(self.commits(), 3)
+
+    def test_that_commit_names_and_touches_only_its_file(self):
+        touched = git("-C", str(self.hub), "show", "--name-only", "--format=", "HEAD").split()
+        self.assertEqual(touched, ["trip/notes.md"])
+        body = git("-C", str(self.hub), "log", "-1", "--pretty=%B")
+        self.assertIn("interrupted", body)
+        self.assertEqual(body.count("hub-file: "), 1, body)
+        self.assertIn("hub-file: trip/notes.md\n", body)
+
+    def test_the_checkout_is_cleaned_of_both(self):
+        self.assertFalse((self.source / "finance-and-tax.md").exists())
+        self.assertFalse((self.source / "trip").exists())
+
+
+class TestResumeWithSeveralFilesLeft(HubTempCase):
+    """PLANT: an interrupted run that committed none of the files it had to move.
+
+    The companion to `TestResumeCommitsEachFileOnItsOwn`, whose fixture leaves only one
+    file needing a commit — where one commit for "all of them" is indistinguishable from
+    one per file. Here both files need one, so a resume that lumps them together fails.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.init()  # the interrupted run: seed only
+        (self.source / "finance-and-tax.md").write_text("real hub content\n")
+        (self.source / "trip").mkdir()
+        (self.source / "trip" / "notes.md").write_text("folder hub content\n")
+        self.result = self.init()
+
+    def test_each_file_gets_its_own_commit_naming_only_it(self):
+        self.assertEqual(self.result.migration_commits, 2)
+        self.assertEqual(self.commits(), 3)
+        for rev, rel in (("HEAD~1", "finance-and-tax.md"), ("HEAD", "trip/notes.md")):
+            touched = git("-C", str(self.hub), "show", "--name-only", "--format=", rev).split()
+            self.assertEqual(touched, [rel])
+            body = git("-C", str(self.hub), "log", "-1", "--pretty=%B", rev)
+            self.assertEqual(body.count("hub-file: "), 1, body)
+            self.assertIn(f"hub-file: {rel}\n", body)
 
 
 class TestResumeTakesTrackedContentOutOfTheIndex(HubTempCase):
@@ -629,8 +720,10 @@ class TestFailedMigrationCommitAfterTheSeedLanded(HubTempCase):
             self.init(git_bin=str(self.shim))
 
         self.assertIn("injected migration-commit failure", str(raised.exception))
-        # the seed had committed when the migration commit was refused
-        self.assertEqual(self.seed_count.read_text().strip(), "1")
+        # The seed AND the first file's migration commit (finance-and-tax.md sorts first)
+        # had landed when the second file's commit was refused — so the rollback is proven
+        # to discard landed migration commits too, not only the seed.
+        self.assertEqual(self.seed_count.read_text().strip(), "2")
         # the half-built repo is gone, so the next run creates rather than resumes
         self.assertFalse(self.hub.exists())
         # the owner's content is still where it was: on disk and in the public index
@@ -646,10 +739,10 @@ class TestFailedMigrationCommitAfterTheSeedLanded(HubTempCase):
 
         self.assertEqual(result.status, "created")
         self.assertEqual(result.migrated, ["finance-and-tax.md", "personal.md"])
-        self.assertEqual(self.commits(), 2)
+        self.assertEqual(self.commits(), 3)  # the seed + one migration commit per file
         root = git("-C", str(self.hub), "rev-list", "--max-parents=0", "HEAD").strip()
-        self.assertEqual(git("-C", str(self.hub), "rev-parse", "HEAD^").strip(), root)
-        # the migrated content lives in the child commit, not in the seed review skips
+        self.assertEqual(git("-C", str(self.hub), "rev-parse", "HEAD~2").strip(), root)
+        # the migrated content lives in the child commits, not in the seed review skips
         self.assertLessEqual({"finance-and-tax.md", "personal.md"}, self.committed())
         seeded = git("-C", str(self.hub), "ls-tree", "-r", "--name-only", root).split()
         self.assertNotIn("personal.md", seeded)
@@ -676,10 +769,24 @@ class TestCommitMessage(unittest.TestCase):
         # The seed commit carries scaffolding only; migration is its own commit.
         self.assertNotIn("moved", commit_message().casefold())
 
-    def test_migration_is_listed_in_its_own_message(self):
-        message = migration_message(["finance-and-tax.md"])
-        self.assertIn("1 hub file(s)", message)
-        self.assertIn("finance-and-tax.md", message)
+    def test_a_migration_message_names_its_one_file_in_every_place_review_reads(self):
+        for render in (migration_message, resume_message):
+            message = render("trip/notes.md")
+            change = build_change("0" * 40, NOW.isoformat(), "buzai tests", message)
+            self.assertIn("trip/notes.md", change.subject)
+            self.assertIn("trip/notes.md", change.changed)
+            self.assertTrue(change.why)
+            self.assertEqual(change.files, ("trip/notes.md",))
+            self.assertEqual(change.source, "owner-directed")
+            # a quoted name in `Changed:` is read as the heading a rejection is scoped to
+            self.assertIsNone(change.section)
+
+    def test_the_trailer_spellings_are_the_ones_the_write_path_owns(self):
+        # Spelled twice only because importing them is a cycle; a drift would not error,
+        # it would silently strip every migration item of its file.
+        self.assertEqual(hub_init.TRAILER_FILE, hub_commit.TRAILER_FILE)
+        self.assertEqual(hub_init.TRAILER_SOURCE, hub_commit.TRAILER_SOURCE)
+        self.assertEqual(hub_init.MIGRATION_SOURCE, hub_commit.OWNER_DIRECTED)
 
 
 class TestMarkerRejectsANaiveTimestamp(unittest.TestCase):
@@ -838,18 +945,30 @@ class TestMainReportsTheCommitsItMade(HubTempCase):
         self.assertEqual(rc, 0)
         return out.getvalue()
 
-    def test_a_first_run_with_migration_reports_both_commits(self):
+    def test_a_first_run_with_migration_reports_one_commit_per_file(self):
+        (self.source / "finance-and-tax.md").write_text("real hub content\n")
+        (self.source / "trip").mkdir()
+        (self.source / "trip" / "notes.md").write_text("folder hub content\n")
+
+        out = self.run_main()
+
+        self.assertEqual(self.commits(), 3)  # the history the output has to describe
+        # the exact old phrasing; the owner instructions legitimately say "initial commit"
+        self.assertNotIn("3 initial commit", out)
+        self.assertIn("(3 commit(s))", out)
+        self.assertIn("the seed commit", out)
+        self.assertIn("2 migration commit(s), one per migrated file", out)
+        self.assertNotIn("a separate migration commit", out)  # the single-commit claim
+        self.assertIn("make hub-review", out)
+
+    def test_a_resumed_run_reports_the_commits_it_made(self):
+        self.init()
         (self.source / "finance-and-tax.md").write_text("real hub content\n")
 
         out = self.run_main()
 
-        self.assertEqual(self.commits(), 2)  # the history the output has to describe
-        # the exact old phrasing; the owner instructions legitimately say "initial commit"
-        self.assertNotIn("2 initial commit", out)
-        self.assertIn("(2 commit(s))", out)
-        self.assertIn("the seed commit", out)
-        self.assertIn("migration commit moving 1 file(s)", out)
-        self.assertIn("make hub-review", out)
+        self.assertIn("completed it (2 commit(s))", out)
+        self.assertIn("1 migration commit(s), one per migrated file", out)
 
     def test_a_first_run_without_migration_reports_only_the_seed(self):
         out = self.run_main()

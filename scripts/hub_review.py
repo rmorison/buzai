@@ -462,7 +462,8 @@ def reviewable(change: Change, roots: Collection[str] = ()) -> bool:
         fresh instance asks its owner to review is the scaffolding. Identifying it by
         being parentless rather than by its subject means nothing has to match on prose.
         It excludes the seed and *only* the seed: `hub_init` commits content migrated out
-        of the public checkout as a child of it, exactly so this stays true.
+        of the public checkout as children of it — one per file, each naming its file —
+        exactly so this stays true and each migrated file is its own verdict.
 
     `roots` is passed in rather than read from git so this stays pure; `root_commits()`
     is the reader.

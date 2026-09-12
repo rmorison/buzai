@@ -33,7 +33,7 @@ from scripts.hub_commit import (
 from scripts.hub_commit import detail_of as commit_detail_of
 from scripts.hub_init import BOOTSTRAP_SOURCE
 from scripts.hub_init import commit_message as hub_init_commit_message
-from scripts.hub_init import migration_message as hub_init_migration_message
+from scripts.hub_init import initialize as hub_init_initialize
 from scripts.hub_remote import INDETERMINATE, LOCAL_ONLY, PRIVATE, GitResult, Verification
 from scripts.hub_remote import default_git_runner as real_git
 from scripts.hub_review import (
@@ -1100,20 +1100,6 @@ class TestTheHubInitSeedIsNotAReviewItem(ReviewRepoCase):
         self.assertFalse(reviewable(find_change(self.hub, self.seed), root_commits(self.hub)))
         self.assertEqual(root_commits(self.hub), frozenset({self.seed}))
 
-    def test_content_hub_init_migrated_is_still_reviewable(self):
-        """The other half of the exclusion: it must drop the seed and nothing else.
-
-        `hub_init` used to fold content migrated out of the public checkout INTO the seed
-        commit, so this exclusion hid the owner's own knowledge from review permanently —
-        the one class of content the loop exists for. `hub_init` now commits a migration
-        as a CHILD of the seed; this is the assertion that pins why.
-        """
-        git("-C", str(self.hub), "commit", "-q", "--allow-empty", "-m",
-            hub_init_migration_message(["finance-and-tax.md"]))
-        moved = git("-C", str(self.hub), "rev-parse", "HEAD").strip()
-        self.assertNotIn(moved, root_commits(self.hub))
-        self.assertTrue(reviewable(find_change(self.hub, moved), root_commits(self.hub)))
-
     def test_the_owner_is_never_asked_to_review_the_bootstrap(self):
         out = io.StringIO()
         with redirect_stdout(out):
@@ -1124,6 +1110,100 @@ class TestTheHubInitSeedIsNotAReviewItem(ReviewRepoCase):
 
     def test_recorded_knowledge_is_still_reviewed(self):
         self.assertEqual([c.sha for c in self.pending()], [self.fact])
+
+
+class TestHubInitMigrationIsReviewedOneFileAtATime(unittest.TestCase):
+    """The REAL `hub_init.initialize()` output, run through this module — not a synthetic
+    commit shaped like one.
+
+    Two defects lived in the gap between the two modules, and a hand-made `--allow-empty`
+    commit could show neither. `hub_init` migrated every file in ONE commit whose message
+    had no `Changed:` line, no `Why:` line and no `hub-file:` trailer, and `build_change`
+    fills an item's what, why and files from exactly those — so the owner was shown a bare
+    subject. And a rejection acts on every file its commit touched, so one "no" emptied
+    every migrated file, after `hub_init` had already deleted the checkout copies.
+
+    PLANT: two migrated files, one nested in a folder hub.
+    """
+
+    FINANCE = "# Finance\n\n- the accountant is Dana Reyes\n"
+    NOTES = "# Trip\n\n- the ferry leaves at 07:40\n"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        source = root / "checkout" / "hubs"
+        (source / "trip").mkdir(parents=True)
+        (source / "README.md").write_text("# Hubs — scaffolds live here\n")
+        (source / "_example-hub.md").write_text("# <Domain> hub\n")
+        (source / "finance-and-tax.md").write_text(self.FINANCE)
+        (source / "trip" / "notes.md").write_text(self.NOTES)
+        self.hub = root / "hubs"
+        self.result = hub_init_initialize(self.hub, source, NOW)
+        self.roots = root_commits(self.hub)
+
+    def pending(self) -> list[Change]:
+        noted = disposed_shas(self.hub)
+        return [
+            c for c in read_changes(self.hub) if reviewable(c, self.roots) and c.sha not in noted
+        ]
+
+    def item_for(self, rel: str) -> Change:
+        return next(c for c in self.pending() if c.named_files == (rel,))
+
+    def test_the_store_is_the_seed_plus_one_commit_per_migrated_file(self):
+        self.assertEqual(self.result.migrated, ["finance-and-tax.md", "trip/notes.md"])
+        count = int(git("-C", str(self.hub), "rev-list", "--count", "HEAD").strip())
+        self.assertEqual(count, 1 + len(self.result.migrated))
+
+    def test_the_seed_is_still_excluded(self):
+        self.assertEqual(len(self.roots), 1)
+        (seed,) = self.roots
+        self.assertFalse(reviewable(find_change(self.hub, seed), self.roots))
+        self.assertNotIn(seed, [c.sha for c in self.pending()])
+
+    def test_one_pending_item_per_migrated_file_each_naming_only_its_file(self):
+        self.assertEqual(
+            sorted(c.named_files for c in self.pending()),
+            [("finance-and-tax.md",), ("trip/notes.md",)],
+        )
+
+    def test_each_item_carries_what_and_why_and_its_source(self):
+        for rel in ("finance-and-tax.md", "trip/notes.md"):
+            change = self.item_for(rel)
+            self.assertIn(rel, change.changed)
+            self.assertIn("public", change.why)
+            self.assertEqual(change.source, OWNER_DIRECTED)
+
+    def test_the_plain_language_read_out_names_the_file_and_the_what_and_why(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            run_list(self.hub, 10, NOW)
+        text = out.getvalue()
+        self.assertIn("2 change(s) awaiting review", text)
+        self.assertNotIn("Initialize hub store", text)
+        for rel in ("finance-and-tax.md", "trip/notes.md"):
+            self.assertIn(f"file: {rel}", text)
+        self.assertEqual(text.count("what:"), 2, text)
+        self.assertEqual(text.count("why:"), 2, text)
+
+    def test_rejecting_one_migrated_file_leaves_the_other_intact(self):
+        notes_before = (self.hub / "trip" / "notes.md").read_bytes()
+
+        result = dispose(
+            self.hub,
+            Decision(self.item_for("finance-and-tax.md").sha, REJECTED, reason="not mine"),
+            now=NOW,
+            push=False,
+        )
+
+        self.assertEqual(result.status, RECORDED, result.detail)
+        self.assertEqual(result.resolution, REMOVED)
+        self.assertNotIn("Dana Reyes", (self.hub / "finance-and-tax.md").read_text())
+        self.assertEqual((self.hub / "trip" / "notes.md").read_bytes(), notes_before)
+        # and the other file is still awaiting its own verdict
+        self.assertEqual([c.named_files for c in self.pending()], [("trip/notes.md",)])
 
 
 class MultiLineEntryCase(ReviewRepoCase):
