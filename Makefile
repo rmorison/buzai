@@ -139,8 +139,13 @@ env-url: ## Print the owner-equivalent reconnect deep-link (TTY only — refuses
 auth: ## Interactive Claude.ai subscription login — pick "1. Claude account with subscription"
 	claude
 
-prime-consent: ## One-time Remote Control consent — answer "y", then spawn mode "1"
-	claude remote-control --name $(NAME)
+# `--spawn=same-dir` is passed for the same reason the unit passes it: it is the mode the
+# service runs in, and supplying it here removes an interactive prompt the service never
+# sees. That prompt is not harmless — the TUI reads it in raw mode, so a stray Ctrl-C
+# arrives as a literal byte instead of SIGINT and the priming step wedges, which is how a
+# real install lost it. The "Enable Remote Control?" consent has no flag and still stands.
+prime-consent: ## One-time Remote Control consent — answer "y" (the only prompt left)
+	claude remote-control --name $(NAME) --spawn=same-dir
 
 # --- dev ----------------------------------------------------------------------
 

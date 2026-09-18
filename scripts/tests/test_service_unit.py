@@ -164,6 +164,54 @@ class TestOnlyTheUnitExcusesAMissingStore(unittest.TestCase):
         self.assertTrue(remote_parser().parse_args([SERVICE_FLAG]).if_initialized)
 
 
+class TestPrimingRunsTheModeTheServiceRuns(unittest.TestCase):
+    """`make prime-consent` exists to answer prompts the headless service cannot. It ran
+    `claude remote-control --name <NAME>` with no `--spawn`, so it stopped at a spawn-mode
+    prompt the service never sees — the unit has always passed `--spawn=same-dir`, and
+    SETUP said so while still telling the owner to answer the prompt by hand.
+
+    Observed on a real install: the TUI reads that prompt in raw mode, so Ctrl-C arrives as
+    a literal byte instead of SIGINT. The priming step wedged, survived `kill %1` (SIGTERM
+    cannot be delivered to a job stopped by Ctrl-Z), and had to be SIGKILLed.
+
+    The consent itself has no flag and is still answered by hand — that is the one thing
+    this step is for.
+    """
+
+    SPAWN_FLAG = "--spawn=same-dir"
+
+    def recipe(self) -> str:
+        return " ".join(make_recipe("prime-consent"))
+
+    def test_priming_passes_the_spawn_mode(self):
+        self.assertIn(self.SPAWN_FLAG, self.recipe())
+
+    def test_it_is_the_same_mode_the_unit_runs(self):
+        # the point is parity: priming in one mode and serving in another would prime
+        # the wrong project state
+        (exec_start,) = directives("ExecStart")
+        self.assertIn(self.SPAWN_FLAG, exec_start)
+
+    def test_priming_still_runs_remote_control_under_the_configured_name(self):
+        recipe = self.recipe()
+        self.assertIn("claude remote-control", recipe)
+        self.assertIn("--name", recipe)
+
+    def test_no_doc_still_tells_the_owner_to_answer_the_spawn_prompt(self):
+        # the instruction outlived the prompt once already; these are the three places
+        # that carried it
+        for path in (
+            REPO_ROOT / "docs" / "SETUP.md",
+            REPO_ROOT / "docs" / "QUICKSTART.md",
+            REPO_ROOT / "docs" / "TROUBLESHOOTING.md",
+            REPO_ROOT / "install.sh",
+        ):
+            text = path.read_text()
+            self.assertNotIn("Spawn mode for this project", text, path.name)
+            self.assertNotIn("Spawn mode 1", text, path.name)
+            self.assertNotIn("spawn mode\n   **1**", text, path.name)
+
+
 class TestTheUnitOnlyNamesThingsThatExist(unittest.TestCase):
     """A string match in the template proves nothing on its own — these calls have to be
     real. A renamed flag would otherwise leave the unit silently doing nothing again."""

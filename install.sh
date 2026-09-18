@@ -370,8 +370,7 @@ any machine), then classify them for the trust gate: docs/SETUP.md §4 and
 without them the service runs but silently never registers (the #1 trap):
 
     make prime-consent
-      \"Enable Remote Control? (y/n)\"      -> y
-      \"Spawn mode for this project [1/2]\" -> 1   (same-dir)
+      \"Enable Remote Control? (y/n)\"      -> y   (the only prompt)
 
 Confirm the session appears at claude.ai/code (same account), then exit with
 Ctrl-D Ctrl-D. Details: docs/SETUP.md §6."

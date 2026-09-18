@@ -15,7 +15,7 @@ make liveness    # just the LIVE / NOT-LIVE probe
 Almost always one of two things — the service is `active` but **silently never registered**:
 
 1. **You skipped the one-time interactive consent.** `claude remote-control` has first-run
-   prompts ("Enable Remote Control? y", "Spawn mode 1") that a headless service can't
+   prompt ("Enable Remote Control? y") that a headless service can't
    answer, so it starts but never registers. Fix: run it once by hand and answer them, then
    restart the service (this is [`SETUP.md`](SETUP.md) §6):
 

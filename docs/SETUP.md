@@ -321,16 +321,18 @@ unit needs **no** `EnvironmentFile` — leave those lines commented (their defau
 > user and answer both prompts:
 >
 > ```bash
-> make prime-consent                          # runs `claude remote-control --name <NAME>`
-> #   "Enable Remote Control? (y/n)"  -> y
-> #   "Spawn mode for this project [1/2]" -> 1   (same-dir)
+> make prime-consent            # `claude remote-control --name <NAME> --spawn=same-dir`
+> #   "Enable Remote Control? (y/n)"  -> y      <- the only prompt
 > #   then confirm "buzai-assistant" shows up at claude.ai/code (or mobile Code tab),
 > #   and exit with Ctrl-D Ctrl-D  (claude exits on EOF/Ctrl-C, not SIGTERM)
 > ```
 >
-> These choices persist per-project (`~/buzai`). The unit passes `--spawn=same-dir`, so
-> after this only the one-time **"Enable Remote Control?"** consent matters (it has no
-> CLI flag to skip). Requires full-scope subscription auth from §3 — an inference-only
+> The consent persists per-project (`~/buzai`). Only the one-time **"Enable Remote
+> Control?"** consent needs answering — it has no CLI flag to skip. The spawn mode does
+> have one, and the target passes it, matching what the unit runs: a prompt the service
+> never sees should not stand between you and the service. (It was worse than a
+> keystroke — the TUI reads that prompt in raw mode, so a stray Ctrl-C arrives as a
+> literal byte rather than SIGINT, and the priming step wedges.) Requires full-scope subscription auth from §3 — an inference-only
 > `setup-token` runs interactive sessions but **cannot register** the remote session.
 
 **Then install and enable the unit:**
