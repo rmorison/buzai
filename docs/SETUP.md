@@ -321,7 +321,7 @@ unit needs **no** `EnvironmentFile` — leave those lines commented (their defau
 > user and answer both prompts:
 >
 > ```bash
-> make prime-consent            # `claude remote-control --name <NAME> --spawn=same-dir`
+> make prime-consent      # `claude remote-control --name <NAME> --spawn=same-dir --permission-mode auto`
 > #   "Enable Remote Control? (y/n)"  -> y      <- the only prompt
 > #   then confirm "buzai-assistant" shows up at claude.ai/code (or mobile Code tab),
 > #   and exit with Ctrl-D Ctrl-D  (claude exits on EOF/Ctrl-C, not SIGTERM)
@@ -352,7 +352,7 @@ detail + the local-MCP secrets path: `deploy/README.md`.
 **Quick / local / non-Linux** alternative — run it in the foreground and watch output:
 
 ```bash
-claude remote-control --name buzai-assistant
+claude remote-control --name buzai-assistant --spawn=same-dir --permission-mode auto
 ```
 
 (Foreground is fine for a quick test, but it stops when your shell closes; use the

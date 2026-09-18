@@ -145,7 +145,7 @@ auth: ## Interactive Claude.ai subscription login — pick "1. Claude account wi
 # arrives as a literal byte instead of SIGINT and the priming step wedges, which is how a
 # real install lost it. The "Enable Remote Control?" consent has no flag and still stands.
 prime-consent: ## One-time Remote Control consent — answer "y" (the only prompt left)
-	claude remote-control --name $(NAME) --spawn=same-dir
+	claude remote-control --name $(NAME) --spawn=same-dir --permission-mode auto
 
 # --- dev ----------------------------------------------------------------------
 

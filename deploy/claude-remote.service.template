@@ -93,7 +93,14 @@ TimeoutStartSec=600s
 # [1/2]" prompt can never block a headless start. (The other first-run prompt,
 # "Enable Remote Control? (y/n)", has no flag — prime it once interactively per
 # SETUP §6 before enabling this unit, or the service starts but never registers.)
-ExecStart=%h/.local/bin/claude remote-control --name buzai-assistant --spawn=same-dir
+# `--permission-mode auto` is pinned rather than inherited. The account plan decides the
+# default (auto on Pro/Max/Team, `default` — i.e. manual approval — elsewhere), so an
+# unpinned unit behaves differently for different adopters, and an always-on assistant that
+# falls back to manual stalls on routine calls with nobody watching to approve them. This
+# does NOT weaken the gate: PreToolUse hooks run BEFORE any permission-mode check, in every
+# mode, and a hook's `deny` holds even under --dangerously-skip-permissions. The mode only
+# decides what happens to calls the gate already allowed.
+ExecStart=%h/.local/bin/claude remote-control --name buzai-assistant --spawn=same-dir --permission-mode auto
 
 # The "retried at service start" guarantee, actually wired. A push can fail for hours —
 # an expired deploy key or token, an offline box — and the commit is then durable locally

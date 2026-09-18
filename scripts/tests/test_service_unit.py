@@ -212,6 +212,44 @@ class TestPrimingRunsTheModeTheServiceRuns(unittest.TestCase):
             self.assertNotIn("spawn mode\n   **1**", text, path.name)
 
 
+class TestTheUnitPinsThePermissionMode(unittest.TestCase):
+    """The mode spawned sessions run in is pinned, not inherited.
+
+    The account plan decides the default — auto on Pro/Max/Team, `default` (manual
+    approval) elsewhere — so an unpinned unit gives different adopters different
+    behaviour, and an always-on assistant that falls back to manual stalls on routine
+    calls with nobody watching to approve them.
+
+    Pinning does not weaken the gate, which is why `auto` is safe to pin: PreToolUse
+    hooks run BEFORE any permission-mode check, in every mode, and a hook returning
+    `deny` holds even under --dangerously-skip-permissions. The mode only decides what
+    happens to calls the gate already allowed.
+    """
+
+    MODE_FLAG = "--permission-mode auto"
+
+    def test_the_unit_pins_it(self):
+        (exec_start,) = directives("ExecStart")
+        self.assertIn(self.MODE_FLAG, exec_start)
+
+    def test_priming_spawns_in_the_same_mode_it_will_serve_in(self):
+        # priming that spawns under different rules primes the wrong project state
+        self.assertIn(self.MODE_FLAG, " ".join(make_recipe("prime-consent")))
+
+    def test_the_mode_is_one_claude_accepts(self):
+        # `claude remote-control --help`: acceptEdits, auto, bypassPermissions,
+        # default, dontAsk, plan
+        mode = self.MODE_FLAG.split()[-1]
+        self.assertIn(
+            mode, {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}
+        )
+
+    def test_the_unit_does_not_skip_permissions_wholesale(self):
+        # the gate would still hold, but a unit that ships this is indefensible
+        (exec_start,) = directives("ExecStart")
+        self.assertNotIn("--dangerously-skip-permissions", exec_start)
+
+
 class TestTheUnitOnlyNamesThingsThatExist(unittest.TestCase):
     """A string match in the template proves nothing on its own — these calls have to be
     real. A renamed flag would otherwise leave the unit silently doing nothing again."""
