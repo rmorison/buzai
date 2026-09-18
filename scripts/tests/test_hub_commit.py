@@ -192,7 +192,7 @@ class HubRepoCase(unittest.TestCase):
     SEED = "# Notes\n\n- seeded fact\n"
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self._tmp.name)
         self.hub = self.root / "hubs"
         self.hub.mkdir()

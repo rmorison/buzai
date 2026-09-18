@@ -133,7 +133,7 @@ class HubTempCase(unittest.TestCase):
     """Everything runs in a tempdir: never the real ~/hubs, never the network."""
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self._tmp.name)
         self.hub = self.root / "hubs"
         (self.hub / ".git").mkdir(parents=True)
@@ -331,7 +331,7 @@ class TestDefaultHostResolver(unittest.TestCase):
     """
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._tmp.cleanup)
         self.dir = Path(self._tmp.name)
         self.argv = self.dir / "argv"

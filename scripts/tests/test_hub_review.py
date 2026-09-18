@@ -175,7 +175,7 @@ class ReviewRepoCase(unittest.TestCase):
     SEED = "# Notes\n\n- seeded fact\n"
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self._tmp.name)
         self.hub = self.root / "hubs"
         self.hub.mkdir()
@@ -1130,7 +1130,7 @@ class TestHubInitMigrationIsReviewedOneFileAtATime(unittest.TestCase):
     NOTES = "# Trip\n\n- the ferry leaves at 07:40\n"
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._tmp.cleanup)
         root = Path(self._tmp.name)
         source = root / "checkout" / "hubs"
