@@ -163,15 +163,16 @@ class TestAnonymousUrls(unittest.TestCase):
             self.urls("https://user:ghp_secret@github.com/owner/hubs.git"), [HTTPS_URL]
         )
 
-    def test_scp_style_ssh_also_probes_the_https_endpoint(self):
-        # public readability is exposed over https, never over ssh — probing only ssh
-        # would report "private" for every repo on earth
-        self.assertEqual(self.urls(SSH_URL), [HTTPS_URL.removesuffix(".git") + ".git", SSH_URL])
+    def test_scp_style_ssh_probes_only_the_https_endpoint(self):
+        # public readability is exposed over https, never over ssh. The twin is the whole
+        # signal: an ssh read is refused for public and private repos alike, and on the
+        # owner's own box it is not even anonymous (see the PLANT below).
+        self.assertEqual(self.urls(SSH_URL), [HTTPS_URL.removesuffix(".git") + ".git"])
 
     def test_ssh_scheme_url_drops_the_ssh_port(self):
         self.assertEqual(
             self.urls("ssh://git@example.test:2222/owner/hubs.git"),
-            ["https://example.test/owner/hubs.git", "ssh://example.test:2222/owner/hubs.git"],
+            ["https://example.test/owner/hubs.git"],
         )
 
     def test_git_protocol_is_already_anonymous(self):
@@ -222,7 +223,7 @@ class TestSshAliasRemote(unittest.TestCase):
 
     def test_the_documented_remote_yields_an_https_twin(self):
         self.assertEqual(
-            list(self.endpoints().urls), ["https://github.com/owner/hubs.git", ALIAS_URL]
+            list(self.endpoints().urls), ["https://github.com/owner/hubs.git"]
         )
 
     def test_nothing_is_wrong_with_it(self):
@@ -237,13 +238,13 @@ class TestSshAliasRemote(unittest.TestCase):
     def test_an_alias_in_an_ssh_scheme_url_is_resolved_too(self):
         self.assertEqual(
             list(self.endpoints("ssh://buzai-hub/owner/hubs.git").urls),
-            ["https://github.com/owner/hubs.git", "ssh://buzai-hub/owner/hubs.git"],
+            ["https://github.com/owner/hubs.git"],
         )
 
     def test_a_real_hostname_still_works_when_ssh_echoes_it_back(self):
         # `ssh -G github.com` with no Host block answers "hostname github.com"
         resolver = FakeSshConfig(**{"github.com": "github.com"})
-        self.assertEqual(list(anonymous_endpoints(SSH_URL, resolver).urls), [HTTPS_URL, SSH_URL])
+        self.assertEqual(list(anonymous_endpoints(SSH_URL, resolver).urls), [HTTPS_URL])
 
     def test_an_unresolvable_alias_derives_NO_endpoint(self):
         # not "just the ssh URL": an anonymous ssh probe is refused for a PUBLIC repo
@@ -269,6 +270,23 @@ class TestVerifyAnAliasRemote(HubTempCase):
         self.assertEqual(result.verdict, PRIVATE)
         self.assertTrue(result.push_allowed)
         self.assertIn("https://github.com/owner/hubs.git", self.probed(git))
+
+    def test_an_authenticated_ssh_read_is_never_evidence_of_public(self):
+        """PLANT, observed on a real install: the ssh URL used to be probed too.
+
+        On the owner's own box that read is not anonymous. `~/.ssh/config` supplies the
+        deploy key `deploy/README.md` tells them to create, `IdentitiesOnly` does not
+        exclude it (the config's own IdentityFile is "specified in configuration"), and
+        the read SUCCEEDS. Counted as an anonymous read, it reported a verified-private
+        hub remote as PUBLICLY READABLE and refused every push, for a setup that followed
+        the instructions exactly. Suppressing the config instead is not the fix: the alias
+        then resolves to nothing, which is UNKNOWN, which is INDETERMINATE — refused too.
+        """
+        git = ScriptedGit(remote_url=ALIAS_URL, anon={ALIAS_URL: PUBLIC_READ})
+        result = self.verify(git, resolve_host=ALIAS_CONFIG)
+        self.assertEqual(result.verdict, PRIVATE)
+        self.assertTrue(result.push_allowed)
+        self.assertNotIn(ALIAS_URL, self.probed(git))
 
     def test_a_public_repo_behind_the_alias_is_still_caught(self):
         # the twin is really probed, not merely derived: this is the refusal that the
@@ -633,9 +651,15 @@ class TestVerifyHappyPath(HubTempCase):
         self.assertTrue(self.result.push_allowed)
         self.assertEqual(self.result.source, "probe")
 
-    def test_both_endpoints_were_probed_anonymously(self):
+    def test_only_the_https_twin_is_probed_anonymously(self):
+        # One endpoint, not two: the ssh URL carries no signal about public readability
+        # (ssh refuses public and private repos alike) and probing it from the owner's own
+        # box authenticates with the hub deploy key. See the PLANT in TestVerifyAnAliasRemote.
         anon = [a for a in self.git.probes if anon_call(a)]
-        self.assertEqual(len(anon), 2)
+        self.assertEqual(len(anon), 1)
+        probed = [a[a.index("ls-remote") + 1] for a in anon]
+        self.assertEqual(probed, [HTTPS_URL])
+        self.assertNotIn(SSH_URL, probed)
 
     def test_verdict_is_cached(self):
         entry = read_cache(default_cache_path(self.hub))

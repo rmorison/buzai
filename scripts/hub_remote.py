@@ -77,8 +77,18 @@ that failure is *indeterminate*, never "private".
 Which endpoint gets probed matters as much as the environment. Public readability is
 exposed over https (and `git://`), never over ssh — an anonymous ssh probe is refused
 for a public repo just as loudly as for a private one. So `anonymous_endpoints()`
-derives the https endpoint from an ssh remote and probes both; a read on *either*
-proves the repo is public.
+derives the https endpoint from an ssh remote and probes **only** that.
+
+The ssh URL is never an endpoint, and that is not a simplification — probing it is
+actively wrong in both directions. ssh authenticates before it answers, so a read is
+refused for a public repo exactly as loudly as for a private one (no signal); and the
+probe runs on the owner's own box, where `~/.ssh/config` names the hub deploy key, so
+the "anonymous" ssh read *succeeds* with the very credential the setup prescribes and
+`decide` reads that success as PUBLIC. Observed on a real install: the documented
+deploy-key setup reported its own private hub remote as PUBLICLY READABLE and refused
+every push. Suppressing the config instead (`ssh -F /dev/null`) only moves the damage:
+the alias then resolves to nothing, "could not resolve hostname" matches no
+`DENIED_PATTERNS` entry, and the verdict becomes INDETERMINATE — refused forever again.
 
 Deriving that twin from the documented remote, and why `ssh -G`
 ---------------------------------------------------------------
@@ -431,13 +441,18 @@ def default_host_resolver(
 
 
 def _ssh_endpoints(
-    host: str, path: str, ssh_url: str, resolve_host: HostResolver | None
+    host: str, path: str, resolve_host: HostResolver | None
 ) -> AnonymousEndpoints:
-    """The https twin of an ssh remote, plus the ssh remote itself.
+    """The https twin of an ssh remote — and only the twin.
 
     The twin is what can prove the repo public, so failing to derive it must produce an
     empty list and a named reason — not the ssh URL on its own, which is refused for
     public and private repos alike and would therefore read as proof of privacy.
+
+    The ssh URL is not returned *alongside* it either, for the mirror-image reason: on
+    the owner's own box that read is not anonymous. `~/.ssh/config` supplies the deploy
+    key `deploy/README.md` tells them to create, the read succeeds, and a success is
+    proof of PUBLIC. See the module docstring.
     """
     hostname = resolve_host(host) if resolve_host is not None else host
     if not hostname:
@@ -449,14 +464,15 @@ def _ssh_endpoints(
             f"block with a `HostName` line in ~/.ssh/config (see deploy/README.md), or "
             f"point the remote at the provider's real ssh URL",
         )
-    return AnonymousEndpoints((f"https://{hostname}/{path.lstrip('/')}", redact(ssh_url)))
+    return AnonymousEndpoints((f"https://{hostname}/{path.lstrip('/')}",))
 
 
 def anonymous_endpoints(url: str, resolve_host: HostResolver | None = None) -> AnonymousEndpoints:
     """Endpoints to probe as a stranger. Pure given `resolve_host`.
 
     Public readability is served over https / `git://`, never over ssh, so an ssh remote
-    contributes its https twin *and* itself: a read on either proves the repo is public.
+    contributes its https twin and nothing else — see `_ssh_endpoints` for why probing
+    the ssh URL too is not merely useless but wrong.
     An empty list is not "safe", it is unverifiable — `decide` turns it into a refusal.
 
     `resolve_host` is None for the parsing-only view (the host token is taken at face
@@ -473,14 +489,14 @@ def anonymous_endpoints(url: str, resolve_host: HostResolver | None = None) -> A
     if scheme == "ssh":
         if not split.hostname or not split.path:
             return AnonymousEndpoints()
-        return _ssh_endpoints(split.hostname, split.path, raw, resolve_host)
+        return _ssh_endpoints(split.hostname, split.path, resolve_host)
     if scheme in TRANSPORT_SCHEMES:
         return AnonymousEndpoints()  # file://, ftp:// — no anonymous endpoint to derive
     # Not one of git's transports, so `scheme` may well be an ssh config alias: this is
     # git's scp-like `host:path`, which has no `//` and is not a URL at all.
     match = SCP_LIKE.match(raw)
     if match:
-        return _ssh_endpoints(match.group("host"), match.group("path"), raw, resolve_host)
+        return _ssh_endpoints(match.group("host"), match.group("path"), resolve_host)
     return AnonymousEndpoints()  # a bare local path
 
 
