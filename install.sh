@@ -302,6 +302,26 @@ pause_exit() { printf '\n%s\n\nre-run  make setup  when done — it resumes wher
 
 # Marker-confirmed step: no probeable local artifact exists, so completion is
 # recorded in a gitignored marker. At a TTY we ask; piped, we print and exit.
+consent_recorded() {
+  # The Remote Control consent dialog, once answered, is recorded account-wide in
+  # ~/.claude.json. Every other step in this driver probes; this one could not, so it
+  # asked the owner a question only they could answer from memory. Measured both ways on
+  # real installs: absent on a fresh account that genuinely needed priming, true on one
+  # whose service then registered without it.
+  #
+  # The spawn mode is deliberately NOT part of this: the unit passes --spawn explicitly,
+  # so only the consent itself gates registration.
+  [ -x .venv/bin/python ] || return 1
+  .venv/bin/python - <<'PYEOF' 2>/dev/null
+import json, pathlib, sys
+try:
+    data = json.loads((pathlib.Path.home() / ".claude.json").read_text())
+except Exception:
+    sys.exit(1)
+sys.exit(0 if data.get("remoteDialogSeen") is True else 1)
+PYEOF
+}
+
 confirm_or_pause() {
   local marker=".buzai/$1"; shift
   [ -f "$marker" ] && return 0
@@ -380,15 +400,24 @@ any machine), then classify them for the trust gate: docs/SETUP.md §4 and
   fi
 
   step "7/9 Remote Control consent prime (manual pause #3)"
-  confirm_or_pause setup-consent-done \
-"One-time interactive consent — a headless service cannot answer these prompts, and
-without them the service runs but silently never registers (the #1 trap):
+  if consent_recorded; then
+    say "   ok — Remote Control consent already recorded"
+    touch .buzai/setup-consent-done
+  else
+    confirm_or_pause setup-consent-done \
+"One-time interactive consent — a headless service cannot answer it, and without it the
+service runs but silently never registers (the #1 trap).
 
-    make prime-consent
-      \"Enable Remote Control? (y/n)\"      -> y   (the only prompt)
+It needs THIS shell, which the prompt below is holding, so:
 
-Confirm the session appears at claude.ai/code (same account), then exit with
-Ctrl-D Ctrl-D. Details: docs/SETUP.md §6."
+    1. answer N below
+    2. make prime-consent      \"Enable Remote Control? (y/n)\" -> y   (the only prompt)
+       confirm the session appears at claude.ai/code (same account),
+       then exit it with Ctrl-D Ctrl-D
+    3. make setup              answer y at this step on that run
+
+Details: docs/SETUP.md §6."
+  fi
 
   step "8/9 Always-on service"
   if [ -f "$HOME/.config/systemd/user/claude-remote.service" ]; then

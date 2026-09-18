@@ -250,6 +250,23 @@ class TestTheUnitPinsThePermissionMode(unittest.TestCase):
         self.assertNotIn("--dangerously-skip-permissions", exec_start)
 
 
+class TestEveryVerbFindsTheToolsRegardlessOfShell(unittest.TestCase):
+    """`claude` and `uv` live in ~/.local/bin, which only a LOGIN shell adds to PATH.
+
+    `ssh host 'make auth'` runs a non-login shell and died with "claude: No such file or
+    directory". `make setup` was unaffected, because its own phase exports the same path —
+    which is exactly what made the failure look situational rather than structural.
+    """
+
+    def test_the_makefile_puts_local_bin_on_path(self):
+        text = MAKEFILE.read_text()
+        self.assertRegex(text, r"export PATH\s*:=\s*\$\(HOME\)/\.local/bin:\$\(PATH\)")
+
+    def test_it_is_set_before_any_recipe_could_need_it(self):
+        text = MAKEFILE.read_text()
+        self.assertLess(text.index("export PATH"), text.index("auth:"))
+
+
 class TestTheAssistantIsToldToUseThePinnedInterpreter(unittest.TestCase):
     """CLAUDE.md is the assistant's only instruction for writing to a hub, and it named
     `python3`. The hub scripts import `datetime.UTC`, which is 3.11+; Ubuntu 22.04 — the

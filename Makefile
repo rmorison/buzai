@@ -11,6 +11,13 @@
 #
 # Verb NAMES are public API — keep them stable. Recipes may evolve.
 
+# `claude` and `uv` install into ~/.local/bin, which a LOGIN shell adds to PATH via
+# .profile. A non-login shell does not: `ssh host 'make auth'` died with
+# "claude: No such file or directory". `make setup` was unaffected because its own phase
+# exports this, which is precisely what made the failure look situational. Set it once
+# here so every verb works however the shell was started.
+export PATH := $(HOME)/.local/bin:$(PATH)
+
 NAME    ?= buzai-assistant
 WORKDIR ?= $(HOME)/buzai
 PY      := .venv/bin/python

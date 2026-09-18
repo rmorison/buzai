@@ -115,6 +115,37 @@ class TestTheInstallerCanFetchARequestedBranch(unittest.TestCase):
         self.assertRegex(self.text, r"#\s+BUZAI_REF=<branch>")
 
 
+class TestConsentStepProbesLikeEveryOtherStep(unittest.TestCase):
+    """The driver promises it "probes each step, skips what's already done, pauses only
+    where a human is required". Step 7 did not probe: it printed instructions for a
+    command needing the very shell its prompt was blocking, then asked "Done (or not
+    needed)?" — a question whose only truthful first-pass answer is N.
+
+    The consent dialog records itself account-wide in ~/.claude.json. Measured both ways
+    on real installs: absent on a fresh account that genuinely needed priming, true on one
+    whose service then registered without it.
+    """
+
+    def setUp(self):
+        self.text = INSTALL_SH.read_text()
+
+    def test_there_is_a_probe_for_recorded_consent(self):
+        self.assertIn("consent_recorded()", self.text)
+        self.assertIn("remoteDialogSeen", self.text)
+
+    def test_step_seven_uses_it_to_skip(self):
+        self.assertIn("if consent_recorded; then", self.text)
+        self.assertIn("consent already recorded", self.text)
+
+    def test_the_pause_says_to_answer_N_first(self):
+        # it cannot be satisfied from the prompt, so it must not ask as though it can
+        self.assertIn("answer N below", self.text)
+
+    def test_the_pause_still_names_the_command_and_the_resume(self):
+        self.assertIn("make prime-consent", self.text)
+        self.assertIn("make setup", self.text)
+
+
 class TestTheDocsDescribeTheSameStep(unittest.TestCase):
     """Docs drift is how a bootstrap step becomes folklore. Both places are checked."""
 
