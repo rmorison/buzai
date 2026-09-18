@@ -228,13 +228,12 @@ EOF
   fi
     if [ "$BUZAI_REF" = "main" ]; then
     say "    curl -fsSL ${BUZAI_REPO}/raw/${BUZAI_REF}/install.sh | bash"
-    # This script cannot know which ref it was fetched from — curl hands it no URL. So a
-    # branch bootstrap that did not set BUZAI_REF lands here, and the line above would
-    # install main onto an account bootstrapped from other code, silently and with no
-    # error. Say so rather than letting the two phases disagree.
-    say ""
-    say "    (Fetched this script from a branch? It cannot tell — the line above installs"
-    say "     main. Pass BUZAI_REF=<branch> to BOTH phases to keep them in step.)"
+    # This script cannot know which ref it was fetched from — curl hands it no URL — so a
+    # branch bootstrap that did not set BUZAI_REF lands here and the line above installs
+    # main onto an account bootstrapped from other code. One line, phrased as an option:
+    # the reader who needs it is testing a branch deliberately, and the adopter following
+    # QUICKSTART should not be asked whether they did something they did not do.
+    say "    (installing a branch? pass BUZAI_REF=<branch> to both phases)"
   else
     say "    curl -fsSL ${BUZAI_REPO}/raw/${BUZAI_REF}/install.sh | BUZAI_REF=${BUZAI_REF} bash"
   fi

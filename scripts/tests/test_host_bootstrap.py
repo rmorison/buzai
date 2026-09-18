@@ -106,7 +106,10 @@ class TestTheInstallerCanFetchARequestedBranch(unittest.TestCase):
         setting BUZAI_REF, and the printed user-phase command installs main onto an
         account bootstrapped from other code — silently, with no error. curl hands the
         script no URL, so it cannot detect this; it can only say so."""
-        self.assertIn("BUZAI_REF=<branch> to BOTH phases", self.text)
+        self.assertIn("pass BUZAI_REF=<branch> to both phases", self.text)
+        # one line, and not phrased as a question aimed at the reader: the adopter
+        # following QUICKSTART did not fetch from a branch and should not be asked
+        self.assertNotIn("Fetched this script from a branch?", self.text)
 
     def test_the_variable_is_documented_with_the_others(self):
         self.assertRegex(self.text, r"#\s+BUZAI_REF=<branch>")
