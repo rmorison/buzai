@@ -97,7 +97,15 @@ class HubTempCase(unittest.TestCase):
     """Everything runs in a tempdir: never the real ~/hubs and never the real checkout."""
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        # `ignore_cleanup_errors` because teardown races with git, not with the code under
+        # test. These cases create real repos in the tempdir; git can leave a transient
+        # object or lock file behind for a moment, and rmtree walks the tree before it
+        # removes it — so cleanup can raise `Directory not empty: .../hubs/.git` after every
+        # assertion in the body has already passed. Seen once on CI (main, caa58f7), never
+        # reproduced locally in 25 suite runs or 40 stress iterations, which is the shape of
+        # a rare filesystem race on a loaded runner. No guarantee lives in teardown, so a
+        # failure here can only ever be noise that reads as a real regression.
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self._tmp.name)
         self.checkout = self.root / "checkout"
         self.source = make_checkout(self.checkout)
