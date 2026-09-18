@@ -440,9 +440,7 @@ def default_host_resolver(
     return None
 
 
-def _ssh_endpoints(
-    host: str, path: str, resolve_host: HostResolver | None
-) -> AnonymousEndpoints:
+def _ssh_endpoints(host: str, path: str, resolve_host: HostResolver | None) -> AnonymousEndpoints:
     """The https twin of an ssh remote — and only the twin.
 
     The twin is what can prove the repo public, so failing to derive it must produce an

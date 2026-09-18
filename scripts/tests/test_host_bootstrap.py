@@ -27,7 +27,9 @@ def root_phase() -> str:
     """The body of `root_phase()` — identity work outside it would never run as root."""
     text = INSTALL_SH.read_text()
     start = text.index("root_phase() {")
-    end = text.index("\n# ------------------------------------------------------------------ user phase")
+    end = text.index(
+        "\n# ------------------------------------------------------------------ user phase"
+    )
     return text[start:end]
 
 

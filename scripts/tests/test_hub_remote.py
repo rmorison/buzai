@@ -222,9 +222,7 @@ class TestSshAliasRemote(unittest.TestCase):
         return anonymous_endpoints(url, resolve_host)
 
     def test_the_documented_remote_yields_an_https_twin(self):
-        self.assertEqual(
-            list(self.endpoints().urls), ["https://github.com/owner/hubs.git"]
-        )
+        self.assertEqual(list(self.endpoints().urls), ["https://github.com/owner/hubs.git"])
 
     def test_nothing_is_wrong_with_it(self):
         self.assertIsNone(self.endpoints().problem)
