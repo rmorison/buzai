@@ -24,6 +24,7 @@
 # Options (env vars):
 #   BUZAI_USER=<name>              service account for the root phase   (default: buzai)
 #   BUZAI_REPO=<url>               repo to fetch in the user phase      (default: https://github.com/rmorison/buzai)
+#   BUZAI_REF=<branch>             branch to fetch in the user phase    (default: main)
 #   BUZAI_WORKDIR=<dir>            workspace for the user phase         (default: $HOME/buzai)
 #   BUZAI_COPY_SSH_KEYS=0          root phase: don't copy the admin's authorized_keys
 #   BUZAI_ALLOW_ADMIN_INSTALL=1    user phase: allow install into a sudo-capable account
@@ -34,6 +35,10 @@ set -euo pipefail
 
 BUZAI_USER="${BUZAI_USER:-buzai}"
 BUZAI_REPO="${BUZAI_REPO:-https://github.com/rmorison/buzai}"
+# The branch the user phase fetches. Testing a change end to end means installing it
+# the way an adopter would, and without this the user phase could only ever fetch the
+# default branch — so the one path nobody could rehearse was the published one-liner.
+BUZAI_REF="${BUZAI_REF:-main}"
 BUZAI_WORKDIR="${BUZAI_WORKDIR:-$HOME/buzai}"
 
 say()  { printf '%s\n' "$*"; }
@@ -63,7 +68,7 @@ refuse_admin_account() {
     fail "account '$(id -un)' is sudo-capable — refusing to install buzai into it.
 buzai belongs in its own unprivileged account. You probably meant one of:
 
-    curl -fsSL ${BUZAI_REPO}/raw/main/install.sh | sudo bash    # bootstrap (note: sudo)
+    curl -fsSL ${BUZAI_REPO}/raw/${BUZAI_REF}/install.sh | sudo bash    # bootstrap (note: sudo)
     ssh ${BUZAI_USER}@<host>   # then install there: re-run the one-liner, or
                                # git clone + make setup (or: sudo -u ${BUZAI_USER} -i)
 
@@ -221,7 +226,11 @@ EOF
   else
     say "    sudo -u $user -i          # no ssh key on the account — switch in from here"
   fi
-  say "    curl -fsSL ${BUZAI_REPO}/raw/main/install.sh | bash"
+    if [ "$BUZAI_REF" = "main" ]; then
+    say "    curl -fsSL ${BUZAI_REPO}/raw/${BUZAI_REF}/install.sh | bash"
+  else
+    say "    curl -fsSL ${BUZAI_REPO}/raw/${BUZAI_REF}/install.sh | BUZAI_REF=${BUZAI_REF} bash"
+  fi
   say ""
   say "(or: git clone ${BUZAI_REPO}.git ~/buzai && cd ~/buzai && make setup)"
 }
@@ -248,13 +257,13 @@ user_phase() {
     fail "$BUZAI_WORKDIR exists and isn't a buzai checkout — refusing to touch it (set BUZAI_WORKDIR to use another path)"
   else
     if command -v git >/dev/null 2>&1; then
-      say "   cloning $BUZAI_REPO"
-      git clone --depth 1 "$BUZAI_REPO.git" "$BUZAI_WORKDIR" 2>/dev/null \
-        || git clone --depth 1 "$BUZAI_REPO" "$BUZAI_WORKDIR"
+      say "   cloning $BUZAI_REPO ($BUZAI_REF)"
+      git clone --depth 1 --branch "$BUZAI_REF" "$BUZAI_REPO.git" "$BUZAI_WORKDIR" 2>/dev/null \
+        || git clone --depth 1 --branch "$BUZAI_REF" "$BUZAI_REPO" "$BUZAI_WORKDIR"
     else
       say "   git not found — fetching tarball"
       mkdir -p "$BUZAI_WORKDIR"
-      curl -fsSL "$BUZAI_REPO/archive/refs/heads/main.tar.gz" \
+      curl -fsSL "$BUZAI_REPO/archive/refs/heads/$BUZAI_REF.tar.gz" \
         | tar -xz --strip-components=1 -C "$BUZAI_WORKDIR"
     fi
   fi

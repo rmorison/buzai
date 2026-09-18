@@ -64,6 +64,47 @@ class TestTheBootstrapGivesTheAccountAGitIdentity(unittest.TestCase):
         self.assertLess(identity, probe)
 
 
+class TestTheInstallerCanFetchARequestedBranch(unittest.TestCase):
+    """The user phase could only ever fetch the repo's default branch, so the published
+    one-liner — the path every adopter actually takes — was the one path that could not be
+    rehearsed before shipping it. A whole fresh-install smoke test had to be run by cloning
+    a branch by hand and calling `make setup`, which tests everything except the installer.
+
+    The tarball fallback was worse than unparameterised: it hardcoded `main`, so any fork
+    whose default branch is named something else got a working `git clone` and a 404 on the
+    fallback — on exactly the hosts that lack git and therefore depend on it.
+
+    Both phases must name the SAME ref. The root phase prints the user-phase command, and
+    printing a `main` URL after bootstrapping from a branch would hand the owner an
+    installer for different code than the one they just ran.
+    """
+
+    def setUp(self):
+        self.text = INSTALL_SH.read_text()
+
+    def test_the_ref_defaults_to_main(self):
+        self.assertRegex(self.text, r'BUZAI_REF="\$\{BUZAI_REF:-main\}"')
+
+    def test_the_clone_fetches_that_ref(self):
+        # both the .git and bare-URL attempts, or the fallback silently ignores the ref
+        self.assertEqual(self.text.count('--branch "$BUZAI_REF"'), 2)
+
+    def test_the_tarball_fallback_is_not_pinned_to_main(self):
+        self.assertNotIn("archive/refs/heads/main.tar.gz", self.text)
+        self.assertIn("archive/refs/heads/$BUZAI_REF.tar.gz", self.text)
+
+    def test_the_printed_next_step_names_the_same_ref(self):
+        self.assertNotIn("${BUZAI_REPO}/raw/main/install.sh", self.text)
+        self.assertIn("${BUZAI_REPO}/raw/${BUZAI_REF}/install.sh", self.text)
+
+    def test_a_non_default_ref_is_passed_through_to_the_user_phase(self):
+        # bootstrapping from a branch must tell the owner to install that same branch
+        self.assertIn("BUZAI_REF=${BUZAI_REF} bash", self.text)
+
+    def test_the_variable_is_documented_with_the_others(self):
+        self.assertRegex(self.text, r"#\s+BUZAI_REF=<branch>")
+
+
 class TestTheDocsDescribeTheSameStep(unittest.TestCase):
     """Docs drift is how a bootstrap step becomes folklore. Both places are checked."""
 
