@@ -22,8 +22,8 @@ inside this checkout, following symlinks first, so a hub store can't be quietly
 aimed back at the public repo.
 
 ```bash
-python3 scripts/hub_paths.py          # print where hubs resolve to, and why
-BUZAI_HUBS_DIR=/srv/hubs python3 scripts/hub_paths.py
+.venv/bin/python scripts/hub_paths.py          # print where hubs resolve to, and why
+BUZAI_HUBS_DIR=/srv/hubs .venv/bin/python scripts/hub_paths.py
 ```
 
 Set the override in the service unit, not a shell profile — a `--user` unit reads
@@ -52,7 +52,7 @@ After that, hub content is written by **one** tool, `scripts/hub_commit.py`, whi
 takes the write lock, scans for credentials, and records one reviewable commit:
 
 ```bash
-python3 scripts/hub_commit.py --file finance-and-tax.md \
+.venv/bin/python scripts/hub_commit.py --file finance-and-tax.md \
   --append "- Filed 2025 return on 2026-03-02" --section "Tax" \
   --summary "Record when the 2025 return was filed" --source owner-directed
 ```

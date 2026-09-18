@@ -250,6 +250,40 @@ class TestTheUnitPinsThePermissionMode(unittest.TestCase):
         self.assertNotIn("--dangerously-skip-permissions", exec_start)
 
 
+class TestTheAssistantIsToldToUseThePinnedInterpreter(unittest.TestCase):
+    """CLAUDE.md is the assistant's only instruction for writing to a hub, and it named
+    `python3`. The hub scripts import `datetime.UTC`, which is 3.11+; Ubuntu 22.04 — the
+    OS docs/SETUP.md targets — ships 3.10. So an assistant following the documented
+    command got `ImportError: cannot import name 'UTC'` and could not write a hub at all,
+    while `hub_paths.py` (which does not import UTC) ran fine under the same interpreter,
+    making the failure look situational rather than systematic.
+
+    Observed live on a fresh install. The Makefile's PY and the unit both use the pinned
+    venv; only the instruction diverged, so that divergence is what this test pins.
+    """
+
+    PINNED = ".venv/bin/python"
+
+    def instruction_files(self):
+        for name in ("CLAUDE.md", "docs/SETUP.md", "docs/SMOKE-TEST.md", "docs/TROUBLESHOOTING.md"):
+            path = REPO_ROOT / name
+            if path.exists():
+                yield path
+
+    def test_no_instruction_file_tells_the_assistant_to_use_bare_python3(self):
+        for path in self.instruction_files():
+            self.assertNotIn("python3 scripts/", path.read_text(), path.name)
+
+    def test_claude_md_shows_the_pinned_interpreter_for_hub_writes(self):
+        text = (REPO_ROOT / "CLAUDE.md").read_text()
+        self.assertIn(f"{self.PINNED} scripts/hub_commit.py", text)
+
+    def test_the_makefile_uses_the_same_interpreter(self):
+        # the instruction and the task runner must not drift apart again
+        line = next(x for x in MAKEFILE.read_text().splitlines() if x.startswith("PY"))
+        self.assertIn(self.PINNED, line)
+
+
 class TestTheUnitOnlyNamesThingsThatExist(unittest.TestCase):
     """A string match in the template proves nothing on its own — these calls have to be
     real. A renamed flag would otherwise leave the unit silently doing nothing again."""

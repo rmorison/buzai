@@ -32,7 +32,7 @@ credentials, makes one commit with the provenance trailer, and pushes only if th
 remote has been proven private.
 
 ```bash
-python3 scripts/hub_commit.py --file <hub>.md --append "- fact" \
+.venv/bin/python scripts/hub_commit.py --file <hub>.md --append "- fact" \
   --section "Section heading" --summary "what changed" --reason "why" \
   --source autonomous
 ```
