@@ -28,7 +28,7 @@ this file or anywhere in the tree.
 | Content | Rule |
 |---|---|
 | Product code, docs, engineering history (plans, brainstorms, solutions, decisions) | ship — write public-safe at authoring time |
-| Personal state (`audit/`, `.buzai/`, `hubs/*.md`, `deploy/env/*.env`, `notes/`, `.claude/settings.local.json`) | never (gitignored) |
+| Personal state (`audit/`, `.buzai/`, `hubs/*`, `deploy/env/*.env`, `notes/`, `.claude/settings.local.json`) | never (gitignored) |
 | The private gate-pattern file | **never in any repo** — lives on the maintainer's machine only |
 | Workflows with write-scoped tokens or repo secrets in triggers | never without a security review |
 

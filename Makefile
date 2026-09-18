@@ -21,9 +21,10 @@ UNIT    := $(SYSTEMD_USER)/claude-remote.service
 
 # `audit` MUST be .PHONY — a live workspace has an `audit/` directory, and without this
 # Make would treat the target as a satisfied file and skip the recipe.
-.PHONY: help bootstrap setup claude-install venv test trust-install trust-check liveness \
-        audit doctor smoke env-url auth prime-consent service-install service-start \
-        service-stop service-restart service-status lint dev
+.PHONY: help bootstrap setup claude-install venv test trust-install trust-check hub-init \
+        hub-remote-check hub-push hub-review liveness audit doctor smoke env-url auth \
+        prime-consent service-install service-start service-stop service-restart \
+        service-status lint dev
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -58,6 +59,24 @@ trust-install: ## Merge the trust-gate hooks into .claude/settings.json + lock a
 
 trust-check: ## Validate trust-gate config parses + the gate self-test passes
 	$(PY) scripts/trust_check.py
+
+hub-init: ## Create + seed the private hub repo outside the checkout (idempotent; stops before the remote)
+	$(PY) scripts/hub_init.py
+
+hub-remote-check: ## Prove the hub remote is PRIVATE (anonymous readability probe) before anything is pushed
+	$(PY) scripts/hub_remote.py
+
+# Run this at service start: an expired token or an offline box leaves commits durable
+# locally but not off-box, and the backlog is only drained by a write or by this verb.
+# The review dispositions ride a notes ref, which `git push` does not carry on its own —
+# hence the second call. It is chained with && deliberately: if the commits could not be
+# pushed (unreachable, or a remote that failed the privacy probe), the notes must not go
+# either.
+hub-push: ## Retry pushing any hub commits + review dispositions that never reached the private remote
+	$(PY) scripts/hub_commit.py --retry-push && $(PY) scripts/hub_review.py --push-notes
+
+hub-review: ## Show the hub changes awaiting your review (plain language; the assistant drives the rest)
+	$(PY) scripts/hub_review.py -n $(or $(N),10)
 
 # --- service ------------------------------------------------------------------
 
@@ -98,10 +117,15 @@ liveness: ## LIVE / NOT-LIVE — is the remote-control server holding a relay so
 audit: ## Show the last trust-gate decisions (verify the gate is firing; pass N=… to change count)
 	$(PY) scripts/audit_tail.py -n $(or $(N),15)
 
-doctor: ## Aggregate health check: prereqs, venv, secrets, liveness (informational)
+# The preflight is the same binary systemd runs as ExecStartPre, so `doctor` shows
+# exactly what service start will see. It prints the resolved hub path, `WARN:` lines for
+# durability conditions (no remote / unpushed backlog / dirty hub tree — these exit 0 and
+# never block start) and `FAIL:` lines for leak conditions (which do). Both streams are
+# left unredirected so the WARN lines surface here too.
+doctor: ## Aggregate health check: prereqs, venv, secrets + personal-state layout, liveness
 	@echo "== prereqs =="; command -v claude >/dev/null && claude --version || echo "  claude: MISSING (see SETUP step 2)"
 	@echo "== venv ==";    test -x $(PY) && echo "  $$($(PY) --version)" || echo "  .venv: MISSING (run: make venv)"
-	@echo "== secrets =="; if $(PY) scripts/secrets_preflight.py; then :; else echo "  secrets-preflight reported a problem (exit $$?)"; fi
+	@echo "== secrets + personal-state layout =="; if $(PY) scripts/secrets_preflight.py; then :; else echo "  secrets-preflight FAILED (exit $$?) — the service will REFUSE TO START until this is fixed; WARN lines above are durability-only and do not block start"; fi
 	@echo "== liveness =="; if $(PY) scripts/liveness.py; then :; else echo "  not live (exit $$?) — a traceback above means the probe itself errored, not just idle"; fi
 
 smoke: ## SC0 preflight for the 8-point smoke test (see docs/SMOKE-TEST.md)
@@ -115,8 +139,13 @@ env-url: ## Print the owner-equivalent reconnect deep-link (TTY only — refuses
 auth: ## Interactive Claude.ai subscription login — pick "1. Claude account with subscription"
 	claude
 
-prime-consent: ## One-time Remote Control consent — answer "y", then spawn mode "1"
-	claude remote-control --name $(NAME)
+# `--spawn=same-dir` is passed for the same reason the unit passes it: it is the mode the
+# service runs in, and supplying it here removes an interactive prompt the service never
+# sees. That prompt is not harmless — the TUI reads it in raw mode, so a stray Ctrl-C
+# arrives as a literal byte instead of SIGINT and the priming step wedges, which is how a
+# real install lost it. The "Enable Remote Control?" consent has no flag and still stands.
+prime-consent: ## One-time Remote Control consent — answer "y" (the only prompt left)
+	claude remote-control --name $(NAME) --spawn=same-dir --permission-mode auto
 
 # --- dev ----------------------------------------------------------------------
 

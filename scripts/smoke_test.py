@@ -1,4 +1,4 @@
-"""Drive and record the buzai MVP smoke test (SC0-SC8).
+"""Drive and record the buzai MVP smoke test (SC0-SC9).
 
 SC0 is a preflight GATE: if secrets/credentials are miswired, the rest is blocked
 (don't start the service on an unsafe layout). The mechanizable checks (SC0 secrets,
@@ -22,6 +22,7 @@ CRITERIA = {
     "SC6": "Hubs readable/writable and persist across a restart",
     "SC7": "Substrate smoke-test recorded (incl. subagent coverage); audit/ is 0700",
     "SC8": "Connector auth survives a restart within token validity (no re-auth)",
+    "SC9": "Review loop: hub changes list in plain language, approve/reject sticks, history keeps both",
 }
 _GATED = [k for k in CRITERIA if k != "SC0"]
 

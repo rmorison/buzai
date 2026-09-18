@@ -7,7 +7,8 @@
 #     Creates the dedicated unprivileged user (default: buzai), enables linger,
 #     wires XDG_RUNTIME_DIR into its login init file, copies the invoking admin's
 #     authorized_keys so `ssh buzai@host` works directly (opt out:
-#     BUZAI_COPY_SSH_KEYS=0), and verifies the per-user systemd manager — the
+#     BUZAI_COPY_SSH_KEYS=0), gives the account a default git identity (the hub
+#     store needs one), and verifies the per-user systemd manager — the
 #     steps documented in docs/HOST-BOOTSTRAP.md. Idempotent: re-running
 #     changes nothing that's already in place.
 #
@@ -23,6 +24,7 @@
 # Options (env vars):
 #   BUZAI_USER=<name>              service account for the root phase   (default: buzai)
 #   BUZAI_REPO=<url>               repo to fetch in the user phase      (default: https://github.com/rmorison/buzai)
+#   BUZAI_REF=<branch>             branch to fetch in the user phase    (default: main)
 #   BUZAI_WORKDIR=<dir>            workspace for the user phase         (default: $HOME/buzai)
 #   BUZAI_COPY_SSH_KEYS=0          root phase: don't copy the admin's authorized_keys
 #   BUZAI_ALLOW_ADMIN_INSTALL=1    user phase: allow install into a sudo-capable account
@@ -33,6 +35,10 @@ set -euo pipefail
 
 BUZAI_USER="${BUZAI_USER:-buzai}"
 BUZAI_REPO="${BUZAI_REPO:-https://github.com/rmorison/buzai}"
+# The branch the user phase fetches. Testing a change end to end means installing it
+# the way an adopter would, and without this the user phase could only ever fetch the
+# default branch — so the one path nobody could rehearse was the published one-liner.
+BUZAI_REF="${BUZAI_REF:-main}"
 BUZAI_WORKDIR="${BUZAI_WORKDIR:-$HOME/buzai}"
 
 say()  { printf '%s\n' "$*"; }
@@ -62,7 +68,7 @@ refuse_admin_account() {
     fail "account '$(id -un)' is sudo-capable — refusing to install buzai into it.
 buzai belongs in its own unprivileged account. You probably meant one of:
 
-    curl -fsSL ${BUZAI_REPO}/raw/main/install.sh | sudo bash    # bootstrap (note: sudo)
+    curl -fsSL ${BUZAI_REPO}/raw/${BUZAI_REF}/install.sh | sudo bash    # bootstrap (note: sudo)
     ssh ${BUZAI_USER}@<host>   # then install there: re-run the one-liner, or
                                # git clone + make setup (or: sudo -u ${BUZAI_USER} -i)
 
@@ -164,6 +170,31 @@ EOF
     fi
   fi
 
+  # 1e. git identity — the hub store is a git repo, and `make hub-init` refuses to commit
+  #     without a committer identity. A fresh account has none, so the documented setup
+  #     dead-ends at the hub store for every adopter (observed on a clean install: hub-init
+  #     failed, personal content stayed in the public checkout, and the preflight kept
+  #     blocking service start). Written as a file rather than via `git config`, for the
+  #     same reason 1c writes the login file directly: this runs as root before the user
+  #     phase installs anything, so git need not exist yet. It is only a fallback —
+  #     `hub_commit.py` stamps the assistant's own author on every hub write — so a neutral
+  #     account-local identity is the right default, and the owner can change it any time.
+  local gitconfig="$home/.gitconfig"
+  refuse_symlink "$gitconfig"
+  if grep -qs '^[[:space:]]*email[[:space:]]*=' "$gitconfig"; then
+    say "   git identity already set in .gitconfig — skipping"
+  else
+    tee -a "$gitconfig" >/dev/null <<EOF
+
+[user]
+	name = $user
+	email = $user@localhost
+EOF
+    chown "$user:$user" "$gitconfig"
+    chmod 644 "$gitconfig"
+    say "   git identity set ($user <$user@localhost>) — hub-init needs one; change it any time"
+  fi
+
   # verify (a): is the per-user systemd MANAGER running? (tests linger, not login env)
   # The manager can take a moment to come up right after enable-linger.
   local state="" i
@@ -195,7 +226,18 @@ EOF
   else
     say "    sudo -u $user -i          # no ssh key on the account — switch in from here"
   fi
-  say "    curl -fsSL ${BUZAI_REPO}/raw/main/install.sh | bash"
+    if [ "$BUZAI_REF" = "main" ]; then
+    say "    curl -fsSL ${BUZAI_REPO}/raw/${BUZAI_REF}/install.sh | bash"
+    # This script cannot know which ref it was fetched from — curl hands it no URL. So a
+    # branch bootstrap that did not set BUZAI_REF lands here, and the line above would
+    # install main onto an account bootstrapped from other code, silently and with no
+    # error. Say so rather than letting the two phases disagree.
+    say ""
+    say "    (Fetched this script from a branch? It cannot tell — the line above installs"
+    say "     main. Pass BUZAI_REF=<branch> to BOTH phases to keep them in step.)"
+  else
+    say "    curl -fsSL ${BUZAI_REPO}/raw/${BUZAI_REF}/install.sh | BUZAI_REF=${BUZAI_REF} bash"
+  fi
   say ""
   say "(or: git clone ${BUZAI_REPO}.git ~/buzai && cd ~/buzai && make setup)"
 }
@@ -222,13 +264,13 @@ user_phase() {
     fail "$BUZAI_WORKDIR exists and isn't a buzai checkout — refusing to touch it (set BUZAI_WORKDIR to use another path)"
   else
     if command -v git >/dev/null 2>&1; then
-      say "   cloning $BUZAI_REPO"
-      git clone --depth 1 "$BUZAI_REPO.git" "$BUZAI_WORKDIR" 2>/dev/null \
-        || git clone --depth 1 "$BUZAI_REPO" "$BUZAI_WORKDIR"
+      say "   cloning $BUZAI_REPO ($BUZAI_REF)"
+      git clone --depth 1 --branch "$BUZAI_REF" "$BUZAI_REPO.git" "$BUZAI_WORKDIR" 2>/dev/null \
+        || git clone --depth 1 --branch "$BUZAI_REF" "$BUZAI_REPO" "$BUZAI_WORKDIR"
     else
       say "   git not found — fetching tarball"
       mkdir -p "$BUZAI_WORKDIR"
-      curl -fsSL "$BUZAI_REPO/archive/refs/heads/main.tar.gz" \
+      curl -fsSL "$BUZAI_REPO/archive/refs/heads/$BUZAI_REF.tar.gz" \
         | tar -xz --strip-components=1 -C "$BUZAI_WORKDIR"
     fi
   fi
@@ -344,8 +386,7 @@ any machine), then classify them for the trust gate: docs/SETUP.md §4 and
 without them the service runs but silently never registers (the #1 trap):
 
     make prime-consent
-      \"Enable Remote Control? (y/n)\"      -> y
-      \"Spawn mode for this project [1/2]\" -> 1   (same-dir)
+      \"Enable Remote Control? (y/n)\"      -> y   (the only prompt)
 
 Confirm the session appears at claude.ai/code (same account), then exit with
 Ctrl-D Ctrl-D. Details: docs/SETUP.md §6."

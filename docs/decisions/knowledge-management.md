@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-06-23
-- **Related:** `docs/brainstorms/2026-06-23-trust-capability-model-requirements.md`, `docs/brainstorms/2026-06-23-compound-learning-step-requirements.md`
+- **Related:** `docs/brainstorms/2026-06-23-trust-capability-model-requirements.md`, `docs/brainstorms/2026-06-23-compound-learning-step-requirements.md`, `docs/decisions/private-versioned-hubs.md` (supersedes the storage/durability half of decision 4)
 
 ## Context
 
@@ -13,7 +13,7 @@ The assistant keeps a long-lived personal knowledge base — "hubs" — alongsid
 1. **Substrate is markdown-in-git** — the same substrate every other durable store already uses. One mental model and one retrieval path (native file/content search + conventions) across the whole assistant; no separate KM engine beside it.
 2. **Hub shape is earn-the-split.** A hub stays a single `<category>.md` while it is small. It becomes a directory — an index/overview file plus per-topic entry files with light frontmatter (date, tags, status) and `[[wikilink]]` cross-references — once it has grown large enough that reading it whole is wasteful or its retrieval is too coarse. Migration is a trivial markdown reshape because the substrate does not change.
 3. **Retrieval is search + index, not embeddings.** Content/file search over the files, aided by a hub index where one exists. The same files open in Obsidian (markdown + wikilinks) for a human GUI.
-4. **Preserved from the PoC:** hub-wins precedence, the Drive mirror, and repo/file-share legibility.
+4. **Preserved from the PoC:** hub-wins precedence and repo/file-share legibility. **Not the Drive mirror** — this decision claimed it was preserved, and it never shipped in this template (verified). Durability and legibility are served instead by the **private git remote** decided in `docs/decisions/private-versioned-hubs.md`: hub content lives in a private git repository *outside* the public checkout, every assistant change is one commit with a plain-language message, history is pushed off-box to a remote proven private before each push, and the owner approves or rejects per change conversationally. Everything else in this decision stands — substrate, hub shape, and retrieval are unchanged by it.
 
 ## Consequences
 

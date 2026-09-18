@@ -72,8 +72,10 @@ git clone https://github.com/rmorison/buzai.git ~/buzai && cd ~/buzai
 does this for you, falling back to a tarball when git isn't installed, then runs
 `make setup`.)
 
-`~/buzai` is the assistant's workspace. Personal state (your hubs, your secrets)
-stays gitignored; the repo ships only machinery + empty scaffolds.
+`~/buzai` is the assistant's workspace, and it is a **system directory**: machinery,
+docs, and scaffolds only. Personal state lives *outside* it — your hubs in a private git
+repo at `$BUZAI_HUBS_DIR` (default `~/hubs`, step 9), your secrets at
+`~/.config/buzai/secrets/` — so a `git pull` here can never trample or publish it.
 
 ## 2. Install Claude Code
 
@@ -319,16 +321,18 @@ unit needs **no** `EnvironmentFile` — leave those lines commented (their defau
 > user and answer both prompts:
 >
 > ```bash
-> make prime-consent                          # runs `claude remote-control --name <NAME>`
-> #   "Enable Remote Control? (y/n)"  -> y
-> #   "Spawn mode for this project [1/2]" -> 1   (same-dir)
+> make prime-consent      # `claude remote-control --name <NAME> --spawn=same-dir --permission-mode auto`
+> #   "Enable Remote Control? (y/n)"  -> y      <- the only prompt
 > #   then confirm "buzai-assistant" shows up at claude.ai/code (or mobile Code tab),
 > #   and exit with Ctrl-D Ctrl-D  (claude exits on EOF/Ctrl-C, not SIGTERM)
 > ```
 >
-> These choices persist per-project (`~/buzai`). The unit passes `--spawn=same-dir`, so
-> after this only the one-time **"Enable Remote Control?"** consent matters (it has no
-> CLI flag to skip). Requires full-scope subscription auth from §3 — an inference-only
+> The consent persists per-project (`~/buzai`). Only the one-time **"Enable Remote
+> Control?"** consent needs answering — it has no CLI flag to skip. The spawn mode does
+> have one, and the target passes it, matching what the unit runs: a prompt the service
+> never sees should not stand between you and the service. (It was worse than a
+> keystroke — the TUI reads that prompt in raw mode, so a stray Ctrl-C arrives as a
+> literal byte rather than SIGINT, and the priming step wedges.) Requires full-scope subscription auth from §3 — an inference-only
 > `setup-token` runs interactive sessions but **cannot register** the remote session.
 
 **Then install and enable the unit:**
@@ -348,7 +352,7 @@ detail + the local-MCP secrets path: `deploy/README.md`.
 **Quick / local / non-Linux** alternative — run it in the foreground and watch output:
 
 ```bash
-claude remote-control --name buzai-assistant
+claude remote-control --name buzai-assistant --spawn=same-dir --permission-mode auto
 ```
 
 (Foreground is fine for a quick test, but it stops when your shell closes; use the
@@ -418,18 +422,140 @@ operation):
 render of large tool output); a phantom "running" task with no process (orphan from a
 dead session).
 
-## 9. Hubs
+## 9. Hubs — your private, versioned knowledge base
 
-With the assistant running and attached, seed your knowledge base. This is a
-**post-setup step you can drive entirely from the Claude app over Remote Control** — ask
-the assistant to create and populate hubs in the running session — or edit the files
-directly on the box. Start from the shipped scaffolds (see `hubs/README.md`); your
-populated hubs are personal and gitignored, only the scaffolds are tracked.
+Hubs are the assistant's long-lived personal knowledge base, and they do **not** live in
+this checkout. This repo is public and ships only the tracked scaffolds
+(`hubs/README.md`, `hubs/_example-hub.md`); your real hubs live in a **private git
+repository outside the checkout**, at `$BUZAI_HUBS_DIR`, defaulting to `~/hubs`. That
+separation is the privacy barrier — not `.gitignore`, and not the trust gate, which
+declares Bash (and therefore git) a blind spot.
+
+> **Never write hub content inside `~/buzai`.** A hub file in the checkout is one
+> `git add` away from a public remote. `scripts/hub_paths.py` refuses any hub location
+> inside the checkout (following symlinks first), and `scripts/secrets_preflight.py`
+> **fails service start** if it finds personal content under `hubs/` — that is a leak
+> condition, not a warning.
+
+**a. Create the store.** One idempotent verb:
+
+```bash
+make hub-init      # creates + seeds the hub repo, commits, prints the next step
+```
+
+It creates the resolved directory, `git init`s it, copies the tracked scaffolds in,
+writes that store's own README (it carries the restore procedure, so the one thing you
+need to rebuild an instance travels *inside* the backup), records a
+`.buzai/remote-expected` marker with the creation time, and — if any real hub markdown is
+still sitting in `hubs/` in the checkout — moves it out into the new repo and deletes the
+checkout's copies. Re-running reports the existing store and changes nothing.
+
+```bash
+.venv/bin/python scripts/hub_paths.py    # print where hubs resolve to, and why
+```
+
+> **If your store is not `~/hubs`, set `BUZAI_HUBS_DIR` in the systemd unit — never only
+> in a shell profile.** A `--user` unit sources neither `~/.profile` nor `~/.bashrc`, so a
+> profile-only export reaches your ssh session and never reaches the service: the
+> assistant would read and write a different store than the one you inspect by hand,
+> silently, with both looking correct. The commented `Environment=BUZAI_HUBS_DIR=%h/hubs`
+> line in `deploy/claude-remote.service.template` is where it goes; every hub verb and the
+> preflight print the path they resolved, so compare them if anything looks missing.
+
+**b. Create the private remote yourself.** `make hub-init` deliberately stops here and
+prints these commands rather than running them: this is the one step where a wrong flag
+publishes your knowledge base, so buzai never does it for you.
+
+```bash
+gh repo create hubs --private          # or your host's web UI — EMPTY repo, no README, no license
+# confirm in the web UI that it really is private, then attach and push:
+git -C ~/hubs remote add origin <ssh-url-of-that-private-repo>
+git -C ~/hubs push -u origin main
+```
+
+Use an **ssh deploy key scoped to that one repository** (write access enabled), with
+`known_hosts` pre-populated — `deploy/README.md` step 1 has the exact `ssh-keygen` /
+`ssh-keyscan` / `~/.ssh/config` recipe. A token embedded in the remote URL is
+**forbidden**, not discouraged: git echoes the remote on failure and the unit sends stderr
+to the journal, so it would be logged in plaintext on exactly the failures this design
+expects routinely. Then prove the destination before anything is pushed:
+
+```bash
+make hub-remote-check     # anonymous `git ls-remote` — if a stranger can read it, push is refused
+```
+
+It reports **PRIVATE** (push permitted), **PUBLICLY READABLE** (refused), **could not be
+confirmed private** (refused and queued — unreachable, timed out, or an unrecognized
+error; never assumed private), or **no remote** (local-only, which exits 0 because it is a
+durability condition, not a leak). The verdict is cached inside the hub repo at
+`.git/buzai/remote-verified.json` for an hour and re-checked at service start — the unit
+runs `scripts/hub_remote.py` as an `ExecStartPre=-` line, before anything pushes — so a
+repo flipped to public later, same clone URL, is caught rather than trusted forever. That
+line cannot block start: a remote that must not be pushed to is not a reason to take the
+assistant off the air.
+
+**c. Seed and use it.** This is a **post-setup step you can drive entirely from the Claude
+app over Remote Control** — ask the assistant to record something and it goes through
+`scripts/hub_commit.py`: one logical change, one commit, a message you can review without
+the diff, an `instruction-source` trailer, and a push to the private remote. Start a hub
+by copying the scaffold into the *store*, never alongside it here:
+
+```bash
+cp hubs/_example-hub.md ~/hubs/finance-and-tax.md      # then edit, or just tell the assistant
+```
+
+**d. Review, day to day.** Ask the assistant what changed — from the phone, in plain
+language — or run the same thing yourself:
+
+```bash
+make hub-review            # what is awaiting your review, newest first (N=25 to show more)
+```
+
+You approve or reject **per item**, conversationally; anything you do not act on stays
+pending. A rejection needs your reason and **removes** the recorded content unless you
+supply the correct value, in which case it replaces it — the assistant never invents a
+correction. Both the original and the correction stay in history. Verdicts are stored as
+git notes on `refs/notes/buzai-review`.
+
+**e. Drain the push backlog.** A push failure never blocks a write: the commit is durable
+locally and the sha is queued. Retry happens on the next hub write and at service start —
+or by hand:
+
+```bash
+make hub-push              # retries unpushed commits, then the review dispositions ref
+```
+
+"At service start" is an `ExecStartPost=-` line in the unit running exactly what
+`make hub-push` runs, chained the same way: the notes ref only goes if the commits went.
+It runs *after* the server is up and cannot fail the unit, so `systemctl --user restart
+claude-remote` is a legitimate way to drain a backlog once the network or the deploy key
+is fixed. `journalctl --user -u claude-remote` shows what it did.
+
+If it keeps failing, the deploy key or token has most likely expired (fine-grained tokens
+do, routinely) — see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md). `make doctor` prints a
+`WARN:` line for an unpushed backlog, a store with no remote, or a dirty hub tree; those
+are durability conditions and never block service start.
+
+**f. Restore onto a fresh instance.** Clone the private repo to the resolved hub path,
+then fetch the notes ref — `git clone` does not bring `refs/notes/*` with it, and without
+it every already-approved change resurfaces as pending:
+
+```bash
+git clone <your-private-hub-remote> ~/hubs
+git -C ~/hubs fetch origin "refs/notes/*:refs/notes/*"     # past approve/reject verdicts
+```
+
+That is the whole restore: content, history, and review state. Nothing in the buzai
+checkout needs editing (unless the store lives somewhere other than `~/hubs`, in which
+case clone it there and set `BUZAI_HUBS_DIR` in the unit). Confirm past verdicts came back
+— `make hub-review` should not re-list changes you already settled — before calling the
+restore complete.
 
 ## 10. Verify
 
-Run `make smoke` (the SC0 preflight gate), then complete the 8-point smoke test:
-`docs/SMOKE-TEST.md`. Your instance is "stood up and working" when all eight pass.
+Run `make smoke` (the SC0 preflight gate), then complete the smoke test:
+`docs/SMOKE-TEST.md`. Your instance is "stood up and working" when all nine criteria
+(SC1–SC9) pass.
 
 ## Updating later — don't wipe your wired state
 
@@ -442,7 +568,12 @@ local state your running instance depends on:
 - `audit/` — the trust-gate audit log
 - `.venv/` — the pinned interpreter (a costly rebuild)
 - `.buzai/` — provenance + accumulated gate state
-- `trust/config/*.local.toml` and your populated `hubs/`
+- `trust/config/*.local.toml`
+
+**Your hubs are no longer on that list.** They live in their own private git repo outside
+the checkout (step 9), so nothing you do to `~/buzai` — pull, re-clone, or `rm -rf` — can
+reach them, and a lost host costs at most the unpushed tail. That is exactly the problem
+the private hub store fixed.
 
 Update in place instead. Normal case — as the `buzai` user, pull directly:
 
@@ -462,9 +593,10 @@ sudo -u buzai git -C /home/buzai/buzai pull --ff-only origin main   # only touch
 
 Either way, `git pull` leaves all the untracked state above intact, so your gate stays
 wired and your audit log continues. (If you genuinely must re-clone, copy out
-`.claude/settings.json`, `audit/`, `trust/config/*.local.toml`, and `hubs/` first, then
-restore them.) After an update, **restart the Claude Code session** so any changed hook
-config takes effect — and re-run `make test` if the gate code changed.
+`.claude/settings.json`, `audit/`, and `trust/config/*.local.toml` first, then restore
+them — the hub store needs nothing, since it is not in here.) After an update, **restart
+the Claude Code session** so any changed hook config takes effect — and re-run `make test`
+if the gate code changed.
 
 ## Security
 

@@ -70,19 +70,27 @@ particular can change the architecture if it fails.
 
 ## Results (fill in)
 
+Run on **2026-09-18**, Claude Code **2.1.275**, instance `buzai-smoke` (fresh install
+from `feat/private-versioned-hubs`). Method: a throwaway `PreToolUse` logging hook
+(`jq -r '.tool_name'`) registered alongside the gate, exercised from the Claude desktop
+app over Remote Control, then compared against `audit/audit.jsonl`. The hook was removed
+afterwards. **Control:** the log was confirmed non-empty for tools already accounted for
+before any conclusion was drawn from its silence — an empty log cannot distinguish "the
+hook did not fire" from "the instrument is broken".
+
 | Source | Hook fired? | Legs/decision correct? (step 5) | Notes |
 |---|---|---|---|
-| Gmail (managed) | ☐ | ☐ | read → private_read + untrusted; no send tool |
-| Google Calendar (managed) | ☐ | ☐ | read → private_read; create/update → send; delete → hard-gate |
-| Google Drive (managed) | ☐ | ☐ | read → private_read + untrusted; create/copy → send |
-| Todoist (managed) | ☐ | ☐ | read → private_read; add/update/comment/assign → send |
-| Dropbox (managed) | ☐ | ☐ | read → +untrusted; create/move/share → send; delete + share-link hard-gate |
-| Directory connectors enabled (Slack/Notion/GitHub/…) | ☐ | ☐ | names validated via `/mcp`; legs per the catalog block |
-| Sheets (local MCP) | ☐ | ☐ | |
-| IMAP/SMTP (local MCP, if wired) | ☐ | ☐ | |
-| Bash / Read (built-in) | ☐ | ☐ | |
-| **(2a) Agent/Task spawn (RB2)** | ☐ | — | Expected yes — the containment point. |
-| **(2b) Subagent-internal call (RB2)** | ☐ | — | If NO: delegation acts ungated internally — see RB2 fallback. |
+| Gmail (managed) | ☑ | ☑ | `search_threads`, `get_message` → `private_read` + `untrusted_content`, ask |
+| Google Calendar (managed) | ☑ | ☑ | `list_events` → `private_read` + `untrusted_content`, ask; `create_event` → `external_send`, ask. Delete not exercised |
+| Google Drive (managed) | ☐ | ☐ | connected, NOT exercised |
+| Todoist (managed) | ☐ | ☐ | connected, NOT exercised |
+| Dropbox (managed) | ☐ | ☐ | connected, NOT exercised |
+| Directory connectors enabled (Slack/Notion/GitHub/…) | ☑ | n/a | `Claude Docs` connected but **unmapped** → zero legs, ask (the correct default). Slack connected, not exercised. `trust-check` FAILs on both, by design |
+| Sheets (local MCP) | — | — | not wired; `mcpServers` empty |
+| IMAP/SMTP (local MCP, if wired) | — | — | not wired |
+| Bash / Read (built-in) | ☑ | ☑ | `Bash` → `[]`, ask; `Read` → allow; `WebFetch` → `untrusted_content`, ask; `ToolSearch` → allow |
+| **(2a) Agent/Task spawn (RB2)** | ☑ | — | Fired, via `always-gate: action class 'Agent' requires approval` — not ordinary `policy:review` |
+| **(2b) Subagent-internal call (RB2)** | ☑ | — | **Fires.** The subagent's own `Read` reached the MAIN-session hook (spawn 06:34:50 → `Read` 06:35:22 → `SubagentHandback` 06:35:25) and was adjudicated. `SubagentHandback` is itself gated (unmapped → ask), so the return path is adjudicated too |
 
 ## Decision gate
 
@@ -97,7 +105,11 @@ particular can change the architecture if it fails.
   approved spawn can still let a subagent act ungated internally. Acceptable fallback
   for v1 (delegation is owner-approved and rare); if you need unattended delegation,
   add the deferred MCP-allowlist / per-connector enforcement that survives delegation
-  before relying on it. ✅ mitigation chosen; (2b) to confirm live
+  before relying on it. ✅ mitigation chosen; **(2b) CONFIRMED LIVE 2026-09-18 on
+  Claude Code 2.1.275: main-session hooks DO fire on subagent-internal calls.**
+  Containment is therefore stronger than this gate assumed — a subagent cannot act
+  ungated behind an approved spawn on this version. Keep the spawn gate regardless: this
+  is one version's behaviour, not a guarantee
 - **RB3 owner signal:** signal = `kind = "owner"` from the per-turn writer; maps to
   `OWNER` via the shipped `tiers.toml [kinds]` with no adopter config. Resolved.
   Verify with step 4. ✅ signal chosen
@@ -105,3 +117,9 @@ particular can change the architecture if it fails.
 Do not proceed to rely on the gate for any **connector** row above that is unchecked.
 The RB2 spawn-gating (2a) is enforced by tests; (2b) is the residual to confirm on
 your Claude Code version.
+
+> **Scope of the 2026-09-18 run.** Drive, Todoist and Dropbox are connected on that
+> instance but were never exercised, so their live tool names remain unconfirmed against
+> the catalog — they stay unchecked rather than being marked off by association. Re-run
+> this whole procedure after upgrading Claude Code: (2b) in particular is an observation
+> about 2.1.275, and the v1 mitigation (always-gate the spawn) is what the tests enforce.

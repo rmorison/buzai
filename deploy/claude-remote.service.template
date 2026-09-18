@@ -43,10 +43,48 @@ WorkingDirectory=%h/buzai
 #EnvironmentFile=%h/.config/buzai/secrets/xero.env
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
-# Refuse to start on a miswired secrets/credentials layout (tracked secret,
-# wrong perms). Runs under the pinned, self-contained .venv Python (SETUP step 5),
-# NOT the host's system python.
+# Where the private hub repo lives. %h/hubs is the default, so this line is only needed
+# if your store is somewhere else — but if it IS somewhere else, it MUST be set HERE.
+# A `--user` unit sources neither ~/.profile nor ~/.bashrc, so an export in a shell
+# profile reaches your ssh session and never reaches the service: the assistant would
+# read and write a different store than the one you inspect by hand, silently, with
+# both looking correct. The preflight below prints the path it resolved on every start
+# — compare it against `make hub-init` output if anything looks missing.
+#Environment=BUZAI_HUBS_DIR=%h/hubs
+
+# Refuse to start on a layout that can leak personal state: a real .env or personal hub
+# content inside the checkout, a hub deploy key with loose perms or tracked by any repo,
+# a credential helper on the public origin, or a hub path inside the checkout. Durability
+# conditions (no remote, unpushed backlog, dirty hub tree) print WARN and DO NOT block
+# start — with StartLimitBurst=5 above, failing on those would turn "knowledge is not
+# backed up" into "the assistant is gone". Runs under the pinned, self-contained .venv
+# Python (SETUP step 5), NOT the host's system python.
 ExecStartPre=%h/buzai/.venv/bin/python %h/buzai/scripts/secrets_preflight.py
+
+# Re-verify that the hub remote is still PRIVATE, and do it BEFORE anything pushes.
+# The verdict is cached for an hour inside the hub repo, and a repository can be flipped
+# to public through a web UI with the clone URL unchanged — so without this line a
+# restart would keep pushing against a verdict nobody re-checked. This runs a fresh
+# anonymous probe and rewrites or EVICTS the cached verdict; a non-private answer leaves
+# no usable cache entry, so the pushes below refuse and queue instead of proceeding.
+# The leading '-' means the outcome can never affect service start: a network that is
+# down, a verdict of "public" — neither is a reason to take the assistant off the air,
+# they are reasons not to push. A store that does not exist yet does not even reach that
+# net: `--if-initialized`, passed HERE and never by `make hub-remote-check`, makes that
+# state a plain note with exit 0, the same tier secrets_preflight uses for it, so the
+# journal keeps `FAIL:` and `WARN` for conditions that are actually wrong instead of
+# printing one at every start before `make hub-init`. Run by hand, a missing store fails.
+# Bounded: every probe carries PROBE_TIMEOUT_SECONDS (20s) and the ssh-alias resolution 10s.
+ExecStartPre=-%h/buzai/.venv/bin/python %h/buzai/scripts/hub_remote.py --if-initialized
+
+# The start job now spans the preflight, a privacy re-verification and two pushes, and
+# every one of them is network-facing. systemd's 90s default would kill a start whose
+# probes are merely slow — and killing it stops the ExecStart server that is already
+# running and serving, which is precisely backwards. Each command is internally bounded,
+# so this only has to exceed their sum on a bad-but-real day (an unreachable remote is
+# roughly two minutes of timeouts); a generous value costs nothing because the assistant
+# is live throughout, while a tight one takes a working assistant down.
+TimeoutStartSec=600s
 
 # Long-lived remote-control SERVER (sessions attach on demand). Do NOT use
 # `--spawn session` here: single-session-exits-on-complete + Restart=always is the
@@ -55,7 +93,33 @@ ExecStartPre=%h/buzai/.venv/bin/python %h/buzai/scripts/secrets_preflight.py
 # [1/2]" prompt can never block a headless start. (The other first-run prompt,
 # "Enable Remote Control? (y/n)", has no flag — prime it once interactively per
 # SETUP §6 before enabling this unit, or the service starts but never registers.)
-ExecStart=%h/.local/bin/claude remote-control --name buzai-assistant --spawn=same-dir
+# `--permission-mode auto` is pinned rather than inherited. The account plan decides the
+# default (auto on Pro/Max/Team, `default` — i.e. manual approval — elsewhere), so an
+# unpinned unit behaves differently for different adopters, and an always-on assistant that
+# falls back to manual stalls on routine calls with nobody watching to approve them. This
+# does NOT weaken the gate: PreToolUse hooks run BEFORE any permission-mode check, in every
+# mode, and a hook's `deny` holds even under --dangerously-skip-permissions. The mode only
+# decides what happens to calls the gate already allowed.
+ExecStart=%h/.local/bin/claude remote-control --name buzai-assistant --spawn=same-dir --permission-mode auto
+
+# The "retried at service start" guarantee, actually wired. A push can fail for hours —
+# an expired deploy key or token, an offline box — and the commit is then durable locally
+# but not off-box; nothing drains that backlog except the next successful write, a manual
+# `make hub-push`, or this. The second call is the review dispositions: `git push` does
+# not carry refs/notes/*, so they need their own push or an R8 restore resurfaces every
+# already-approved change as pending.
+#
+# ExecStartPost, so the server above is already up and serving before any of it runs. The
+# leading '-' means failure can never affect start. `sh -c` with '&&' is deliberate and
+# matches `make hub-push`: if the commits could not be pushed, the notes ref must NOT go
+# either — a note must never reach the remote ahead of the correction commit it refers
+# to. Both calls re-verify privacy themselves and refuse unless the verdict is PRIVATE
+# (the ExecStartPre above has just refreshed it), and both are bounded — 60s per push,
+# 30s per local git call — so neither can hang this unit. Each carries `--if-initialized`
+# for the same reason as the privacy refresh: before `make hub-init` there is nothing to
+# drain, which is a note here. `make hub-push` omits it on purpose, so an owner who runs
+# it on a box with no store gets a failure rather than a success that drained nothing.
+ExecStartPost=-/bin/sh -c '%h/buzai/.venv/bin/python %h/buzai/scripts/hub_commit.py --retry-push --if-initialized && %h/buzai/.venv/bin/python %h/buzai/scripts/hub_review.py --push-notes --if-initialized'
 
 Restart=always
 RestartSec=10s

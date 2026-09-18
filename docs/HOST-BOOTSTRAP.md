@@ -41,7 +41,12 @@ operation alike, runs inside the unprivileged `buzai` account. It:
    `/home/buzai/.ssh/authorized_keys` too. Opt out with the var after `sudo`:
    `curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | sudo BUZAI_COPY_SSH_KEYS=0 bash`;
    skipped automatically when the invoking account has no `authorized_keys`.
-5. **Verifies both failure modes separately**: (a) the per-user systemd *manager* runs
+5. **Sets a default git identity for the account** (`~/.gitconfig`, `name = buzai`,
+   `email = buzai@localhost`) — your hub store is a git repository and `make hub-init`
+   refuses to commit without a committer identity, which a fresh account does not have.
+   Skipped if one is already set, and safe to change any time: it is only a fallback,
+   because every hub write stamps the assistant's own author on the commit.
+6. **Verifies both failure modes separately**: (a) the per-user systemd *manager* runs
    (linger problem if not), and (b) a fresh *login* is correctly wired (login-file
    problem if not). It fails loudly naming which one broke.
 
@@ -106,6 +111,15 @@ sudo install -d -m 700 -o buzai -g buzai /home/buzai/.ssh
 sudo tee -a /home/buzai/.ssh/authorized_keys <~/.ssh/authorized_keys >/dev/null
 sudo chown buzai:buzai /home/buzai/.ssh/authorized_keys
 sudo chmod 600 /home/buzai/.ssh/authorized_keys
+
+# git identity — the hub store is a git repo and `make hub-init` will not commit
+# without one. Only a fallback: hub writes carry the assistant's own author.
+sudo -u buzai tee -a /home/buzai/.gitconfig >/dev/null <<'EOF'
+
+[user]
+	name = buzai
+	email = buzai@localhost
+EOF
 
 # verify (a) — manager up (tests linger, not your login env):
 sudo -u buzai XDG_RUNTIME_DIR=/run/user/$(id -u buzai) systemctl --user is-system-running   # → running

@@ -1,0 +1,1696 @@
+import io
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+from scripts.hub_commit import (
+    APPEND_ENTRY,
+    AUTONOMOUS,
+    CLI_SOURCES,
+    DIVERGED,
+    NOTHING_TO_PUSH,
+    OWNER_CORRECTION,
+    OWNER_DIRECTED,
+    PUSH_LOCAL_ONLY,
+    PUSH_REFUSED,
+    PUSHED,
+    REMOVE_ENTRY,
+    REPLACE_SECTION,
+    UNATTRIBUTED,
+    Backlog,
+    Operation,
+    WriteRequest,
+    default_backlog_path,
+    record,
+    record_unpushed,
+)
+from scripts.hub_commit import detail_of as commit_detail_of
+from scripts.hub_init import BOOTSTRAP_SOURCE
+from scripts.hub_init import commit_message as hub_init_commit_message
+from scripts.hub_init import initialize as hub_init_initialize
+from scripts.hub_remote import INDETERMINATE, LOCAL_ONLY, PRIVATE, GitResult, Verification
+from scripts.hub_remote import default_git_runner as real_git
+from scripts.hub_review import (
+    ALREADY_ABSENT,
+    ALREADY_DISPOSED,
+    APPROVED,
+    FAILED,
+    NOTES_REF,
+    NOTHING_TO_REMOVE,
+    OWNER_AUTHORED,
+    PARTIALLY_REMOVED,
+    RECORDED,
+    REJECTED,
+    REMOVED,
+    REPLACED,
+    STALE_BACKLOG_SECONDS,
+    Change,
+    Decision,
+    Disposition,
+    HubReviewError,
+    added_blocks,
+    build_change,
+    count_block,
+    dispose,
+    disposed_shas,
+    duration,
+    find_change,
+    main,
+    parse_disposition,
+    parse_trailers,
+    push_notes,
+    read_changes,
+    read_disposition,
+    removal_scope,
+    reviewable,
+    root_commits,
+    run_list,
+    split_hunks,
+    staleness_warning,
+    summarize,
+    trailer_values,
+)
+from scripts.hub_review import detail_of as review_detail_of
+from scripts.tests.env_isolation import assert_injection_suppressed, plant
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+NOW = datetime(2026, 8, 5, 12, 0, 0, tzinfo=UTC)
+
+# Hermetic git: nothing from ~/.gitconfig or /etc/gitconfig reaches these tests, and no
+# test ever touches the network or the real ~/hubs.
+GIT_ENV = {
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_AUTHOR_NAME": "buzai tests",
+    "GIT_AUTHOR_EMAIL": "tests@example.invalid",
+    "GIT_COMMITTER_NAME": "buzai tests",
+    "GIT_COMMITTER_EMAIL": "tests@example.invalid",
+}
+_SAVED: dict[str, str | None] = {}
+
+
+def setUpModule():
+    for key, value in GIT_ENV.items():
+        _SAVED[key] = os.environ.get(key)
+        os.environ[key] = value
+
+
+def tearDownModule():
+    for key, value in _SAVED.items():
+        restore_env(key, value)
+
+
+def restore_env(name: str, value: str | None) -> None:
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+
+
+def git(*args, check=True) -> str:
+    r = subprocess.run(["git", *args], capture_output=True, text=True, check=check)
+    return r.stdout
+
+
+def verifier_for(verdict=PRIVATE, remote="origin", url="ssh://host.invalid/hubs.git"):
+    verification = Verification(verdict, remote, url, f"{verdict} (injected)", "probe")
+    return lambda hub: verification
+
+
+PRIVATE_REMOTE = verifier_for(PRIVATE)
+NO_REMOTE = verifier_for(LOCAL_ONLY, remote=None)
+UNVERIFIED_REMOTE = verifier_for(INDETERMINATE)
+
+
+def local_verifier(remote: Path):
+    """A verified-private verdict pointing at a real bare repo in the tempdir."""
+    return verifier_for(PRIVATE, remote="origin", url=str(remote))
+
+
+DRIVER = """
+import sys, time
+sys.path.insert(0, {repo!r})
+from datetime import UTC, datetime
+from pathlib import Path
+from scripts.hub_review import REJECTED, Decision, dispose
+
+hub, sha, fact, start_at = Path(sys.argv[1]), sys.argv[2], sys.argv[3], float(sys.argv[4])
+while time.time() < start_at:
+    time.sleep(0.002)
+result = dispose(
+    hub,
+    Decision(sha, REJECTED, reason="the owner says %s is wrong" % fact),
+    now=datetime.now(UTC),
+    push=False,
+)
+print(result.status, result.resolution)
+sys.exit(0 if result.status == "recorded" else 1)
+"""
+
+APPROVE_DRIVER = """
+import sys, time
+sys.path.insert(0, {repo!r})
+from datetime import UTC, datetime
+from pathlib import Path
+from scripts.hub_review import APPROVED, Decision, dispose
+
+hub, sha, start_at = Path(sys.argv[1]), sys.argv[2], float(sys.argv[3])
+while time.time() < start_at:
+    time.sleep(0.002)
+result = dispose(hub, Decision(sha, APPROVED), now=datetime.now(UTC), push=False)
+print(result.status, result.detail)
+sys.exit(0 if result.status == "recorded" else 1)
+"""
+
+
+class ReviewRepoCase(unittest.TestCase):
+    """A real hub repo in a tempdir, written through the real U4 write path."""
+
+    SEED = "# Notes\n\n- seeded fact\n"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.hub = self.root / "hubs"
+        self.hub.mkdir()
+        git("init", "-q", "-b", "main", str(self.hub))
+        self.notes = self.hub / "notes.md"
+        self.notes.write_text(self.SEED)
+        git("-C", str(self.hub), "add", "-A")
+        git("-C", str(self.hub), "commit", "-q", "-m", "seed")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    # --- writing changes to review -------------------------------------------------
+
+    def append(self, fact: str, *, section=None, summary=None, source=AUTONOMOUS) -> str:
+        result = record(
+            self.hub,
+            WriteRequest(
+                Operation(APPEND_ENTRY, "notes.md", f"- {fact}", section=section),
+                summary=summary or f"Record {fact}",
+                reason=f"the assistant heard {fact} in conversation",
+                source=source,
+            ),
+            now=NOW,
+            push=False,
+        )
+        self.assertTrue(result.recorded, result.detail)
+        assert result.commit is not None
+        return result.commit
+
+    def replace_section(self, section: str, text: str) -> str:
+        result = record(
+            self.hub,
+            WriteRequest(
+                Operation(REPLACE_SECTION, "notes.md", text, section=section),
+                summary=f"Reword the {section} section",
+                reason="the assistant tidied the wording later",
+            ),
+            now=NOW,
+            push=False,
+        )
+        self.assertTrue(result.recorded, result.detail)
+        assert result.commit is not None
+        return result.commit
+
+    # --- queries -------------------------------------------------------------------
+
+    def pending(self) -> list[Change]:
+        noted = disposed_shas(self.hub)
+        roots = root_commits(self.hub)
+        return [c for c in read_changes(self.hub) if reviewable(c, roots) and c.sha not in noted]
+
+    def pending_subjects(self) -> list[str]:
+        return [c.subject for c in self.pending()]
+
+    def subjects(self) -> list[str]:
+        return git("-C", str(self.hub), "log", "--pretty=%s").split("\n")
+
+    def commit_count(self) -> int:
+        return int(git("-C", str(self.hub), "rev-list", "--count", "HEAD").strip())
+
+    def approve(self, sha: str, **kw):
+        kw.setdefault("push", False)
+        return dispose(self.hub, Decision(sha, APPROVED), now=NOW, **kw)
+
+    def reject(self, sha: str, reason="that is wrong", value="", **kw):
+        kw.setdefault("push", False)
+        return dispose(self.hub, Decision(sha, REJECTED, reason=reason, value=value), now=NOW, **kw)
+
+    def bare_remote(self) -> Path:
+        remote = self.root / "remote.git"
+        git("init", "-q", "--bare", "-b", "main", str(remote))
+        git("-C", str(self.hub), "remote", "add", "origin", str(remote))
+        return remote
+
+
+# --- pure core -----------------------------------------------------------------------
+
+
+class TestTrailerParsing(unittest.TestCase):
+    MESSAGE = (
+        "Record the boiler service\n\n"
+        "Changed: appended a 1-line entry to home.md under 'House'.\n"
+        "Why: the owner mentioned it in passing\n\n"
+        "hub-file: home.md\nhub-operation: append-entry\ninstruction-source: autonomous\n"
+    )
+
+    def test_trailers_are_read_from_the_last_paragraph(self):
+        self.assertEqual(
+            parse_trailers(self.MESSAGE),
+            {
+                "hub-file": "home.md",
+                "hub-operation": "append-entry",
+                "instruction-source": "autonomous",
+            },
+        )
+
+    def test_a_subject_only_message_has_no_trailers(self):
+        # "feat: something" is a subject, not provenance — reading it as a trailer would
+        # invent an instruction source that was never recorded
+        self.assertEqual(parse_trailers("feat: add a thing\n"), {})
+
+    def test_a_body_that_is_not_a_trailer_block_is_ignored(self):
+        self.assertEqual(parse_trailers("Subject\n\nsome prose, not a trailer\n"), {})
+
+    def test_a_change_carries_prose_and_provenance_but_no_diff(self):
+        change = build_change(
+            "abc1234def", "2026-08-05T10:00:00+00:00", "buzai assistant", self.MESSAGE
+        )
+        self.assertEqual(change.short, "abc1234d")
+        self.assertEqual(change.subject, "Record the boiler service")
+        self.assertEqual(change.changed, "appended a 1-line entry to home.md under 'House'.")
+        self.assertEqual(change.why, "the owner mentioned it in passing")
+        self.assertEqual(change.file, "home.md")
+        self.assertEqual(change.source, "autonomous")
+        self.assertEqual(change.section, "House")
+
+
+class TestReviewable(unittest.TestCase):
+    def change(self, source: str) -> Change:
+        return Change("a" * 40, NOW, "buzai assistant", "s", "c", "w", "notes.md", "append", source)
+
+    def test_assistant_recorded_changes_are_reviewed(self):
+        for source in (AUTONOMOUS, "owner-directed", UNATTRIBUTED):
+            self.assertTrue(reviewable(self.change(source)), source)
+
+    def test_corrections_are_not_re_reviewed(self):
+        self.assertFalse(reviewable(self.change(OWNER_CORRECTION)))
+
+    def test_commits_with_no_instruction_source_are_not_review_items(self):
+        self.assertFalse(reviewable(self.change("")))
+
+
+class TestCountBlock(unittest.TestCase):
+    """The matcher counts rather than answering yes/no: one match and two matches call
+    for opposite actions (remove, or refuse), and a hub repeats lines constantly."""
+
+    DOC = "# Notes\n\n- one\n- two\n- three\n"
+    REPEATED = "# Notes\n\n## Car\n\n- Renewed the policy.\n\n## Home\n\n- Renewed the policy.\n"
+
+    def test_a_present_block_is_found(self):
+        self.assertEqual(count_block(self.DOC, ["- two"]), 1)
+
+    def test_a_multi_line_block_must_be_contiguous(self):
+        self.assertEqual(count_block(self.DOC, ["- two", "- three"]), 1)
+        self.assertEqual(count_block(self.DOC, ["- one", "- three"]), 0)
+
+    def test_reworded_content_is_not_a_match(self):
+        self.assertEqual(count_block(self.DOC, ["- two (reworded)"]), 0)
+
+    def test_an_empty_block_never_matches(self):
+        self.assertEqual(count_block(self.DOC, []), 0)
+        self.assertEqual(count_block(self.REPEATED, [], "Home"), 0)
+
+    def test_a_repeated_line_is_counted_not_collapsed(self):
+        self.assertEqual(count_block(self.REPEATED, ["- Renewed the policy."]), 2)
+
+    def test_a_section_narrows_the_search_to_one_of_them(self):
+        self.assertEqual(count_block(self.REPEATED, ["- Renewed the policy."], "Home"), 1)
+        self.assertEqual(count_block(self.REPEATED, ["- Renewed the policy."], "Car"), 1)
+
+    def test_a_heading_that_is_gone_matches_nothing_rather_than_wandering(self):
+        self.assertEqual(count_block(self.REPEATED, ["- Renewed the policy."], "Garage"), 0)
+
+    def test_the_heading_line_itself_is_outside_its_own_body(self):
+        self.assertEqual(count_block(self.REPEATED, ["## Home"], "Home"), 0)
+
+
+class TestRemovalScope(unittest.TestCase):
+    def test_an_ordinary_entry_keeps_its_heading(self):
+        self.assertEqual(removal_scope(["- a fact"], "Health"), "Health")
+
+    def test_a_block_that_carries_a_heading_is_searched_unscoped(self):
+        # `_apply_append` creates a missing section as part of the entry, so the recorded
+        # block starts with `## Health` — which a scoped search could never find, because
+        # a section body does not contain its own heading
+        self.assertIsNone(removal_scope(["## Health", "", "- a fact"], "Health"))
+
+    def test_no_recorded_heading_stays_unscoped(self):
+        self.assertIsNone(removal_scope(["- a fact"], None))
+
+
+class TestSplitHunks(unittest.TestCase):
+    """One block per hunk. A flattened block spanning two hunks is contiguous nowhere in
+    the file, so it silently matches nothing and a rejection removes nothing."""
+
+    TWO_HUNKS = (
+        "diff --git a/notes.md b/notes.md\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/notes.md\n"
+        "+++ b/notes.md\n"
+        "@@ -5 +5 @@ ## Health\n"
+        "-- line one\n"
+        "+- new one\n"
+        "@@ -7 +7 @@\n"
+        "-- line three\n"
+        "+- new three\n"
+    )
+
+    def test_each_hunk_becomes_its_own_block(self):
+        self.assertEqual(split_hunks(self.TWO_HUNKS), [["- new one"], ["- new three"]])
+
+    def test_the_file_header_is_never_mistaken_for_added_content(self):
+        for block in split_hunks(self.TWO_HUNKS):
+            self.assertNotIn("+++ b/notes.md", block)
+            self.assertNotIn(" b/notes.md", block)
+
+    def test_a_multi_line_hunk_stays_one_contiguous_block(self):
+        diff = "@@ -1,0 +2,2 @@\n+- one\n+- two\n"
+        self.assertEqual(split_hunks(diff), [["- one", "- two"]])
+
+    def test_a_hunk_that_only_deleted_contributes_no_block(self):
+        self.assertEqual(split_hunks("@@ -3 +2,0 @@\n-- gone\n"), [])
+
+    def test_blank_padding_is_trimmed_off_each_block(self):
+        self.assertEqual(split_hunks("@@ -1,0 +2,3 @@\n+\n+- one\n+\n"), [["- one"]])
+
+
+class TestDispositionRoundTrip(unittest.TestCase):
+    def test_a_rejection_round_trips_through_the_note(self):
+        note = Disposition(
+            REJECTED, NOW, reason="wrong number", resolution=REMOVED, corrections=("abc",)
+        )
+        back = parse_disposition(note.to_json(), "deadbeef")
+        self.assertEqual(back, note)
+
+    def test_an_unreadable_note_is_reported_not_guessed(self):
+        for text in ("not json at all", '{"disposition": "approved"}', "{}"):
+            with self.assertRaises(HubReviewError):
+                parse_disposition(text, "deadbeef")
+
+
+class TestSummary(unittest.TestCase):
+    CHANGE = Change(
+        "a" * 40,
+        NOW - timedelta(hours=5),
+        "buzai assistant",
+        "Record the boiler service",
+        "appended a 1-line entry to home.md under 'House'.",
+        "the owner mentioned it in passing",
+        "home.md",
+        "append-entry",
+        AUTONOMOUS,
+    )
+
+    def test_pending_items_are_plain_language_never_a_diff(self):
+        text = "\n".join(summarize([self.CHANGE], Backlog(), NOW, total=1))
+        self.assertIn("1 change(s) awaiting review", text)
+        self.assertIn("Record the boiler service", text)
+        self.assertIn("appended a 1-line entry to home.md", text)
+        self.assertIn("5h ago", text)
+        for marker in ("diff --git", "@@ ", "\n+", "\n-"):
+            self.assertNotIn(marker, text)
+
+    def test_nothing_pending_reports_cleanly(self):
+        lines = summarize([], Backlog(), NOW, total=7)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("nothing is awaiting your review", lines[0])
+        self.assertIn("all 7 recorded change(s)", lines[0])
+
+    def test_an_empty_hub_is_not_an_error_either(self):
+        self.assertIn("nothing has been recorded", summarize([], Backlog(), NOW, total=0)[0])
+
+    def test_a_truncated_list_says_how_many_are_hidden(self):
+        text = "\n".join(summarize([self.CHANGE], Backlog(), NOW, total=9, hidden=8))
+        self.assertIn("9 change(s) awaiting review (showing the newest 1 of 9)", text)
+
+    def test_a_stale_backlog_leads_the_summary(self):
+        backlog = Backlog(((("a" * 40), NOW - timedelta(days=3)),))
+        lines = summarize([self.CHANGE], backlog, NOW, total=1)
+        self.assertIn("WARNING", lines[0])
+        self.assertIn("3d", lines[0])
+        self.assertIn("make hub-push", lines[0])
+
+    def test_a_fresh_backlog_does_not_warn(self):
+        backlog = Backlog(((("a" * 40), NOW - timedelta(hours=1)),))
+        self.assertIsNone(staleness_warning(backlog, NOW))
+        self.assertNotIn("WARNING", "\n".join(summarize([], backlog, NOW, total=1)))
+
+    def test_the_threshold_is_the_boundary(self):
+        just_under = Backlog(((("a" * 40), NOW - timedelta(seconds=STALE_BACKLOG_SECONDS - 60)),))
+        just_over = Backlog(((("a" * 40), NOW - timedelta(seconds=STALE_BACKLOG_SECONDS + 60)),))
+        self.assertIsNone(staleness_warning(just_under, NOW))
+        self.assertIsNotNone(staleness_warning(just_over, NOW))
+
+    def test_long_prose_wraps_with_a_hanging_indent(self):
+        change = Change(
+            "b" * 40, NOW, "buzai assistant", "Subject", "x " * 80, "y " * 80, "h.md", "op", "auto"
+        )
+        lines = change.plain(NOW, 1)
+        self.assertTrue(all(len(line) <= 100 for line in lines), lines)
+        self.assertTrue([line for line in lines if line.startswith(" " * 11 + "x")])
+
+    def test_durations_are_human(self):
+        self.assertEqual(duration(30), "under a minute")
+        self.assertEqual(duration(3600), "60m")
+        self.assertEqual(duration(5 * 3600), "5h")
+        self.assertEqual(duration(3 * 86400), "3d")
+
+
+# --- what changed ---------------------------------------------------------------------
+
+
+class TestWhatChanged(ReviewRepoCase):
+    def setUp(self):
+        super().setUp()
+        self.first = self.append("the boiler was serviced")
+        self.second = self.append("the dentist is on Oak Street")
+        self.third = self.append("bin day is Tuesday")
+
+    def test_every_recorded_change_is_pending_until_it_is_judged(self):
+        self.assertEqual(len(self.pending()), 3)
+
+    def test_the_seed_commit_is_not_a_review_item(self):
+        # `make hub-init` and the owner's own git commits carry no instruction source
+        self.assertNotIn("seed", self.pending_subjects())
+
+    def test_items_arrive_newest_first_with_their_reasons(self):
+        items = self.pending()
+        self.assertEqual(items[0].subject, "Record bin day is Tuesday")
+        self.assertIn("appended a 1-line entry to notes.md", items[0].changed)
+        self.assertIn("the assistant heard bin day is Tuesday", items[0].why)
+        self.assertEqual(items[0].source, AUTONOMOUS)
+
+    def test_content_found_loose_on_disk_shows_up_as_unattributed(self):
+        (self.hub / "home.md").write_text("# Home\n\n- typed straight into the file\n")
+        self.append("something else")  # triggers U4's dirty-tree reconciliation
+        sources = {c.source for c in self.pending()}
+        self.assertIn(UNATTRIBUTED, sources)
+
+    def test_the_listing_never_contains_a_diff(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            run_list(self.hub, 10, NOW)
+        text = out.getvalue()
+        self.assertIn("3 change(s) awaiting review", text)
+        self.assertNotIn("diff --git", text)
+        self.assertNotIn("@@", text)
+
+
+class TestApproval(ReviewRepoCase):
+    def setUp(self):
+        super().setUp()
+        self.first = self.append("the boiler was serviced")
+        self.second = self.append("the dentist is on Oak Street")
+        self.third = self.append("bin day is Tuesday")
+
+    def test_an_approved_item_does_not_come_back(self):
+        result = self.approve(self.second)
+        self.assertEqual(result.status, RECORDED)
+        self.assertNotIn(self.second, [c.sha for c in self.pending()])
+
+    def test_approval_changes_no_hub_content(self):
+        before = self.notes.read_text()
+        head = git("-C", str(self.hub), "rev-parse", "HEAD").strip()
+        self.approve(self.second)
+        self.assertEqual(self.notes.read_text(), before)
+        self.assertEqual(git("-C", str(self.hub), "rev-parse", "HEAD").strip(), head)
+
+    def test_partial_review_leaves_the_rest_pending(self):
+        self.approve(self.first)
+        self.approve(self.third)
+        remaining = self.pending()
+        self.assertEqual([c.sha for c in remaining], [self.second])
+
+    def test_the_disposition_is_stored_on_the_commit(self):
+        self.approve(self.second)
+        note = read_disposition(self.hub, self.second)
+        self.assertIsNotNone(note)
+        assert note is not None
+        self.assertEqual(note.disposition, APPROVED)
+        self.assertEqual(note.decided_at, NOW)
+
+    def test_a_second_verdict_is_refused_rather_than_applied_twice(self):
+        self.approve(self.second)
+        again = dispose(
+            self.hub, Decision(self.second, REJECTED, reason="changed my mind"), now=NOW, push=False
+        )
+        self.assertEqual(again.status, ALREADY_DISPOSED)
+        self.assertEqual(again.disposition, APPROVED)
+        self.assertIn("- the dentist is on Oak Street", self.notes.read_text())
+
+    def test_a_short_sha_identifies_the_item(self):
+        self.assertEqual(self.approve(self.third[:8]).status, RECORDED)
+
+
+# --- rejection ------------------------------------------------------------------------
+
+
+class TestRejectionRemoves(ReviewRepoCase):
+    """Covers AE2: three changes, one rejected with a reason — the content goes, the
+    correction is committed, and BOTH the original and the correction stay in history."""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.append("the boiler was serviced")
+        self.second = self.append("the dentist is on Oak Street")
+        self.third = self.append("bin day is Tuesday")
+        self.result = self.reject(self.second, reason="the dentist is on Elm Street")
+
+    def test_the_rejected_content_is_removed_from_the_file(self):
+        self.assertEqual(self.result.status, RECORDED)
+        self.assertEqual(self.result.resolution, REMOVED)
+        self.assertNotIn("Oak Street", self.notes.read_text())
+
+    def test_the_other_facts_are_untouched(self):
+        content = self.notes.read_text()
+        self.assertIn("- the boiler was serviced", content)
+        self.assertIn("- bin day is Tuesday", content)
+
+    def test_the_original_commit_is_still_in_history(self):
+        # R11: rejecting is not erasing — the record of what was recorded stays
+        self.assertIn(self.second, git("-C", str(self.hub), "rev-list", "HEAD").split())
+        self.assertIn("Record the dentist is on Oak Street", self.subjects())
+
+    def test_the_correction_is_a_commit_of_its_own(self):
+        self.assertEqual(len(self.result.corrections), 1)
+        message = git("-C", str(self.hub), "log", "-1", "--pretty=%B", self.result.corrections[0])
+        self.assertIn(f"instruction-source: {OWNER_CORRECTION}", message)
+        self.assertIn("hub-operation: remove-entry", message)
+
+    def test_the_owners_reason_travels_with_the_correction(self):
+        message = git("-C", str(self.hub), "log", "-1", "--pretty=%B", self.result.corrections[0])
+        self.assertIn("the dentist is on Elm Street", message)
+        self.assertIn(f"rejected-commit: {self.second}", message)
+
+    def test_nothing_was_invented_to_replace_it(self):
+        message = git("-C", str(self.hub), "log", "-1", "--pretty=%B", self.result.corrections[0])
+        self.assertIn("would be invented", message)
+        self.assertNotIn("Elm Street", self.notes.read_text())
+
+    def test_the_rejection_and_its_resolution_are_recorded(self):
+        note = read_disposition(self.hub, self.second)
+        assert note is not None
+        self.assertEqual(note.disposition, REJECTED)
+        self.assertEqual(note.reason, "the dentist is on Elm Street")
+        self.assertEqual(note.resolution, REMOVED)
+        self.assertEqual(note.corrections, self.result.corrections)
+
+    def test_the_correction_points_back_at_what_it_corrects(self):
+        note = read_disposition(self.hub, self.result.corrections[0])
+        assert note is not None
+        self.assertEqual(note.disposition, OWNER_AUTHORED)
+        self.assertEqual(note.corrects, self.second)
+
+    def test_neither_the_rejected_item_nor_the_correction_comes_back(self):
+        waiting = [c.sha for c in self.pending()]
+        self.assertNotIn(self.second, waiting)
+        self.assertNotIn(self.result.corrections[0], waiting)
+        self.assertEqual(sorted(waiting), sorted([self.first, self.third]))
+
+    def test_a_rejection_with_no_reason_is_refused(self):
+        result = self.reject(self.first, reason="   ")
+        self.assertEqual(result.status, FAILED)
+        self.assertIn("must carry the owner's reason", result.detail)
+        self.assertIn("- the boiler was serviced", self.notes.read_text())
+
+
+class TestRejectionWithAValue(ReviewRepoCase):
+    def setUp(self):
+        super().setUp()
+        self.sha = self.append("the dentist is on Oak Street", section="Health")
+        self.result = self.reject(
+            self.sha, reason="wrong street", value="- the dentist is on Elm Street"
+        )
+
+    def test_the_owners_value_replaces_the_rejected_content(self):
+        self.assertEqual(self.result.status, RECORDED)
+        self.assertEqual(self.result.resolution, REPLACED)
+        content = self.notes.read_text()
+        self.assertNotIn("Oak Street", content)
+        self.assertIn("- the dentist is on Elm Street", content)
+
+    def test_the_replacement_lands_under_the_original_heading(self):
+        content = self.notes.read_text()
+        self.assertIn("## Health\n\n- the dentist is on Elm Street", content)
+
+    def test_removal_and_replacement_are_both_in_history(self):
+        self.assertEqual(len(self.result.corrections), 2)
+        for sha in self.result.corrections:
+            message = git("-C", str(self.hub), "log", "-1", "--pretty=%B", sha)
+            self.assertIn(f"instruction-source: {OWNER_CORRECTION}", message)
+            self.assertIn("wrong street", message)
+
+    def test_the_note_records_that_it_was_replaced(self):
+        note = read_disposition(self.hub, self.sha)
+        assert note is not None
+        self.assertEqual(note.resolution, REPLACED)
+        self.assertEqual(len(note.corrections), 2)
+
+
+class TestStaleRejection(ReviewRepoCase):
+    """Rejecting a change from twenty commits ago whose text was reworded since. The
+    removal must resolve without needing the original hunk to still apply, and must not
+    guess which of the current lines descended from the rejected one."""
+
+    def setUp(self):
+        super().setUp()
+        self.sha = self.append("the dentist is on Oak Street", section="Health")
+        for n in range(20):
+            self.append(f"unrelated fact {n}")
+        self.replace_section("Health", "- the dentist is Dr. Smith, on Oak St.")
+        self.before = self.notes.read_text()
+        self.result = self.reject(self.sha, reason="I never said that")
+
+    def test_the_rejection_resolves_rather_than_failing(self):
+        self.assertEqual(self.result.status, RECORDED)
+        self.assertEqual(self.result.resolution, ALREADY_ABSENT)
+
+    def test_nothing_was_removed_and_nothing_was_invented(self):
+        self.assertEqual(self.notes.read_text(), self.before)
+        self.assertEqual(self.result.corrections, ())
+
+    def test_the_owner_is_told_what_happened_and_what_to_do_next(self):
+        self.assertIn("no longer in notes.md", self.result.detail)
+        self.assertIn("reject the change that wrote it", self.result.detail)
+
+    def test_the_verdict_is_still_recorded_with_its_reason(self):
+        note = read_disposition(self.hub, self.sha)
+        assert note is not None
+        self.assertEqual(note.disposition, REJECTED)
+        self.assertEqual(note.reason, "I never said that")
+        self.assertNotIn(self.sha, [c.sha for c in self.pending()])
+
+    def test_rejecting_the_rewording_removes_what_is_actually_there(self):
+        rewording = [c for c in self.pending() if "Reword" in c.subject][0]
+        result = self.reject(rewording.sha, reason="wrong too")
+        self.assertEqual(result.resolution, REMOVED)
+        self.assertNotIn("Dr. Smith", self.notes.read_text())
+
+
+class TestRejectingARemoval(ReviewRepoCase):
+    """Rejecting a change that took content *out*. There is nothing to remove, and the
+    removed text is not put back on this module's initiative — restoring it is a value
+    judgement only the owner can make, which is what `--value` is for."""
+
+    def setUp(self):
+        super().setUp()
+        self.append("the boiler was serviced")
+        result = record(
+            self.hub,
+            WriteRequest(
+                Operation(REMOVE_ENTRY, "notes.md", "- seeded fact"),
+                summary="Drop the seeded fact",
+                reason="the assistant judged it obsolete",
+            ),
+            now=NOW,
+            push=False,
+        )
+        self.removal = result.commit
+
+    def test_it_resolves_as_nothing_to_remove(self):
+        result = self.reject(self.removal, reason="I still need that")
+        self.assertEqual(result.status, RECORDED)
+        self.assertEqual(result.resolution, NOTHING_TO_REMOVE)
+        self.assertEqual(result.corrections, ())
+        self.assertIn("added nothing to notes.md", result.detail)
+
+    def test_the_owners_value_is_what_puts_content_back(self):
+        self.reject(self.removal, reason="I still need that", value="- seeded fact")
+        self.assertIn("- seeded fact", self.notes.read_text())
+
+    def test_a_value_does_not_turn_nothing_to_remove_into_replaced(self):
+        """`replaced` is a claim about the OLD content, and here none came out.
+
+        Verified against the version that set REPLACED whenever a value was supplied: the
+        owner was told their content had been replaced by a run that removed nothing and
+        appended their value beside whatever was already there.
+        """
+        result = self.reject(self.removal, reason="I still need that", value="- seeded fact")
+        self.assertEqual(result.resolution, NOTHING_TO_REMOVE)
+        self.assertNotEqual(result.resolution, REPLACED)
+        self.assertIn("nothing was removed to make room for it", result.detail)
+        note = read_disposition(self.hub, self.removal)
+        assert note is not None
+        self.assertEqual(note.resolution, NOTHING_TO_REMOVE)
+
+
+class TestRejectionDoesNotRemoveTheWrongEntry(ReviewRepoCase):
+    """A hub repeats itself: the same bullet under two headings is ordinary, not exotic.
+
+    Rejecting the one under 'Home' must take out the one under 'Home'. An unscoped search
+    takes the FIRST match instead — here, the still-correct entry under 'Car' — which is
+    silent destruction of knowledge by the feature whose whole purpose is protecting it.
+    Verified against the unscoped version: the 'Car' entry was the one that vanished and
+    the rejected 'Home' entry stayed put, with the verdict reported as a clean success.
+    """
+
+    REPEATED = "- Renewed the policy."
+    SEED = f"# Notes\n\n## Car\n\n{REPEATED}\n\n## Home\n\n- the boiler was serviced\n"
+
+    def setUp(self):
+        super().setUp()
+        self.sha = self.append("Renewed the policy.", section="Home")
+        self.assertEqual(self.notes.read_text().count(self.REPEATED), 2)  # the plant is real
+        self.result = self.reject(self.sha, reason="that was the car, not the house")
+
+    def test_the_rejected_entry_is_the_one_that_goes(self):
+        self.assertEqual(self.result.status, RECORDED, self.result.detail)
+        self.assertEqual(self.result.resolution, REMOVED)
+        self.assertEqual(
+            self.notes.read_text(),
+            f"# Notes\n\n## Car\n\n{self.REPEATED}\n\n## Home\n\n- the boiler was serviced\n",
+        )
+
+    def test_the_untouched_entry_under_the_other_heading_survives(self):
+        section = self.notes.read_text().split("## Home")[0]
+        self.assertIn(self.REPEATED, section)
+        self.assertEqual(self.notes.read_text().count(self.REPEATED), 1)
+
+    def test_the_removal_commit_names_the_heading_it_was_scoped_to(self):
+        message = git("-C", str(self.hub), "log", "-1", "--pretty=%B", self.result.corrections[0])
+        self.assertIn("removed a 1-line entry from notes.md under 'Home'", message)
+
+
+class TestAmbiguousRemovalIsRefused(ReviewRepoCase):
+    """When the block is still not unique inside the window, there is no way to tell which
+    occurrence the rejected commit wrote — so nothing is removed and the item stays open.
+
+    Verified against the guessing version: it removed the pre-existing seeded line (the
+    first match, and not the one the commit wrote), reported `removed`, and settled the
+    item — the owner would have been told their rejection succeeded.
+    """
+
+    REPEATED = "- Renewed the policy."
+    SEED = f"# Notes\n\n{REPEATED}\n"
+
+    def setUp(self):
+        super().setUp()
+        self.sha = self.append("Renewed the policy.")  # no heading: the whole file is the window
+        self.before = self.notes.read_text()
+        self.assertEqual(self.before.count(self.REPEATED), 2)  # the plant is real
+        self.result = self.reject(self.sha, reason="I never renewed anything")
+
+    def test_the_verdict_is_refused_rather_than_guessed(self):
+        self.assertEqual(self.result.status, FAILED)
+        self.assertEqual(self.result.corrections, ())
+
+    def test_not_one_line_was_removed(self):
+        self.assertEqual(self.notes.read_text(), self.before)
+        self.assertEqual(self.commit_count(), 2)  # seed + the append; no correction commit
+
+    def test_the_owner_is_told_where_and_how_many(self):
+        self.assertIn("notes.md", self.result.detail)
+        self.assertIn("appears 2 times", self.result.detail)
+        self.assertIn("no heading", self.result.detail)
+        self.assertIn("hub_commit.py", self.result.detail)
+
+    def test_the_item_is_left_open_for_review_not_marked_resolved(self):
+        self.assertIsNone(read_disposition(self.hub, self.sha))
+        self.assertIn(self.sha, [c.sha for c in self.pending()])
+
+    def test_a_refusal_is_not_a_diff(self):
+        for marker in ("diff --git", "@@ ", self.REPEATED):
+            self.assertNotIn(marker, self.result.detail)
+
+    def test_the_command_line_reports_it_as_a_failure(self):
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(self.hub)
+        second = self.append("Renewed the policy.")  # a third copy, still ambiguous
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main(["--reject", second, "--reason", "no", "--no-push"])
+        self.assertEqual(rc, 1)
+        self.assertIn("still awaiting your review", err.getvalue())
+
+
+class TestAmbiguityInsideOneSection(ReviewRepoCase):
+    """Scoping narrows the window; it does not make a duplicate inside it decidable."""
+
+    SEED = "# Notes\n\n## Health\n\n- Dr. Smith, Tuesdays.\n\n## Car\n\n- Dr. Smith, Tuesdays.\n"
+
+    def setUp(self):
+        super().setUp()
+        self.sha = self.append("Dr. Smith, Tuesdays.", section="Health")
+        self.before = self.notes.read_text()
+        self.result = self.reject(self.sha, reason="wrong day")
+
+    def test_two_matches_inside_the_scoped_window_still_refuse(self):
+        self.assertEqual(self.result.status, FAILED)
+        self.assertEqual(self.notes.read_text(), self.before)
+
+    def test_the_refusal_names_the_heading_it_searched(self):
+        self.assertIn("'Health'", self.result.detail)
+        self.assertIn("appears 2 times", self.result.detail)
+
+
+class TestMultiHunkRejection(ReviewRepoCase):
+    """A commit that touched two places in a file added two separate runs of text.
+
+    Flattened into one block they are contiguous nowhere, so the search finds nothing, the
+    rejection resolves as `already-absent`, and the owner is told they rejected content
+    that is still sitting in their hub. Verified against the flattening version: both
+    lines were still in the file and the verdict came back `already-absent` with no
+    corrections.
+    """
+
+    SEED = (
+        "# Notes\n\n## Health\n\n- line one\n- shared line\n- line three\n\n"
+        "## Home\n\n- the boiler was serviced\n"
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.sha = self.replace_section("Health", "- new one\n- shared line\n- new three")
+
+    def test_the_commit_really_produced_more_than_one_hunk(self):
+        # without this the rest of the class would pass against a one-hunk commit, which
+        # is precisely the case the bug did NOT affect
+        self.assertEqual(len(added_blocks(self.hub, self.sha, "notes.md")), 2)
+
+    def test_every_block_the_commit_wrote_is_removed(self):
+        result = self.reject(self.sha, reason="none of that is right")
+        self.assertEqual(result.status, RECORDED, result.detail)
+        self.assertEqual(result.resolution, REMOVED)
+        content = self.notes.read_text()
+        self.assertNotIn("- new one", content)
+        self.assertNotIn("- new three", content)
+        self.assertIn("- shared line", content)  # it did not write that one
+
+    def test_one_remove_entry_correction_per_present_block(self):
+        result = self.reject(self.sha, reason="none of that is right")
+        self.assertEqual(len(result.corrections), 2)
+        for sha in result.corrections:
+            message = git("-C", str(self.hub), "log", "-1", "--pretty=%B", sha)
+            self.assertIn("hub-operation: remove-entry", message)
+            self.assertIn(f"instruction-source: {OWNER_CORRECTION}", message)
+        subjects = [
+            git("-C", str(self.hub), "log", "-1", "--pretty=%s", s) for s in result.corrections
+        ]
+        self.assertIn("part 1 of 2", subjects[0])
+        self.assertIn("part 2 of 2", subjects[1])
+
+    def test_a_partly_superseded_commit_reports_both_halves(self):
+        record(
+            self.hub,
+            WriteRequest(
+                Operation(REMOVE_ENTRY, "notes.md", "- new three"),
+                summary="Drop the third line",
+                reason="a later session tidied it away",
+            ),
+            now=NOW,
+            push=False,
+        )
+        result = self.reject(self.sha, reason="none of that is right")
+
+        self.assertEqual(result.status, RECORDED, result.detail)
+        self.assertEqual(result.resolution, PARTIALLY_REMOVED)
+        self.assertEqual(len(result.corrections), 1)
+        self.assertIn("Removed: 1", result.detail)
+        self.assertIn("Already gone", result.detail)
+        self.assertNotIn("- new one", self.notes.read_text())
+
+    def test_a_partial_outcome_is_recorded_as_partial_in_the_note(self):
+        record(
+            self.hub,
+            WriteRequest(
+                Operation(REMOVE_ENTRY, "notes.md", "- new three"), "Drop it", "tidied away"
+            ),
+            now=NOW,
+            push=False,
+        )
+        self.reject(self.sha, reason="none of that is right")
+        note = read_disposition(self.hub, self.sha)
+        assert note is not None
+        self.assertEqual(note.resolution, PARTIALLY_REMOVED)  # never a plain "removed"
+
+
+class TestUnattributedContentIsRejectableNotOnlyApprovable(ReviewRepoCase):
+    """Content found loose on disk is committed as `unattributed` so review can SEE it —
+    and it is the LEAST trusted thing in the store, so the owner has to be able to take it
+    out. Verified against the unfixed version: the reconcile commit carried no `hub-file:`
+    trailer, so every rejection came back "names no hub file" and the only verdict the
+    owner could actually apply to unclaimed content was *approve*.
+    """
+
+    def setUp(self):
+        super().setUp()
+        (self.hub / "home.md").write_text("# Home\n\n- typed straight into the file\n")
+        self.append("a fact from the assistant")  # triggers U4's dirty-tree reconciliation
+        self.loose = next(c for c in self.pending() if c.source == UNATTRIBUTED)
+
+    def home(self) -> str:
+        return (self.hub / "home.md").read_text()
+
+    def test_the_reconcile_commit_names_the_file_it_swept_up(self):
+        self.assertEqual(self.loose.named_files, ("home.md",))
+
+    def test_rejecting_it_removes_the_content(self):
+        result = self.reject(self.loose.sha, reason="I did not write that and it is wrong")
+        self.assertEqual(result.status, RECORDED, result.detail)
+        self.assertEqual(result.resolution, REMOVED)
+        self.assertNotIn("typed straight into the file", self.home())
+
+    def test_the_verdict_is_recorded_and_the_item_does_not_come_back(self):
+        result = self.reject(self.loose.sha, reason="not mine")
+        note = read_disposition(self.hub, self.loose.sha)
+        assert note is not None
+        self.assertEqual(note.disposition, REJECTED)
+        self.assertEqual(note.corrections, result.corrections)
+        self.assertNotIn(self.loose.sha, [c.sha for c in self.pending()])
+
+    def test_the_assistants_own_fact_is_untouched(self):
+        self.reject(self.loose.sha, reason="not mine")
+        self.assertIn("- a fact from the assistant", self.notes.read_text())
+
+
+class TestRejectingAMultiFileReconciliation(ReviewRepoCase):
+    """One reconcile commit can sweep several loose files, so one rejection has to act on
+    all of them. Verified against a single-`file`-trailer version: only the last file
+    named was searched and the other file's content stayed in the hub."""
+
+    def setUp(self):
+        super().setUp()
+        (self.hub / "home.md").write_text("# Home\n\n- typed straight into the file\n")
+        self.notes.write_text(self.SEED + "- edited by hand\n")
+        self.append("a fact from the assistant")
+        self.loose = next(c for c in self.pending() if c.source == UNATTRIBUTED)
+        self.result = self.reject(self.loose.sha, reason="none of that is mine")
+
+    def test_both_files_are_named_on_the_commit(self):
+        self.assertEqual(sorted(self.loose.named_files), ["home.md", "notes.md"])
+
+    def test_both_files_lose_the_unattributed_content(self):
+        self.assertEqual(self.result.status, RECORDED, self.result.detail)
+        self.assertEqual(self.result.resolution, REMOVED)
+        self.assertNotIn("typed straight into the file", (self.hub / "home.md").read_text())
+        self.assertNotIn("- edited by hand", self.notes.read_text())
+
+    def test_one_removal_commit_per_file(self):
+        self.assertEqual(len(self.result.corrections), 2)
+        for sha in self.result.corrections:
+            self.assertIn(
+                "hub-operation: remove-entry",
+                git("-C", str(self.hub), "log", "-1", "--pretty=%B", sha),
+            )
+
+    def test_the_listing_names_every_file_the_owner_would_be_judging(self):
+        text = "\n".join(self.loose.plain(NOW, 1))
+        self.assertIn("files: ", text)  # plural, and both of them
+        self.assertIn("home.md", text)
+        self.assertIn("notes.md", text)
+
+
+class TestLegacyReconcileCommitsStayRejectable(ReviewRepoCase):
+    """Reconcile commits written before the trailer existed carry no `hub-file:` at all.
+
+    They are already in owners' hubs, so the fix cannot be trailer-only: what git says the
+    commit touched is the fallback. Verified against the trailer-only version: this
+    rejection came back `failed` with "names no hub file" and the content stayed.
+    """
+
+    # The message U4 wrote before `hub-file:` trailers were emitted, kept verbatim.
+    LEGACY = (
+        "Reconcile uncommitted hub content\n\n"
+        "Changed: committed 1 file(s) found uncommitted in the hub working tree before "
+        "this session's write.\n"
+        "Why: content that only exists on disk is invisible to review.\n\n"
+        "  - home.md\n\n"
+        "instruction-source: unattributed\n"
+    )
+
+    def setUp(self):
+        super().setUp()
+        (self.hub / "home.md").write_text("# Home\n\n- typed straight into the file\n")
+        git("-C", str(self.hub), "add", "--", "home.md")
+        git("-C", str(self.hub), "commit", "-q", "-m", self.LEGACY)
+        self.loose = next(c for c in self.pending() if c.source == UNATTRIBUTED)
+
+    def test_the_plant_really_has_no_file_trailer(self):
+        self.assertEqual(self.loose.named_files, ())
+        self.assertEqual(trailer_values(self.LEGACY, "hub-file"), ())
+
+    def test_it_is_still_rejectable_through_what_git_says_it_touched(self):
+        result = self.reject(self.loose.sha, reason="I did not write that")
+        self.assertEqual(result.status, RECORDED, result.detail)
+        self.assertEqual(result.resolution, REMOVED)
+        self.assertNotIn("typed straight into the file", (self.hub / "home.md").read_text())
+
+    def test_a_commit_from_outside_the_write_path_is_still_refused(self):
+        # the fallback is scoped to commits the write path made: a commit with no
+        # instruction source is the owner's own, or the store's seed, and this flow is
+        # not a general-purpose file editor
+        seed = git("-C", str(self.hub), "rev-list", "--max-parents=0", "HEAD").strip()
+        result = self.reject(seed, reason="not mine")
+        self.assertEqual(result.status, FAILED)
+        self.assertIn("names no hub file", result.detail)
+
+
+class TestTheHubInitSeedIsNotAReviewItem(ReviewRepoCase):
+    """`hub_init`'s initial commit carries an `instruction-source` trailer, and the source
+    filter here does not drop it — so without the root-commit exclusion the store's own
+    bootstrap is the first thing every fresh instance asks its owner to review. It is not
+    assistant-recorded knowledge at all.
+
+    The seed's source is now `hub_init.BOOTSTRAP_SOURCE` rather than `owner-directed`
+    (previously it claimed the same source as knowledge recorded at the owner's request).
+    That is deliberately *additive*: `reviewable()` filters only `owner-correction`, so a
+    new source value changes nothing here and the root-commit exclusion is still what
+    keeps the seed out of the queue. This class is the proof of that, which is why it
+    asserts the seed is reviewable-by-source first.
+
+    Verified against the unfixed version: `Initialize hub store` was item 1 of the listing
+    on a brand-new hub.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # the real message `hub_init` writes, on the repo's root commit
+        git("-C", str(self.hub), "commit", "-q", "--amend", "-m", hub_init_commit_message())
+        self.seed = git("-C", str(self.hub), "rev-parse", "HEAD").strip()
+        self.fact = self.append("the boiler was serviced")
+
+    def test_the_seed_really_carries_an_instruction_source(self):
+        # without this the class would pass against a seed the source filter already drops
+        change = find_change(self.hub, self.seed)
+        self.assertEqual(change.source, BOOTSTRAP_SOURCE)
+        self.assertNotEqual(BOOTSTRAP_SOURCE, OWNER_DIRECTED)
+        self.assertTrue(reviewable(change), "the source filter alone does not exclude it")
+
+    def test_the_root_commit_is_excluded(self):
+        self.assertFalse(reviewable(find_change(self.hub, self.seed), root_commits(self.hub)))
+        self.assertEqual(root_commits(self.hub), frozenset({self.seed}))
+
+    def test_the_owner_is_never_asked_to_review_the_bootstrap(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            run_list(self.hub, 10, NOW)
+        text = out.getvalue()
+        self.assertNotIn("Initialize hub store", text)
+        self.assertIn("1 change(s) awaiting review", text)
+
+    def test_recorded_knowledge_is_still_reviewed(self):
+        self.assertEqual([c.sha for c in self.pending()], [self.fact])
+
+
+class TestHubInitMigrationIsReviewedOneFileAtATime(unittest.TestCase):
+    """The REAL `hub_init.initialize()` output, run through this module — not a synthetic
+    commit shaped like one.
+
+    Two defects lived in the gap between the two modules, and a hand-made `--allow-empty`
+    commit could show neither. `hub_init` migrated every file in ONE commit whose message
+    had no `Changed:` line, no `Why:` line and no `hub-file:` trailer, and `build_change`
+    fills an item's what, why and files from exactly those — so the owner was shown a bare
+    subject. And a rejection acts on every file its commit touched, so one "no" emptied
+    every migrated file, after `hub_init` had already deleted the checkout copies.
+
+    PLANT: two migrated files, one nested in a folder hub.
+    """
+
+    FINANCE = "# Finance\n\n- the accountant is Dana Reyes\n"
+    NOTES = "# Trip\n\n- the ferry leaves at 07:40\n"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        source = root / "checkout" / "hubs"
+        (source / "trip").mkdir(parents=True)
+        (source / "README.md").write_text("# Hubs — scaffolds live here\n")
+        (source / "_example-hub.md").write_text("# <Domain> hub\n")
+        (source / "finance-and-tax.md").write_text(self.FINANCE)
+        (source / "trip" / "notes.md").write_text(self.NOTES)
+        self.hub = root / "hubs"
+        self.result = hub_init_initialize(self.hub, source, NOW)
+        self.roots = root_commits(self.hub)
+
+    def pending(self) -> list[Change]:
+        noted = disposed_shas(self.hub)
+        return [
+            c for c in read_changes(self.hub) if reviewable(c, self.roots) and c.sha not in noted
+        ]
+
+    def item_for(self, rel: str) -> Change:
+        return next(c for c in self.pending() if c.named_files == (rel,))
+
+    def test_the_store_is_the_seed_plus_one_commit_per_migrated_file(self):
+        self.assertEqual(self.result.migrated, ["finance-and-tax.md", "trip/notes.md"])
+        count = int(git("-C", str(self.hub), "rev-list", "--count", "HEAD").strip())
+        self.assertEqual(count, 1 + len(self.result.migrated))
+
+    def test_the_seed_is_still_excluded(self):
+        self.assertEqual(len(self.roots), 1)
+        (seed,) = self.roots
+        self.assertFalse(reviewable(find_change(self.hub, seed), self.roots))
+        self.assertNotIn(seed, [c.sha for c in self.pending()])
+
+    def test_one_pending_item_per_migrated_file_each_naming_only_its_file(self):
+        self.assertEqual(
+            sorted(c.named_files for c in self.pending()),
+            [("finance-and-tax.md",), ("trip/notes.md",)],
+        )
+
+    def test_each_item_carries_what_and_why_and_its_source(self):
+        for rel in ("finance-and-tax.md", "trip/notes.md"):
+            change = self.item_for(rel)
+            self.assertIn(rel, change.changed)
+            self.assertIn("public", change.why)
+            self.assertEqual(change.source, OWNER_DIRECTED)
+
+    def test_the_plain_language_read_out_names_the_file_and_the_what_and_why(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            run_list(self.hub, 10, NOW)
+        text = out.getvalue()
+        self.assertIn("2 change(s) awaiting review", text)
+        self.assertNotIn("Initialize hub store", text)
+        for rel in ("finance-and-tax.md", "trip/notes.md"):
+            self.assertIn(f"file: {rel}", text)
+        self.assertEqual(text.count("what:"), 2, text)
+        self.assertEqual(text.count("why:"), 2, text)
+
+    def test_rejecting_one_migrated_file_leaves_the_other_intact(self):
+        notes_before = (self.hub / "trip" / "notes.md").read_bytes()
+
+        result = dispose(
+            self.hub,
+            Decision(self.item_for("finance-and-tax.md").sha, REJECTED, reason="not mine"),
+            now=NOW,
+            push=False,
+        )
+
+        self.assertEqual(result.status, RECORDED, result.detail)
+        self.assertEqual(result.resolution, REMOVED)
+        self.assertNotIn("Dana Reyes", (self.hub / "finance-and-tax.md").read_text())
+        self.assertEqual((self.hub / "trip" / "notes.md").read_bytes(), notes_before)
+        # and the other file is still awaiting its own verdict
+        self.assertEqual([c.named_files for c in self.pending()], [("trip/notes.md",)])
+
+
+class MultiLineEntryCase(ReviewRepoCase):
+    """A three-line entry recorded as ONE block, for the two ways it can go stale."""
+
+    SEED = "# Notes\n\n## Health\n\n- baseline\n"
+    ENTRY = "- the dentist is on Oak Street\n- appointments are on Tuesdays\n- ring the bell twice"
+
+    def setUp(self):
+        super().setUp()
+        self.sha = record(
+            self.hub,
+            WriteRequest(
+                Operation(APPEND_ENTRY, "notes.md", self.ENTRY, section="Health"),
+                summary="Record the dentist details",
+                reason="the assistant heard them in conversation",
+            ),
+            now=NOW,
+            push=False,
+        ).commit
+
+
+class TestPartiallyEditedRejectedContent(MultiLineEntryCase):
+    """One block, edited *within* since: a line reworded, the rest still standing.
+
+    `PARTIALLY_REMOVED` covers a commit that wrote several BLOCKS of which some survive.
+    This is the other half and it is not covered by that: the run no longer matches
+    anywhere, so the single block counts as absent and the verdict resolves as
+    `already-absent` — closing the item while the surviving lines sit in the hub. Verified
+    against the version without `_refuse_if_partially_edited`: the rejection came back
+    `recorded` / `already-absent`, the note was written, and two of the three rejected
+    lines were still in notes.md.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.replace_section(
+            "Health",
+            "- baseline\n- the dentist is on Elm Street\n"
+            "- appointments are on Tuesdays\n- ring the bell twice",
+        )
+        self.before = self.notes.read_text()
+        self.commits_before = self.commit_count()
+        self.result = self.reject(self.sha, reason="I never said any of that")
+
+    def test_the_plant_is_one_block_that_no_longer_matches(self):
+        self.assertEqual(len(added_blocks(self.hub, self.sha, "notes.md")), 1)
+        self.assertNotIn("Oak Street", self.before)
+        self.assertIn("- appointments are on Tuesdays", self.before)
+
+    def test_the_verdict_is_refused_rather_than_resolved_as_absent(self):
+        self.assertEqual(self.result.status, FAILED)
+        self.assertNotEqual(self.result.resolution, ALREADY_ABSENT)
+        self.assertEqual(self.result.corrections, ())
+
+    def test_nothing_was_removed_and_nothing_was_committed(self):
+        self.assertEqual(self.notes.read_text(), self.before)
+        self.assertEqual(self.commit_count(), self.commits_before)
+
+    def test_the_item_is_left_open_rather_than_closed_over_surviving_lines(self):
+        self.assertIsNone(read_disposition(self.hub, self.sha))
+        self.assertIn(self.sha, [c.sha for c in self.pending()])
+
+    def test_the_owner_is_told_which_lines_are_still_there(self):
+        self.assertIn("PARTIALLY EDITED", self.result.detail)
+        self.assertIn("2 of its 3 line(s)", self.result.detail)
+        self.assertIn("- appointments are on Tuesdays", self.result.detail)
+        self.assertIn("- ring the bell twice", self.result.detail)
+        self.assertNotIn("Oak Street", self.result.detail)  # that line is genuinely gone
+
+
+class TestWhollySupersededContentStillResolves(MultiLineEntryCase):
+    """The guard must not turn every stale rejection into a refusal: when NOTHING the
+    block recorded is still there, `already-absent` is the honest answer and the item is
+    settled. Its own class, so it never depends on another rejection having failed."""
+
+    def setUp(self):
+        super().setUp()
+        self.replace_section("Health", "- baseline\n- see the practice website")
+        self.before = self.notes.read_text()
+        self.result = self.reject(self.sha, reason="I never said any of that")
+
+    def test_it_resolves_rather_than_refusing(self):
+        self.assertEqual(self.result.status, RECORDED, self.result.detail)
+        self.assertEqual(self.result.resolution, ALREADY_ABSENT)
+
+    def test_the_item_is_settled_and_the_file_untouched(self):
+        self.assertEqual(self.notes.read_text(), self.before)
+        self.assertNotIn(self.sha, [c.sha for c in self.pending()])
+
+
+class TestGitDetailIsOneSharedHelper(unittest.TestCase):
+    """`hub_review` had its own untyped near-copy of `hub_commit._detail`; a third is
+    inlined in `hub_init`. The text is what every failure in both units is reported with,
+    and the copies had already drifted (one typed, one not)."""
+
+    def test_hub_review_uses_hub_commits_helper_rather_than_a_copy(self):
+        self.assertIs(review_detail_of, commit_detail_of)
+
+    def test_it_prefers_stderr_then_stdout_then_the_exit_code(self):
+        self.assertEqual(commit_detail_of(GitResult(1, "out", "one\nfatal: bad")), "fatal: bad")
+        self.assertEqual(commit_detail_of(GitResult(1, "first\nsecond", "")), "second")
+        self.assertEqual(commit_detail_of(GitResult(3, "", "")), "exit 3")
+
+
+class TestReviewScopeMatchesWhatTheCliCanRecord(unittest.TestCase):
+    """P1-D, as the invariant rather than as a flag list.
+
+    `reviewable()` drops `owner-correction` because that source is only ever produced by
+    the rejection flow, which writes the matching note in the same breath. That is sound
+    exactly as long as nothing else can mint it. Verified against the version whose CLI
+    offered every source: `owner-correction` was reachable from the command line and this
+    test fails on it — an assistant told "record the correction the owner just gave me"
+    would have written hub content that never appears for review.
+    """
+
+    def test_every_source_the_cli_accepts_produces_a_reviewable_commit(self):
+        for source in CLI_SOURCES:
+            change = Change(
+                "a" * 40, NOW, "buzai assistant", "s", "c", "w", "notes.md", APPEND_ENTRY, source
+            )
+            self.assertTrue(reviewable(change), f"{source} is recordable but never reviewed")
+
+
+class TestRejectionFailurePaths(ReviewRepoCase):
+    def test_an_unknown_commit_is_refused(self):
+        result = self.reject("0" * 40, reason="whatever")
+        self.assertEqual(result.status, FAILED)
+        self.assertIn("no hub commit matches", result.detail)
+
+    def test_a_commit_with_no_hub_file_trailer_is_refused(self):
+        seed = git("-C", str(self.hub), "rev-parse", "HEAD").strip()
+        result = self.reject(seed, reason="not mine")
+        self.assertEqual(result.status, FAILED)
+        self.assertIn("names no hub file", result.detail)
+
+    def test_an_unknown_disposition_is_refused(self):
+        sha = self.append("a fact")
+        result = dispose(self.hub, Decision(sha, "maybe"), now=NOW, push=False)
+        self.assertEqual(result.status, FAILED)
+        self.assertIn("unknown disposition", result.detail)
+
+
+# --- the notes ref ---------------------------------------------------------------------
+
+
+class TestNotesRefIntegrity(ReviewRepoCase):
+    def test_a_missing_notes_ref_means_nothing_disposed_not_everything_approved(self):
+        sha = self.append("a fact")
+        self.assertEqual(disposed_shas(self.hub), set())
+        self.assertEqual([c.sha for c in self.pending()], [sha])
+
+    def test_an_unreadable_notes_ref_fails_loudly(self):
+        self.append("a fact")
+        self.approve(git("-C", str(self.hub), "rev-parse", "HEAD").strip())
+        ref = self.hub / ".git" / "refs" / "notes" / "buzai-review"
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_text("0" * 39 + "1\n")  # points at an object that is not there
+
+        with self.assertRaises(HubReviewError) as cm:
+            disposed_shas(self.hub)
+        self.assertIn(NOTES_REF, str(cm.exception))
+        with self.assertRaises(HubReviewError):
+            run_list(self.hub, 10, NOW)
+
+    def test_a_corrupt_note_is_never_read_as_a_verdict(self):
+        sha = self.append("a fact")
+        git(
+            "-C",
+            str(self.hub),
+            "notes",
+            f"--ref={NOTES_REF}",
+            "add",
+            "-m",
+            "this is not json",
+            sha,
+        )
+        with self.assertRaises(HubReviewError):
+            read_disposition(self.hub, sha)
+
+
+class TestNotesPushEnvironmentIsolation(ReviewRepoCase):
+    """The notes push is the fourth network-facing call, and gets the same layer 1.
+
+    Dispositions are the owner's words about their own knowledge base, so a redirected
+    notes push leaks exactly what a redirected content push leaks. The overlay asserted
+    here is the one `push_notes` handed its runner.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.approve(self.append("a fact"))
+        plant(self)
+        self.calls = []
+
+        def recorder(args, env, timeout):
+            self.calls.append((list(args), dict(env), timeout))
+            # The push itself is never executed: nothing here may leave the box.
+            return GitResult(0, "", "") if "push" in args else real_git(args, env, timeout)
+
+        outcome = push_notes(self.hub, runner=recorder, verifier=PRIVATE_REMOTE)
+        self.assertEqual(outcome.status, PUSHED, outcome.detail)
+        pushes = [call for call in self.calls if "push" in call[0]]
+        self.assertEqual(len(pushes), 1)
+        self.args, self.env, _ = pushes[0]
+
+    def test_nothing_injected_reaches_the_notes_pushs_child(self):
+        assert_injection_suppressed(self, self.env)
+
+    def test_the_notes_push_resets_the_proxy_on_the_command_line(self):
+        overrides = [self.args[i + 1] for i, a in enumerate(self.args) if a == "-c"]
+        self.assertIn("http.proxy=", overrides)
+
+    def test_the_notes_push_keeps_the_credential_channels_it_needs(self):
+        for name in ("SSH_AUTH_SOCK", "GIT_ASKPASS", "GIT_CONFIG_GLOBAL"):
+            self.assertNotIn(name, self.env, name)
+        self.assertEqual(self.env["GIT_TERMINAL_PROMPT"], "0")
+
+
+class TestNotesPush(ReviewRepoCase):
+    def setUp(self):
+        super().setUp()
+        self.sha = self.append("a fact")
+        self.remote = self.bare_remote()
+
+    def notes_on_remote(self) -> str:
+        return git("-C", str(self.remote), "for-each-ref", "--format=%(refname)", "refs/notes")
+
+    def test_nothing_to_push_before_any_verdict(self):
+        outcome = push_notes(self.hub, verifier=local_verifier(self.remote))
+        self.assertEqual(outcome.status, NOTHING_TO_PUSH)
+
+    def test_a_verified_private_remote_receives_the_dispositions(self):
+        self.approve(self.sha)
+        outcome = push_notes(self.hub, verifier=local_verifier(self.remote))
+        self.assertEqual(outcome.status, PUSHED, outcome.detail)
+        self.assertIn(NOTES_REF, self.notes_on_remote())
+
+    def test_an_unverified_remote_gets_nothing(self):
+        self.approve(self.sha)
+        outcome = push_notes(self.hub, verifier=UNVERIFIED_REMOTE)
+        self.assertEqual(outcome.status, PUSH_REFUSED)
+        self.assertEqual(self.notes_on_remote().strip(), "")
+
+    def test_a_local_only_hub_keeps_its_dispositions_without_failing(self):
+        self.approve(self.sha)
+        outcome = push_notes(self.hub, verifier=NO_REMOTE)
+        self.assertEqual(outcome.status, PUSH_LOCAL_ONLY)
+
+    def test_a_diverged_notes_ref_halts_instead_of_merging(self):
+        self.approve(self.sha)
+        git("-C", str(self.hub), "push", "-q", "origin", "HEAD:refs/heads/main")
+        push_notes(self.hub, verifier=local_verifier(self.remote))
+        # another instance disposed something else and pushed it first
+        other = self.root / "other"
+        git("clone", "-q", str(self.remote), str(other))
+        git("-C", str(other), "fetch", "-q", "origin", f"{NOTES_REF}:{NOTES_REF}")
+        git("-C", str(other), "notes", f"--ref={NOTES_REF}", "add", "-m", "{}", "HEAD~1")
+        git("-C", str(other), "push", "-q", "origin", f"{NOTES_REF}:{NOTES_REF}")
+        remote_notes = git("-C", str(self.remote), "rev-parse", NOTES_REF).strip()
+
+        second = self.append("another fact")
+        self.approve(second)
+        outcome = push_notes(self.hub, verifier=local_verifier(self.remote))
+
+        self.assertEqual(outcome.status, DIVERGED)
+        self.assertIn("HALTED", outcome.detail)
+        self.assertEqual(git("-C", str(self.remote), "rev-parse", NOTES_REF).strip(), remote_notes)
+
+    def test_a_disposition_pushes_its_notes_with_it(self):
+        result = self.approve(self.sha, push=True, verifier=local_verifier(self.remote))
+        self.assertEqual(result.notes.status, PUSHED, result.notes.detail)
+        self.assertIn(NOTES_REF, self.notes_on_remote())
+
+    def test_dispositions_survive_a_restore_from_the_remote(self):
+        """R8: a fresh instance fetches the notes ref and does not re-review history."""
+        self.approve(self.sha, push=True, verifier=local_verifier(self.remote))
+        restored = self.root / "restored"
+        git("clone", "-q", str(self.remote), str(restored))
+        self.assertEqual(disposed_shas(restored), set())  # clone does not fetch notes
+        git("-C", str(restored), "fetch", "-q", "origin", "refs/notes/*:refs/notes/*")
+        self.assertEqual(disposed_shas(restored), {self.sha})
+
+
+# --- concurrency -------------------------------------------------------------------------
+
+
+class TestConcurrentDisposals(ReviewRepoCase):
+    """Two sessions disposing at the same time. Per-commit notes cannot conflict, but the
+    ref update behind them can — so both verdicts must land, and neither correction may be
+    applied twice."""
+
+    def test_two_sessions_dispose_at_once_and_both_land(self):
+        facts = ["fact-A", "fact-B", "fact-C"]
+        shas = {fact: self.append(fact) for fact in facts}
+        driver = self.root / "driver.py"
+        driver.write_text(DRIVER.format(repo=str(REPO_ROOT)))
+        start_at = time.time() + 1.5
+
+        procs = [
+            subprocess.Popen(
+                [sys.executable, str(driver), str(self.hub), shas[fact], fact, str(start_at)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for fact in ("fact-A", "fact-C")
+        ]
+        outs = [(p.wait(timeout=90), p.communicate()) for p in procs]
+
+        self.assertEqual([rc for rc, _ in outs], [0, 0], outs)
+        content = self.notes.read_text()
+        self.assertNotIn("fact-A", content)
+        self.assertNotIn("fact-C", content)
+        self.assertIn("- fact-B", content)  # the item nobody judged is untouched
+
+        disposed = disposed_shas(self.hub)
+        self.assertIn(shas["fact-A"], disposed)
+        self.assertIn(shas["fact-C"], disposed)
+        self.assertNotIn(shas["fact-B"], disposed)
+        self.assertEqual([c.sha for c in self.pending()], [shas["fact-B"]])
+
+    def test_simultaneous_verdicts_are_never_silently_lost(self):
+        """The one that fails against a naive implementation. Approvals do not touch a
+        hub file, so nothing but this module's lock serializes them — and concurrent
+        `git notes add` calls each rebuild the notes tree from the same parent, keep the
+        last writer, and *both* exit 0. Verified: with the lock removed, four overlapping
+        approvals leave two dispositions and every process reports success."""
+        shas = [self.append(f"fact-{n}") for n in range(4)]
+        driver = self.root / "approve.py"
+        driver.write_text(APPROVE_DRIVER.format(repo=str(REPO_ROOT)))
+        start_at = time.time() + 1.5
+
+        procs = [
+            subprocess.Popen(
+                [sys.executable, str(driver), str(self.hub), sha, str(start_at)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for sha in shas
+        ]
+        outs = [(p.wait(timeout=90), p.communicate()) for p in procs]
+
+        self.assertEqual([rc for rc, _ in outs], [0] * len(shas), outs)
+        self.assertEqual(disposed_shas(self.hub), set(shas))
+        self.assertEqual(self.pending(), [])
+
+    def test_no_correction_is_applied_twice(self):
+        sha = self.append("fact-A")
+        first = self.reject(sha, reason="wrong")
+        second = self.reject(sha, reason="wrong again")
+        self.assertEqual(first.status, RECORDED)
+        self.assertEqual(second.status, ALREADY_DISPOSED)
+        removals = [s for s in self.subjects() if s.startswith("Remove content the owner rejected")]
+        self.assertEqual(len(removals), 1)
+
+
+# --- the verb ------------------------------------------------------------------------------
+
+
+class TestMain(unittest.TestCase):
+    def test_a_refused_hub_path_exits_1_before_reading_anything(self):
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(REPO_ROOT)  # inside the public checkout
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main([])
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-review FAIL", err.getvalue())
+
+    def test_an_uninitialized_hub_is_reported_not_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+            os.environ["BUZAI_HUBS_DIR"] = str(Path(tmp) / "hubs")
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = main([])
+            self.assertEqual(rc, 1)
+            self.assertIn("make hub-init", err.getvalue())
+            self.assertFalse((Path(tmp) / "hubs").exists())
+
+    def run_uninitialized(self, argv) -> tuple[int, str]:
+        """main() against a hub location inside a tempdir that has no store yet."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(Path(tmp.name) / "hubs")
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main(argv)
+        self.assertFalse((Path(tmp.name) / "hubs").exists())
+        return rc, err.getvalue()
+
+    def test_push_notes_on_an_uninitialized_hub_fails_when_run_by_hand(self):
+        """The second half of `make hub-push`; see the matching hub_commit test. Without the
+        service flag, "no store" is not "no dispositions waiting"."""
+        rc, err = self.run_uninitialized(["--push-notes"])
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-review FAIL", err)
+        self.assertIn("not a hub repo yet", err)
+
+    def test_the_service_flag_makes_a_missing_store_a_note(self):
+        rc, err = self.run_uninitialized(["--push-notes", "--if-initialized"])
+        self.assertEqual(rc, 0)
+        self.assertIn("hub-review: ", err)
+        self.assertIn("not a hub repo yet", err)
+        self.assertNotIn("WARN", err)
+        self.assertNotIn("FAIL", err)
+
+    def test_the_service_flag_never_excuses_a_refused_hub_path(self):
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(REPO_ROOT)  # inside the public checkout
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main(["--push-notes", "--if-initialized"])
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-review FAIL", err.getvalue())
+
+    def test_the_service_flag_only_applies_to_the_drain(self):
+        # A listing or a verdict with no store to act on must never exit 0, flag or not.
+        # Run against a tempdir location so a regressed guard never reads the real store.
+        for argv in (["--if-initialized"], ["--approve", "0" * 8, "--if-initialized"]):
+            with self.assertRaises(SystemExit) as raised:
+                self.run_uninitialized(argv)
+            self.assertEqual(raised.exception.code, 2, argv)
+
+
+class TestMainAgainstARealHub(ReviewRepoCase):
+    """`main` against a hub with no remote — `hub_remote.verify` answers local-only
+    without probing anything, so nothing here can reach the network."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(restore_env, "BUZAI_HUBS_DIR", os.environ.get("BUZAI_HUBS_DIR"))
+        os.environ["BUZAI_HUBS_DIR"] = str(self.hub)
+        self.sha = self.append("the dentist is on Oak Street")
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_the_default_action_lists_what_is_pending(self):
+        rc, out, _ = self.run_main([])
+        self.assertEqual(rc, 0)
+        self.assertIn("hubs resolve to", out)
+        self.assertIn("1 change(s) awaiting review", out)
+        self.assertIn("Record the dentist is on Oak Street", out)
+
+    def test_approving_from_the_command_line_settles_the_item(self):
+        rc, out, _ = self.run_main(["--approve", self.sha[:8], "--no-push"])
+        self.assertEqual(rc, 0)
+        self.assertIn("approved", out)
+        _, out, _ = self.run_main([])
+        self.assertIn("nothing is awaiting your review", out)
+
+    def test_rejecting_without_a_reason_exits_1(self):
+        rc, _, err = self.run_main(["--reject", self.sha, "--no-push"])
+        self.assertEqual(rc, 1)
+        self.assertIn("must carry the owner's reason", err)
+        self.assertIn("Oak Street", self.notes.read_text())
+
+    def test_rejecting_from_the_command_line_removes_the_content(self):
+        rc, out, _ = self.run_main(["--reject", self.sha, "--reason", "wrong street", "--no-push"])
+        self.assertEqual(rc, 0)
+        self.assertIn("correction committed as", out)
+        self.assertNotIn("Oak Street", self.notes.read_text())
+
+    def test_push_notes_on_a_local_only_hub_exits_0(self):
+        self.approve(self.sha)
+        rc, out, err = self.run_main(["--push-notes"])
+        self.assertEqual(rc, 0)
+        self.assertIn("no remote is configured", err + out)
+
+    def test_a_stale_backlog_leads_the_listing(self):
+        # a sha the write path has not already registered at NOW: the backlog keeps the
+        # first timestamp it saw for a commit, which is the moment it was made
+        record_unpushed(
+            default_backlog_path(self.hub), "0" * 40, NOW - timedelta(days=3), "offline earlier"
+        )
+        _, out, _ = self.run_main([])
+        warning = [line for line in out.splitlines() if "WARNING" in line]
+        self.assertTrue(warning, out)
+        self.assertIn("have not reached the private remote", warning[0])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,11 +1,14 @@
 import unittest
 
-from scripts.smoke_test import evaluate, overall
+from scripts.smoke_test import CRITERIA, evaluate, overall
 
 
 class TestSmokeTest(unittest.TestCase):
     def _all_pass(self):
-        return {k: True for k in ["SC0", "SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "SC7", "SC8"]}
+        # Derived from CRITERIA, not a literal list: a hardcoded list silently turns
+        # "everything passes" into "everything except the new criterion" the moment one
+        # is added, which is how this test broke when SC9 landed.
+        return {k: True for k in CRITERIA}
 
     def test_all_pass_is_pass(self):
         statuses = evaluate(self._all_pass())
@@ -28,7 +31,7 @@ class TestSmokeTest(unittest.TestCase):
         self.assertEqual(overall(statuses), "INCOMPLETE")
 
     def test_pending_is_incomplete(self):
-        results = {"SC0": True}  # SC1-SC8 not yet attested
+        results = {"SC0": True}  # nothing past SC0 attested yet
         statuses = evaluate(results)
         self.assertEqual(statuses["SC3"], "pending")
         self.assertEqual(overall(statuses), "INCOMPLETE")

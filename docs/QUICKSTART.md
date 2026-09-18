@@ -47,8 +47,8 @@ then re-run `make setup` (it resumes where you left off):
 2. **Connectors** *(optional — skip freely)* — enable what you want at
    [claude.ai/settings/connectors](https://claude.ai/settings/connectors), then
    `make trust-check` classifies them against the gate. ([SETUP.md §4](SETUP.md))
-3. **Remote Control consent** — `make prime-consent`: answer **y**, spawn mode
-   **1**, confirm the session shows at [claude.ai/code](https://claude.ai/code),
+3. **Remote Control consent** — `make prime-consent`: answer **y** (the only
+   prompt), confirm the session shows at [claude.ai/code](https://claude.ai/code),
    exit with **Ctrl-D Ctrl-D**. ([SETUP.md §6](SETUP.md))
 
 Setup finishes by starting the service and running the live check — it ends with
