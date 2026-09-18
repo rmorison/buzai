@@ -7,7 +7,8 @@
 #     Creates the dedicated unprivileged user (default: buzai), enables linger,
 #     wires XDG_RUNTIME_DIR into its login init file, copies the invoking admin's
 #     authorized_keys so `ssh buzai@host` works directly (opt out:
-#     BUZAI_COPY_SSH_KEYS=0), and verifies the per-user systemd manager — the
+#     BUZAI_COPY_SSH_KEYS=0), gives the account a default git identity (the hub
+#     store needs one), and verifies the per-user systemd manager — the
 #     steps documented in docs/HOST-BOOTSTRAP.md. Idempotent: re-running
 #     changes nothing that's already in place.
 #
@@ -162,6 +163,31 @@ EOF
     else
       say "   ssh key copy: '$SUDO_USER' has no authorized_keys (password-auth ssh?) — switch in with: sudo -u $user -i"
     fi
+  fi
+
+  # 1e. git identity — the hub store is a git repo, and `make hub-init` refuses to commit
+  #     without a committer identity. A fresh account has none, so the documented setup
+  #     dead-ends at the hub store for every adopter (observed on a clean install: hub-init
+  #     failed, personal content stayed in the public checkout, and the preflight kept
+  #     blocking service start). Written as a file rather than via `git config`, for the
+  #     same reason 1c writes the login file directly: this runs as root before the user
+  #     phase installs anything, so git need not exist yet. It is only a fallback —
+  #     `hub_commit.py` stamps the assistant's own author on every hub write — so a neutral
+  #     account-local identity is the right default, and the owner can change it any time.
+  local gitconfig="$home/.gitconfig"
+  refuse_symlink "$gitconfig"
+  if grep -qs '^[[:space:]]*email[[:space:]]*=' "$gitconfig"; then
+    say "   git identity already set in .gitconfig — skipping"
+  else
+    tee -a "$gitconfig" >/dev/null <<EOF
+
+[user]
+	name = $user
+	email = $user@localhost
+EOF
+    chown "$user:$user" "$gitconfig"
+    chmod 644 "$gitconfig"
+    say "   git identity set ($user <$user@localhost>) — hub-init needs one; change it any time"
   fi
 
   # verify (a): is the per-user systemd MANAGER running? (tests linger, not login env)
