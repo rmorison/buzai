@@ -101,6 +101,13 @@ class TestTheInstallerCanFetchARequestedBranch(unittest.TestCase):
         # bootstrapping from a branch must tell the owner to install that same branch
         self.assertIn("BUZAI_REF=${BUZAI_REF} bash", self.text)
 
+    def test_a_default_ref_warns_that_it_cannot_detect_a_branch_bootstrap(self):
+        """The dangerous case is the DEFAULT one: bootstrap from a branch URL without
+        setting BUZAI_REF, and the printed user-phase command installs main onto an
+        account bootstrapped from other code — silently, with no error. curl hands the
+        script no URL, so it cannot detect this; it can only say so."""
+        self.assertIn("BUZAI_REF=<branch> to BOTH phases", self.text)
+
     def test_the_variable_is_documented_with_the_others(self):
         self.assertRegex(self.text, r"#\s+BUZAI_REF=<branch>")
 
