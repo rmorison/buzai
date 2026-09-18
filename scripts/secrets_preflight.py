@@ -91,6 +91,7 @@ under temporary directories and drive the *real* composition through `main()`.
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -449,6 +450,57 @@ def warnings_for(
     return warns
 
 
+def credential_warning(text: str | None, creds: Path) -> str | None:
+    """Whether the stored Claude credentials can still authenticate. Pure.
+
+    The perms check above asks whether this file is *safe*; this asks whether it still
+    *works*. They are different questions, and only the first was ever asked — which is
+    how a live instance sat dead for nine days: the OAuth tokens were emptied in place,
+    the file stayed present and 0600, the preflight stayed green, and every start failed
+    at `claude remote-control` with "You must be logged in". Nothing said so.
+
+    A WARNING, never fatal. A logged-out instance is already going to fail at ExecStart;
+    failing here too would only add a second way to die, and with StartLimitBurst=5 the
+    fatal path is the one that stops systemd retrying at all. The value of this check is
+    that `make doctor` and the journal can name the cause instead of leaving an operator
+    to infer it from a restart loop.
+
+    Never reports a token's value or length — only that one is missing.
+    """
+    if text is None:
+        return (
+            f"no readable Claude credentials at {creds} — the service will start but "
+            f"never register; run `make auth` (see docs/SETUP.md §3)"
+        )
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return (
+            f"{creds} is not readable as JSON, so the stored login cannot be used — "
+            f"the service will start but never register; re-run `make auth`"
+        )
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict):
+        # An auth shape this does not recognize. Saying nothing beats guessing: a wrong
+        # warning here teaches the operator to ignore the one that matters.
+        return None
+    if any(str(oauth.get(k) or "").strip() for k in ("accessToken", "refreshToken")):
+        return None
+    return (
+        f"{creds} holds no usable token — accessToken and refreshToken are both empty, "
+        f"so the service will start but never register. This is what a revoked or "
+        f"cleared login looks like from disk; run `make auth`"
+    )
+
+
+def read_credentials(creds: Path) -> str | None:
+    """The credentials file's text, or None when absent or unreadable. Side-effecting."""
+    try:
+        return creds.read_text()
+    except OSError:
+        return None
+
+
 def notes_for(hub: Path | None, state: HubState) -> list[str]:
     """Legitimate empty states, reported so the journal shows what was actually checked."""
     if hub is None:
@@ -679,6 +731,11 @@ def assess(
     # A refused hub path is not inspected: the warnings describe a store that must not
     # be used at all, and reading it would only bury the fatal finding in noise.
     notes, warnings = durability_report(target, runner, now)
+    # Auth durability sits alongside hub durability: both are "this instance will stop
+    # being useful", neither is a leak, and neither may block start.
+    creds_warning = credential_warning(read_credentials(creds), creds)
+    if creds_warning:
+        warnings.append(creds_warning)
     if not secret_files:
         notes.append(
             f"no local secret files in {secrets_dir} — fine for a managed-connector-only "

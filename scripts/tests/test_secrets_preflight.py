@@ -21,6 +21,7 @@ from scripts.secrets_preflight import (
     _repo_secret_candidates,
     assess,
     backlog_warning,
+    credential_warning,
     dirty_warning,
     enclosing_repo,
     env_file_problems,
@@ -33,6 +34,7 @@ from scripts.secrets_preflight import (
     notes_for,
     origin_credential_violations,
     perm_problems,
+    read_credentials,
     problems,
     read_marker,
     report,
@@ -845,6 +847,62 @@ class TestInspectHub(unittest.TestCase):
         self.assertIsNone(enclosing_repo(self.hub, real_git))
 
 
+class TestCredentialUsability(unittest.TestCase):
+    """The perms check asks whether credentials.json is SAFE; this asks whether it WORKS.
+
+    Only the first was ever asked, which is how a live instance sat dead for nine days:
+    the OAuth tokens were emptied in place, the file stayed present and 0600, the
+    preflight stayed green, and every start failed at `claude remote-control` with "You
+    must be logged in". Nothing in the journal said why.
+    """
+
+    CREDS = Path("/home/example/.claude/.credentials.json")
+
+    def warn(self, text):
+        return credential_warning(text, self.CREDS)
+
+    def oauth(self, **tokens):
+        return json.dumps({"claudeAiOauth": tokens})
+
+    def test_the_emptied_token_shape_that_caused_the_outage_is_named(self):
+        # exactly what was on disk: present, 0600, parseable, and useless
+        w = self.warn(self.oauth(accessToken="", refreshToken=""))
+        self.assertIsNotNone(w)
+        self.assertIn("make auth", w)
+
+    def test_a_usable_access_token_is_silent(self):
+        self.assertIsNone(self.warn(self.oauth(accessToken="tok", refreshToken="")))
+
+    def test_a_usable_refresh_token_alone_is_silent(self):
+        # an expired access token still refreshes; that is not an outage
+        self.assertIsNone(self.warn(self.oauth(accessToken="", refreshToken="tok")))
+
+    def test_whitespace_is_not_a_token(self):
+        self.assertIsNotNone(self.warn(self.oauth(accessToken="   ", refreshToken="")))
+
+    def test_a_missing_file_says_so(self):
+        self.assertIn("make auth", self.warn(None))
+
+    def test_unparseable_json_says_so(self):
+        self.assertIn("JSON", self.warn("{not json"))
+
+    def test_an_unrecognized_auth_shape_stays_silent(self):
+        # saying nothing beats guessing: a wrong warning here teaches the operator to
+        # ignore the one that matters
+        self.assertIsNone(self.warn(json.dumps({"someOtherAuth": {"key": "v"}})))
+        self.assertIsNone(self.warn(json.dumps({})))
+
+    def test_no_warning_ever_carries_a_token_value(self):
+        secret = "sk-ant-oat01-DO-NOT-ECHO"
+        for text in (self.oauth(accessToken=secret, refreshToken=""), "{" + secret):
+            w = self.warn(text) or ""
+            self.assertNotIn(secret, w)
+
+    def test_reader_maps_absent_and_unreadable_to_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(read_credentials(Path(d) / "nope.json"))
+
+
 # --- the WIRING: assess() / main(), with the real composition ----------------------
 #
 # Every individual check above is well tested. `assess()` is what actually decides
@@ -939,6 +997,27 @@ class TestAssessComposition(AssessCompositionCase):
         code, out, _ = self.run_main()
         self.assertEqual(code, 0)
         self.assertIn("secrets-preflight OK", out)
+
+    def test_emptied_credentials_warn_through_assess_and_never_block_start(self):
+        """PLANT: the nine-day outage's exact on-disk shape.
+
+        A logged-out instance already fails at ExecStart; making this fatal would only
+        add a second way to die, and with StartLimitBurst=5 the fatal path is the one
+        that stops systemd retrying at all. The value is that the journal names the cause
+        instead of leaving an operator to infer it from a restart loop.
+        """
+        self.creds.write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "", "refreshToken": ""}})
+        )
+        os.chmod(self.creds, 0o600)
+
+        findings = self.findings()
+
+        self.assertTrue([w for w in findings.warnings if "no usable token" in w], findings.warnings)
+        self.assertEqual(findings.fatal, ())
+        self.assertFalse(findings.blocks_start)
+        code, _, _ = self.run_main()
+        self.assertEqual(code, 0)
 
     def test_a_durability_warning_composed_through_assess_still_exits_zero(self):
         # PLANT: a real hub repo with commits, no remote, and a marker old enough to
