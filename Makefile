@@ -126,6 +126,10 @@ doctor: ## Aggregate health check: prereqs, venv, secrets + personal-state layou
 	@echo "== prereqs =="; command -v claude >/dev/null && claude --version || echo "  claude: MISSING (see SETUP step 2)"
 	@echo "== venv ==";    test -x $(PY) && echo "  $$($(PY) --version)" || echo "  .venv: MISSING (run: make venv)"
 	@echo "== secrets + personal-state layout =="; if $(PY) scripts/secrets_preflight.py; then :; else echo "  secrets-preflight FAILED (exit $$?) — the service will REFUSE TO START until this is fixed; WARN lines above are durability-only and do not block start"; fi
+# Reads the stored verdict rather than the journal: the unit re-verifies at every start,
+# but on the boot path that output does not reliably reach journald, so the log is not a
+# dependable place to confirm it. The cache is written by the probe itself.
+	@echo "== hub remote =="; $(PY) scripts/hub_remote.py --cached 2>&1 | sed 's/^/  /' || true
 	@echo "== liveness =="; if $(PY) scripts/liveness.py; then :; else echo "  not live (exit $$?) — a traceback above means the probe itself errored, not just idle"; fi
 
 smoke: ## SC0 preflight for the 8-point smoke test (see docs/SMOKE-TEST.md)

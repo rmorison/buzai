@@ -110,7 +110,7 @@ Every hub verb and the service preflight print the path they resolved. Compare t
 ```bash
 .venv/bin/python scripts/hub_paths.py    # what the shell sees
 make doctor                              # what the service sees ("hubs resolve to …")
-journalctl --user -u claude-remote | grep "hubs resolve to"
+make doctor          # resolved hub path + the stored privacy verdict and its age
 ```
 
 If those disagree, it's almost always **`BUZAI_HUBS_DIR` exported in a shell profile**. A

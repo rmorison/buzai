@@ -946,6 +946,44 @@ def check(
     return 1 if failed else 0
 
 
+def cached_report(hub: Path, now: datetime, ttl_seconds: float = CACHE_TTL_SECONDS) -> str:
+    """What the stored verdict says, without probing anything. Pure given `now`.
+
+    The unit re-verifies at every start, and the docs told an operator to confirm that by
+    reading the journal. On a real reboot that evidence was not there: both ExecStartPre
+    commands ran and systemd recorded status=0, the probe genuinely re-verified — the
+    cache's `verified_at` proves it — and neither command's stdout reached the journal on
+    the boot path. Three of four starts logged it; the boot did not.
+
+    So the check an operator is told to run must not depend on log capture. The verdict is
+    already written down durably by the thing that produced it; this reads that. No
+    network call, so it answers the same on a box that is offline.
+    """
+    entry = read_cache(default_cache_path(hub))
+    if entry is None:
+        return (
+            "no stored verdict — nothing has verified this remote yet, or the store has "
+            "no remote (run `make hub-remote-check`)"
+        )
+    age = (now - entry.verified_at).total_seconds()
+    when = entry.verified_at.isoformat(timespec="seconds")
+    freshness = "within" if age < ttl_seconds else "OLDER than"
+    return (
+        f"stored verdict: {entry.verdict.upper()} for {redact(entry.url)}\n"
+        f"  verified at {when} ({_humanize_age(age)} ago — {freshness} the "
+        f"{ttl_seconds:.0f}s re-verification window)"
+    )
+
+
+def _humanize_age(seconds: float) -> str:
+    """Rough age for a human reading a health check. Pure."""
+    seconds = max(0.0, seconds)
+    for size, unit in ((86400.0, "d"), (3600.0, "h"), (60.0, "m")):
+        if seconds >= size:
+            return f"{seconds / size:.0f}{unit}"
+    return f"{seconds:.0f}s"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hub_remote.py",
@@ -960,6 +998,15 @@ def build_parser() -> argparse.ArgumentParser:
             "hub-remote-check` never reports a store that is not there as verified"
         ),
     )
+    parser.add_argument(
+        "--cached",
+        action="store_true",
+        help=(
+            "report the stored verdict and its age without probing — the durable answer "
+            "to 'was the remote re-verified at start?', which the journal does not always "
+            "carry on the boot path"
+        ),
+    )
     return parser
 
 
@@ -971,6 +1018,19 @@ def main(argv=None) -> int:
         print(f"hub-remote FAIL: {e}", file=sys.stderr)
         return 1
     print(f"hub-remote: hubs resolve to {location}")
+    if args.cached:
+        # Informational and offline: it reports what is written down, so a missing store
+        # or a missing verdict is an answer, not a failure. It sits ABOVE the check below
+        # deliberately — `make doctor` runs this, and printing FAIL for a routine
+        # pre-`hub-init` state is how the word stops meaning anything.
+        if not (location.path / ".git").exists():
+            print(
+                f"hub-remote: {location.path} is not a hub repo yet — no verdict to "
+                "report (run `make hub-init`)"
+            )
+            return 0
+        print(f"hub-remote: {cached_report(location.path, datetime.now(UTC))}")
+        return 0
     if not (location.path / ".git").exists():
         # Every instance between `make setup` and `make hub-init` is here, and this module
         # is the unit's ExecStartPre, so a FAIL at each start would spend the word the

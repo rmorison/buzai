@@ -11,6 +11,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from scripts.hub_remote import (
+    CACHE_TTL_SECONDS,
+    cached_report,
     DENIED,
     INDETERMINATE,
     LOCAL_ONLY,
@@ -1041,6 +1043,46 @@ class TestCheck(HubTempCase):
         rc, _, err = self.run_check(git)
         self.assertEqual(rc, 1)
         self.assertIn("credential helper", err)
+
+
+class TestCachedVerdictReport(HubTempCase):
+    """The durable answer to "was the remote re-verified at start?".
+
+    The unit re-verifies on every start and the docs told an operator to confirm that in
+    the journal. On a real reboot that evidence was absent: both ExecStartPre commands ran
+    (systemd recorded status=0), the probe genuinely re-verified — `verified_at` in the
+    cache proves it — and neither command's stdout reached journald on the boot path.
+    Three of four starts logged it; the boot did not. A check an operator is told to run
+    must not depend on log capture, so this reads what the probe itself wrote down.
+    """
+
+    def entry(self, verdict=PRIVATE, url=SSH_URL, ago_seconds=0):
+        write_cache(
+            default_cache_path(self.hub),
+            CacheEntry(url, verdict, NOW - timedelta(seconds=ago_seconds)),
+        )
+
+    def test_it_reports_the_stored_verdict_and_when(self):
+        self.entry()
+        out = cached_report(self.hub, NOW)
+        self.assertIn("PRIVATE", out)
+        self.assertIn("verified at", out)
+
+    def test_a_fresh_verdict_is_marked_inside_the_window(self):
+        self.entry(ago_seconds=60)
+        self.assertIn("within", cached_report(self.hub, NOW))
+
+    def test_a_stale_verdict_is_marked_older_than_the_window(self):
+        # the point of the age: a verdict that predates the last start was never refreshed
+        self.entry(ago_seconds=CACHE_TTL_SECONDS + 600)
+        self.assertIn("OLDER than", cached_report(self.hub, NOW))
+
+    def test_no_cache_is_an_answer_not_an_error(self):
+        self.assertIn("no stored verdict", cached_report(self.hub, NOW))
+
+    def test_it_never_echoes_a_credential_bearing_url(self):
+        self.entry(url="https://user:ghp_examplesecrettoken@github.com/owner/hubs.git")
+        self.assertNotIn("ghp_examplesecrettoken", cached_report(self.hub, NOW))
 
 
 class TestMain(unittest.TestCase):
