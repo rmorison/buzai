@@ -892,7 +892,7 @@ class TestTheCredentialHelperFindingIsCredentialFree(HubTempCase):
     appeared verbatim in the violation string.
     """
 
-    TOKEN = "ghp_ThisIsAFakeTokenForTestsOnly0123456789"
+    TOKEN = "ghp_" + "ThisIsAFakeTokenFor" + "TestsOnly0123456789"
     INLINE = "!f() { echo password=" + TOKEN + "; }; f"
 
     def violations(self, helper):

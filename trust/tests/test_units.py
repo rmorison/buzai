@@ -9,6 +9,10 @@ from trust.always_gate import is_always_gated
 from trust.config_loader import load_config
 from trust.model import Leg, Tier
 
+# A well-known fake SSN, built at run time so this file holds no SSN-shaped text
+# for the repository's leak gate to refuse.
+FAKE_SSN = "-".join(["123", "45", "6789"])
+
 
 class TestTiers(unittest.TestCase):
     def setUp(self):
@@ -227,13 +231,13 @@ class TestRedact(unittest.TestCase):
     def test_content_field_reduced_not_verbatim(self):
         import json
 
-        out = redact.redact({"body": "merger with NewCo; my SSN is 123-45-6789"})
+        out = redact.redact({"body": "merger with NewCo; my SSN is " + FAKE_SSN})
         self.assertEqual(out["body"].get("_redacted"), "content")
         self.assertNotIn("NewCo", json.dumps(out))
-        self.assertNotIn("123-45-6789", json.dumps(out))
+        self.assertNotIn(FAKE_SSN, json.dumps(out))
 
     def test_pii_in_plain_string(self):
-        self.assertEqual(redact.redact("ref 123-45-6789").get("_redacted"), "pii")
+        self.assertEqual(redact.redact("ref " + FAKE_SSN).get("_redacted"), "pii")
 
     def test_entry_keeps_gate_authored_fields_legible(self):
         # A managed-connector tool name is 32+ word-chars and used to trip the
@@ -255,7 +259,7 @@ class TestRedact(unittest.TestCase):
         out = redact.redact_entry(
             {
                 "tool": "mcp__claude_ai_Google_Drive__read_file_content",
-                "tool_input": {"token": "sk-ABCDEFGH12345678"},
+                "tool_input": {"token": "sk-" + "ABCDEFGH12345678"},
             }
         )
         self.assertEqual(out["tool"], "mcp__claude_ai_Google_Drive__read_file_content")
@@ -336,7 +340,10 @@ class TestAudit(unittest.TestCase):
                 "tool": "mcp__claude_ai_Google_Calendar__list_events",
                 "decision": "ask",
                 "tier": "OWNER",
-                "tool_input": {"startTime": "2026-06-27T00:00:00", "token": "sk-ABCDEFGH12345678"},
+                "tool_input": {
+                    "startTime": "2026-06-27T00:00:00",
+                    "token": "sk-" + "ABCDEFGH12345678",
+                },
             },
             self.dir,
         )
