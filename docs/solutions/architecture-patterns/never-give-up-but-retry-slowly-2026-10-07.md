@@ -84,20 +84,17 @@ The costs we accept:
   removed the only alarm the unit had, and no replacement exists yet.
 - **Every retry runs the whole start chain.** That covers the privacy probe in
   `ExecStartPre` and, once the server is spawned, the chained backlog pushes in
-  `ExecStartPost` (commits, then review notes; each re-checks privacy first). During a
-  long outage that is one probe and up to two push attempts per cycle against the hub
-  host. Every step is time-bounded. The old 10s cadence without a limit would have run
+  `ExecStartPost` (commits, then review notes). During a long outage that is one probe
+  and up to two push attempts per cycle against the hub host. Every step is time-bounded. The old 10s cadence without a limit would have run
   the chain six times as often, and under the start limit it stopped after five tries.
   The pushes use the hub's own credential, not the login, so they can run during a login
   outage. Nobody has checked on a host whether they finish when the server exits within
   seconds. The journal records each push's outcome, so read that rather than assuming a
   backlog is draining or stuck.
 - **A cycle is longer than 60s.** `RestartSec` counts from the end of a failed attempt,
-  so each cycle is 60s plus the start checks. Those take seconds on a good day. The
-  unit's own estimate for an unreachable hub remote is about two minutes of timeouts.
-  A slow but reachable one can take several minutes, because each push re-checks
-  privacy and every step runs to its own timeout. Nobody has measured the worst case.
-  The hard ceiling is `TimeoutStartSec` (600s). "60 an hour" is a ceiling.
+  so each cycle is 60s plus the start checks. Those take seconds on a good day and longer
+  when the hub remote is slow or unreachable. Nobody has measured how long; the hard
+  ceiling is `TimeoutStartSec` (600s). "60 an hour" is a ceiling.
   Recovery after a renewal is a minute plus however long those checks take.
 - **A one-off crash also waits 60s.** A healthy server that exits once is back after a
   minute, not 10s. A backoff that starts short and grows (`RestartSteps`,
