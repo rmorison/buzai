@@ -55,7 +55,7 @@ operation alike, runs inside the unprivileged `buzai` account. It:
 One buzai instance = one Linux user = one principal. A dedicated account **isolates**
 the assistant's workspace, hubs, secrets, and Claude credentials from your personal
 account — the trust gate's blast radius stops at this user — and gives a clean home for
-`~/.claude/.credentials.json`, `~/.config/buzai/secrets/`, and `~/buzai`.
+`~/.claude/.credentials.json`, `~/.config/buzai/secrets/`, and `~/buzai-assistant`.
 
 ## Next: log in as `buzai` and run the user phase
 
@@ -74,7 +74,7 @@ sudo -u buzai -i
 curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | bash
 ```
 
-Either way the user phase fetches the repo into `~/buzai` and hands off to
+Either way the user phase fetches the repo into `~/buzai-assistant` and hands off to
 `make setup` (see [`SETUP.md`](SETUP.md)). It refuses to run inside a
 sudo-capable account (the forgot-`sudo`-in-step-1 footgun) — override with
 `BUZAI_ALLOW_ADMIN_INSTALL=1` only if you truly mean to.

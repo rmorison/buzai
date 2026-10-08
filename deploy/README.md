@@ -129,7 +129,8 @@ later, same clone URL, is caught rather than trusted forever.
 ```bash
 mkdir -p ~/.config/systemd/user
 cp deploy/claude-remote.service.template ~/.config/systemd/user/claude-remote.service
-# edit WorkingDirectory / paths / --name if your clone isn't at ~/buzai
+# edit WorkingDirectory / paths / --name if your clone isn't at ~/buzai-assistant
+# (`make service-install` does this for you, for the checkout it runs in)
 systemctl --user daemon-reload
 systemctl --user enable --now claude-remote
 ```

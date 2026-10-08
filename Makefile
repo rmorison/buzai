@@ -98,7 +98,8 @@ service-install: ## Install the --user systemd unit for THIS checkout (override 
 ifneq ($(NAME),buzai-assistant)
 	sed -i 's/--name buzai-assistant/--name $(subst &,\&,$(NAME))/' $(UNIT)
 endif
-# The whole token: `%h/buzai` alone is a prefix of it and would leave `-assistant` behind.
+# Match the whole %h/buzai-assistant token: its `%h/buzai` prefix alone would leave
+# `-assistant` behind.
 ifneq ($(WORKDIR),$(HOME)/buzai-assistant)
 	sed -i 's|%h/buzai-assistant|$(subst &,\&,$(WORKDIR))|g' $(UNIT)
 endif

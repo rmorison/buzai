@@ -41,8 +41,8 @@ BUZAI_REPO="${BUZAI_REPO:-https://github.com/rmorison/buzai}"
 BUZAI_REF="${BUZAI_REF:-main}"
 # Not `buzai`: the Remote Control picker labels an environment by its directory's basename,
 # so a deployment named after the repo looks the same as a dev checkout of it (#17).
-# Whether the caller chose the path is remembered, so an old ~/buzai install is only
-# second-guessed when nobody asked for a location.
+# Whether the caller chose the path is remembered, so an install that predates
+# ~/buzai-assistant is only second-guessed when nobody asked for a location.
 BUZAI_WORKDIR_GIVEN="${BUZAI_WORKDIR+given}"
 BUZAI_WORKDIR="${BUZAI_WORKDIR:-$HOME/buzai-assistant}"
 
@@ -260,16 +260,18 @@ user_phase() {
     exec make setup
   fi
 
-  # An install from before #17 lives at ~/buzai. Cloning beside it would leave two
-  # checkouts and a unit still serving the old one, so stop and say how to move it. Only
-  # when the caller named no location and the new one does not exist yet; nothing moves.
+  # An install from before #17 lives at ~/buzai, not ~/buzai-assistant. Cloning beside
+  # it would leave two checkouts and a unit still serving the old one, so stop and say
+  # how to move it. Only when the caller named no location and the new one does not
+  # exist yet; nothing moves.
+  local old="$HOME/buzai"   # where installs lived before ~/buzai-assistant
   if [ -z "$BUZAI_WORKDIR_GIVEN" ] && [ ! -e "$BUZAI_WORKDIR" ] \
-    && [ -f "$HOME/buzai/Makefile" ] && [ -d "$HOME/buzai/trust" ]; then
+    && [ -f "$old/Makefile" ] && [ -d "$old/trust" ]; then
     fail "found an existing install at ~/buzai. New installs live at ~/buzai-assistant, so the
 Remote Control picker can tell the deployment from a dev checkout of the repo. Nothing was moved.
 
   To move it:             docs/SETUP.md, \"Moving an existing install to ~/buzai-assistant\"
-  To keep it where it is: re-run with BUZAI_WORKDIR=\$HOME/buzai"
+  To keep it where it is: re-run with BUZAI_WORKDIR=$old"
   fi
 
   # An existing EMPTY dir is fetchable (a failed earlier fetch must not deadlock re-runs);

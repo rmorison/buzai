@@ -100,7 +100,7 @@ make hub-remote-check
 Also check the credential itself: `scripts/hub_remote.py` refuses outright if the remote
 URL embeds a token (`https://user:TOKEN@host/…`) — use an ssh deploy key
 (`deploy/README.md` step 1). If the preflight reports a credential helper on the **public**
-origin, remove it: `git -C ~/buzai config --unset-all credential.helper`. That one is
+origin, remove it: `git -C ~/buzai-assistant config --unset-all credential.helper`. That one is
 fatal — it would give this instance push access to the public repo.
 
 ## "The assistant can't find my hubs" / it's writing to a different store
@@ -123,7 +123,7 @@ different stores. Set it in the unit instead (uncomment and edit
 Other causes, in order of likelihood: the store was never created (`make hub-init` — the
 verbs say `is not a hub repo yet` when so); the path resolves *inside* the checkout or
 *contains* it, which the resolver refuses outright and the preflight treats as fatal (point
-it somewhere outside `~/buzai`); or a `~/hubs` symlink whose target is inside the checkout
+it somewhere outside `~/buzai-assistant`); or a `~/hubs` symlink whose target is inside the checkout
 — the check follows symlinks first, which is the point.
 
 ## Self-diagnosis checklist

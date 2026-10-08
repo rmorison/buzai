@@ -220,7 +220,7 @@ class TestTrustStateProtection(GateTestBase):
             self.cfg(),
             "tts4",
             "Write",
-            {"file_path": "/home/buzai/buzai/.buzai/provenance.json", "content": "x"},
+            {"file_path": "/home/buzai/buzai-assistant/.buzai/provenance.json", "content": "x"},
         )
         self.assertEqual(res.decision, Decision.DENY)
         self.assertIn("trust-state", res.reason)

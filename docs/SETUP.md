@@ -65,17 +65,23 @@ Everything from step 1 on happens in that session.
 The repo is public:
 
 ```bash
-git clone https://github.com/rmorison/buzai.git ~/buzai && cd ~/buzai
+git clone https://github.com/rmorison/buzai.git ~/buzai-assistant && cd ~/buzai-assistant
 ```
 
 (The installer's user phase — `curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | bash` —
 does this for you, falling back to a tarball when git isn't installed, then runs
 `make setup`.)
 
-`~/buzai` is the assistant's workspace, and it is a **system directory**: machinery,
+`~/buzai-assistant` is the assistant's workspace, and it is a **system directory**: machinery,
 docs, and scaffolds only. Personal state lives *outside* it — your hubs in a private git
 repo at `$BUZAI_HUBS_DIR` (default `~/hubs`, step 9), your secrets at
 `~/.config/buzai/secrets/` — so a `git pull` here can never trample or publish it.
+
+It is deliberately not named `buzai`. The Remote Control picker labels an environment by
+its directory's name plus the host, and a contributor's dev checkout of the repo is
+called `buzai`; two environments with one label invite a prompt sent to the wrong
+instance. Keep dev checkouts at their usual path and never name one `buzai-assistant`.
+Installed earlier, at `~/buzai`? See [Moving an existing install to ~/buzai-assistant](#moving-an-existing-install-to-buzai-assistant).
 
 ## 2. Install Claude Code
 
@@ -134,7 +140,7 @@ make auth          # drops you into `claude` for the one-time interactive login
 > "Organization not resolved". That's expected on a fresh account and clears once
 > login completes; it's not a misconfiguration.
 
-**First time into the workspace.** The first `claude` run inside `~/buzai` hits a few
+**First time into the workspace.** The first `claude` run inside `~/buzai-assistant` hits a few
 one-time prompts (exact wording is Claude-Code-version-specific and changes over time):
 
 - **"Is this a project you created or one you trust?"** — answer **Yes, I trust this
@@ -327,7 +333,8 @@ unit needs **no** `EnvironmentFile` — leave those lines commented (their defau
 > #   and exit with Ctrl-D Ctrl-D  (claude exits on EOF/Ctrl-C, not SIGTERM)
 > ```
 >
-> The consent persists per-project (`~/buzai`). Only the one-time **"Enable Remote
+> The consent is recorded once per account; folder trust (step 3) is recorded per
+> directory, `~/buzai-assistant`. Only the one-time **"Enable Remote
 > Control?"** consent needs answering — it has no CLI flag to skip. The spawn mode does
 > have one, and the target passes it, matching what the unit runs: a prompt the service
 > never sees should not stand between you and the service. (It was worse than a
@@ -338,7 +345,7 @@ unit needs **no** `EnvironmentFile` — leave those lines commented (their defau
 **Then install and enable the unit:**
 
 ```bash
-make service-install      # installs the --user unit (pass NAME= / WORKDIR= if your clone isn't ~/buzai)
+make service-install      # installs the --user unit for THIS checkout (NAME= / WORKDIR= override)
 make service-start        # systemctl --user enable --now  (start now AND on boot)
 loginctl enable-linger "$USER"   # keep running without an active login (may need sudo)
 ```
@@ -431,7 +438,7 @@ repository outside the checkout**, at `$BUZAI_HUBS_DIR`, defaulting to `~/hubs`.
 separation is the privacy barrier — not `.gitignore`, and not the trust gate, which
 declares Bash (and therefore git) a blind spot.
 
-> **Never write hub content inside `~/buzai`.** A hub file in the checkout is one
+> **Never write hub content inside `~/buzai-assistant`.** A hub file in the checkout is one
 > `git add` away from a public remote. `scripts/hub_paths.py` refuses any hub location
 > inside the checkout (following symlinks first), and `scripts/secrets_preflight.py`
 > **fails service start** if it finds personal content under `hubs/` — that is a leak
@@ -571,14 +578,14 @@ local state your running instance depends on:
 - `trust/config/*.local.toml`
 
 **Your hubs are no longer on that list.** They live in their own private git repo outside
-the checkout (step 9), so nothing you do to `~/buzai` — pull, re-clone, or `rm -rf` — can
+the checkout (step 9), so nothing you do to `~/buzai-assistant` — pull, re-clone, or `rm -rf` — can
 reach them, and a lost host costs at most the unpushed tail. That is exactly the problem
 the private hub store fixed.
 
 Update in place instead. Normal case — as the `buzai` user, pull directly:
 
 ```bash
-git -C ~/buzai pull --ff-only origin main     # only touches TRACKED files
+git -C ~/buzai-assistant pull --ff-only origin main     # only touches TRACKED files
 ```
 
 *Fallback* — updating from your `sudo` account instead (you're not in a `buzai`
@@ -588,7 +595,7 @@ leaves root-owned files behind:
 
 ```bash
 # sudo account — git runs as buzai: no safe.directory entry, no chown-after needed
-sudo -u buzai git -C /home/buzai/buzai pull --ff-only origin main   # only touches TRACKED files
+sudo -u buzai git -C /home/buzai/buzai-assistant pull --ff-only origin main   # only touches TRACKED files
 ```
 
 Either way, `git pull` leaves all the untracked state above intact, so your gate stays
@@ -597,6 +604,59 @@ wired and your audit log continues. (If you genuinely must re-clone, copy out
 them — the hub store needs nothing, since it is not in here.) After an update, **restart
 the Claude Code session** so any changed hook config takes effect — and re-run `make test`
 if the gate code changed.
+
+## Moving an existing install to ~/buzai-assistant
+
+Installs from before v0.1.0 live at `~/buzai`. The Remote Control picker labels each
+environment by its working directory's name plus the host, so `~/buzai` shows as
+`buzai · <host>`, exactly like a dev checkout of the repo on the same machine. One stray
+prompt then goes to the wrong instance. New installs use `~/buzai-assistant` for that
+reason. An install at `~/buzai` keeps working until you move it, and `make
+service-install` reminds you each time it runs there.
+
+As the `buzai` user, once:
+
+```bash
+make -C ~/buzai service-stop
+mv ~/buzai ~/buzai-assistant && cd ~/buzai-assistant
+rm -rf .venv && make venv          # a venv records its own absolute path; rebuild it
+```
+
+**Optional — keep this checkout's Claude Code history.** Claude Code keeps per-directory
+state (session transcripts, auto-memory) under `~/.claude/projects/`, keyed by the
+directory's path with `/` and `.` turned into `-`. Move it, or the assistant starts that
+history fresh at the new path:
+
+```bash
+old="$HOME/.claude/projects/$(printf %s "$HOME/buzai" | tr '/.' '--')"
+new="$HOME/.claude/projects/$(printf %s "$HOME/buzai-assistant" | tr '/.' '--')"
+[ -d "$old" ] && [ ! -e "$new" ] && mv "$old" "$new"
+```
+
+**Re-trust the folder.** Claude Code's folder trust is recorded per path, so the moved
+checkout starts untrusted, and `claude remote-control` refuses an untrusted workspace
+("Workspace not trusted") instead of asking. Run `claude` once in `~/buzai-assistant`,
+answer **Yes, I trust this folder**, and exit (step 3 has the details). The Remote
+Control consent is account-wide and carries over; `make setup` tells you if it is
+missing, and `make prime-consent` answers it.
+
+**Then point the service at the new path and bring it back:**
+
+```bash
+make service-install     # rewrites the unit for this checkout
+make service-start
+make liveness            # LIVE: the relay socket is up
+make doctor
+```
+
+Check the picker: the environment now shows as `buzai-assistant · <host>`. Your hubs
+(`~/hubs`), secrets (`~/.config/buzai/secrets/`) and the trust-gate wiring are untouched
+by the move: the hooks resolve through the project directory, and `audit/` and `.buzai/`
+travel with the checkout. To undo it, run the same steps the other way round.
+
+A symlink named `buzai-assistant` pointing at `~/buzai` is not a shortcut. Claude Code
+resolves its working directory to the real path, so the label stays `buzai`, and one
+checkout reachable under two paths splits that per-directory state between them.
 
 ## Security
 

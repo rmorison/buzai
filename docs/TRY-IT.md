@@ -14,7 +14,7 @@ confirm it in the audit log.
 You'll read the audit log a few times. On the server (as the instance's user):
 
 ```bash
-tail -n 5 ~/buzai/audit/audit.jsonl | python3 -m json.tool
+tail -n 5 ~/buzai-assistant/audit/audit.jsonl | python3 -m json.tool
 ```
 
 Each entry shows the `tool`, the `tier` (OWNER), the `legs` it touched
@@ -96,7 +96,7 @@ default. To give it the right behavior, classify it per [`TUNING.md`](TUNING.md)
 **On the server:**
 
 ```bash
-tail -n 20 ~/buzai/audit/audit.jsonl | python3 -m json.tool   # the decisions you just made
+tail -n 20 ~/buzai-assistant/audit/audit.jsonl | python3 -m json.tool   # the decisions you just made
 .venv/bin/python -c "from trust import audit; print('chain intact:', audit.verify_chain('audit'))"
 ```
 
