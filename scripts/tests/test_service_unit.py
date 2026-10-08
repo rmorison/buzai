@@ -18,6 +18,9 @@ Verified against the unfixed template: every test in
 `ExecStartPre=` line and no `ExecStartPost=` line at all.
 """
 
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -410,16 +413,122 @@ class TestTheUnitOnlyNamesThingsThatExist(unittest.TestCase):
         for line in self.commands():
             for token in line.split():
                 if token.endswith(".py"):
-                    self.assertIn("/buzai/.venv/bin/python", line, line)
+                    self.assertIn("/buzai-assistant/.venv/bin/python", line, line)
                     break
 
     def test_every_path_is_rewritable_by_make_service_install(self):
-        # `make service-install WORKDIR=…` runs `sed 's|%h/buzai|$(WORKDIR)|g'`, so a
-        # checkout path written any other way silently keeps pointing at ~/buzai
+        # `make service-install` rewrites the token `%h/buzai-assistant` to the checkout it
+        # ran from, so a checkout path written any other way silently keeps pointing at
+        # ~/buzai-assistant
         for line in self.commands():
             for token in line.split():
                 if token.endswith(".py"):
-                    self.assertIn("%h/buzai/", token)
+                    self.assertIn("%h/buzai-assistant/", token)
+
+
+# The suffixes that turn a unit path into the checkout it names.
+CHECKOUT_SUFFIXES = ("/.venv/bin/python", "/scripts/")
+
+
+def checkout_paths(unit: str, home: Path) -> set[str]:
+    """Every checkout the unit names, with systemd's `%h` expanded to `home`: the
+    WorkingDirectory, plus the directory each venv interpreter and script lives in."""
+    found = {value.replace("%h", str(home)) for value in directives("WorkingDirectory", unit=unit)}
+    for line in directives("ExecStartPre", unit=unit) + directives("ExecStartPost", unit=unit):
+        for token in line.replace("'", " ").split():
+            token = token.lstrip("-").replace("%h", str(home))
+            for suffix in CHECKOUT_SUFFIXES:
+                if suffix in token:
+                    found.add(token.split(suffix)[0])
+    return found
+
+
+class TestServiceInstallPointsTheUnitAtItsCheckout(unittest.TestCase):
+    """Issue #17. The Remote Control picker labels an environment by its working
+    directory's basename, so a deployment at ~/buzai and a dev checkout of the repo both
+    show as `buzai · <host>`. The deployment now lives at ~/buzai-assistant.
+
+    The unit follows the checkout `make service-install` runs in, not a fixed default.
+    A default of ~/buzai-assistant would point an existing ~/buzai install, re-running
+    the verb after `git pull`, at a directory that does not exist.
+
+    These run the real recipe in a scratch HOME, with a stub `systemctl` first on PATH
+    (the Makefile's own PATH export puts $(HOME)/.local/bin there). Nothing is written
+    outside the scratch directory."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name) / "home"
+        bin_dir = self.home / ".local" / "bin"
+        bin_dir.mkdir(parents=True)
+        self.calls = Path(self._tmp.name) / "systemctl.calls"
+        stub = bin_dir / "systemctl"
+        stub.write_text(f'#!/bin/sh\necho "$@" >> "{self.calls}"\n')
+        stub.chmod(0o755)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def checkout(self, name: str) -> Path:
+        """A minimal checkout: the real Makefile and the real template, nothing else."""
+        root = self.home / name
+        (root / "deploy").mkdir(parents=True)
+        (root / "Makefile").write_text(MAKEFILE.read_text())
+        (root / "deploy" / TEMPLATE.name).write_text(TEMPLATE.read_text())
+        return root
+
+    def install(self, root: Path, *overrides: str) -> tuple[str, str]:
+        # an inherited WORKDIR/NAME or make flags would change what the recipe does
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("MAKE") and k not in ("WORKDIR", "NAME")
+        }
+        env["HOME"] = str(self.home)
+        run = subprocess.run(
+            ["make", "--no-print-directory", "-C", str(root), "service-install", *overrides],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        unit = self.home / ".config" / "systemd" / "user" / "claude-remote.service"
+        return unit.read_text(), run.stdout
+
+    def test_a_default_checkout_gets_a_unit_naming_it(self):
+        root = self.checkout("buzai-assistant")
+        unit, _ = self.install(root)
+        self.assertEqual(checkout_paths(unit, self.home), {str(root)})
+
+    def test_an_old_buzai_checkout_keeps_a_unit_naming_it(self):
+        # R4: an existing install that pulls and re-installs keeps working
+        root = self.checkout("buzai")
+        unit, _ = self.install(root)
+        self.assertEqual(checkout_paths(unit, self.home), {str(root)})
+
+    def test_an_explicit_workdir_replaces_the_whole_token(self):
+        # the old pattern `%h/buzai` is a prefix of `%h/buzai-assistant`; matching it
+        # would leave `<WORKDIR>-assistant` in every path
+        root = self.checkout("buzai-assistant")
+        elsewhere = Path(self._tmp.name) / "elsewhere"
+        unit, _ = self.install(root, f"WORKDIR={elsewhere}")
+        self.assertEqual(checkout_paths(unit, self.home), {str(elsewhere)})
+        self.assertNotIn(f"{elsewhere}-assistant", unit)
+
+    def test_a_checkout_named_buzai_is_told_about_the_picker(self):
+        root = self.checkout("buzai")
+        _, out = self.install(root)
+        self.assertIn("picker", out)
+        self.assertIn("Moving an existing install", out)
+
+    def test_a_checkout_named_buzai_assistant_is_not(self):
+        _, out = self.install(self.checkout("buzai-assistant"))
+        self.assertNotIn("picker", out)
+
+    def test_systemd_is_reloaded_through_the_stub(self):
+        self.install(self.checkout("buzai-assistant"))
+        self.assertIn("--user daemon-reload", self.calls.read_text())
 
 
 if __name__ == "__main__":

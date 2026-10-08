@@ -19,7 +19,9 @@
 export PATH := $(HOME)/.local/bin:$(PATH)
 
 NAME    ?= buzai-assistant
-WORKDIR ?= $(HOME)/buzai
+# The unit serves the checkout `make service-install` runs in. A fixed default would point
+# an existing install that pulls and re-installs at a directory that does not exist.
+WORKDIR ?= $(CURDIR)
 PY      := .venv/bin/python
 SYSTEMD_USER := $(HOME)/.config/systemd/user
 UNIT    := $(SYSTEMD_USER)/claude-remote.service
@@ -87,7 +89,7 @@ hub-review: ## Show the hub changes awaiting your review (plain language; the as
 
 # --- service ------------------------------------------------------------------
 
-service-install: ## Install the --user systemd unit (override NAME=/WORKDIR= if not ~/buzai)
+service-install: ## Install the --user systemd unit for THIS checkout (override NAME=/WORKDIR=)
 	@test -n "$(strip $(NAME))" || { echo "error: NAME must not be empty"; exit 1; }
 	mkdir -p $(SYSTEMD_USER)
 	cp deploy/claude-remote.service.template $(UNIT)
@@ -96,11 +98,17 @@ service-install: ## Install the --user systemd unit (override NAME=/WORKDIR= if 
 ifneq ($(NAME),buzai-assistant)
 	sed -i 's/--name buzai-assistant/--name $(subst &,\&,$(NAME))/' $(UNIT)
 endif
-ifneq ($(WORKDIR),$(HOME)/buzai)
-	sed -i 's|%h/buzai|$(subst &,\&,$(WORKDIR))|g' $(UNIT)
+# The whole token: `%h/buzai` alone is a prefix of it and would leave `-assistant` behind.
+ifneq ($(WORKDIR),$(HOME)/buzai-assistant)
+	sed -i 's|%h/buzai-assistant|$(subst &,\&,$(WORKDIR))|g' $(UNIT)
 endif
 	systemctl --user daemon-reload
 	@echo "installed $(UNIT)"
+ifeq ($(notdir $(WORKDIR)),buzai)
+	@echo "note: this checkout is named 'buzai'. The Remote Control picker labels an environment"
+	@echo "  by its directory name, so it looks the same as a dev checkout of the repo on this host."
+	@echo "  See docs/SETUP.md, 'Moving an existing install to ~/buzai-assistant'."
+endif
 	@echo "Remote Control needs a one-time 'make prime-consent' (the #1 trap) done BEFORE"
 	@echo "'make service-start' — do it now if you haven't. Then: make service-start  +  loginctl enable-linger $$USER"
 
