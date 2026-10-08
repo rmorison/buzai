@@ -129,12 +129,11 @@ ExecStartPost=-/bin/sh -c '%h/buzai/.venv/bin/python %h/buzai/scripts/hub_commit
 
 # A minute between tries, because the unit never gives up (StartLimitIntervalSec=0
 # above): at 10s a login outage is ~360 failed starts an hour, and the journal becomes
-# unreadable exactly when someone needs to read it. 60s caps it at 60 an hour. The wait
-# counts from the end of each failed attempt, so a cycle is 60s plus however long the
-# start checks above took, and recovery after a renewed login is about a minute plus
-# those checks. The cost: a one-off crash of a healthy server is also a minute's outage,
-# not 10s. A backoff that starts short (RestartSteps/RestartMaxDelaySec) would avoid
-# that, but it needs systemd 254, and Ubuntu 22.04 ships 249.
+# unreadable exactly when someone needs to read it. The wait counts from the end of a
+# failed attempt, so a cycle is 60s plus the start checks (bounded by TimeoutStartSec
+# above). A one-off crash also waits the full minute; a short-first backoff needs
+# systemd 254. The costs, in full: docs/solutions/architecture-patterns/
+# never-give-up-but-retry-slowly-2026-10-07.md
 Restart=always
 RestartSec=60s
 StandardOutput=journal

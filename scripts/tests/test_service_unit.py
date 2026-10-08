@@ -18,8 +18,10 @@ Verified against the unfixed template: every test in
 `ExecStartPre=` line and no `ExecStartPost=` line at all.
 """
 
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.hub_commit import build_parser as commit_parser
 from scripts.hub_remote import build_parser as remote_parser
@@ -100,6 +102,34 @@ class TestTheUnitNeverGivesUpButRetriesSlowly(unittest.TestCase):
 
     def test_it_restarts_always_and_a_minute_apart(self):
         self.assertEqual(directives("Restart", "Service"), ["always"])
+        self.assertEqual(directives("RestartSec", "Service"), ["60s"])
+
+
+class TestTheDirectiveReaderSeesWhatSystemdSees(unittest.TestCase):
+    """The guards above are only as good as `directives()`. systemd accepts `Key = value`
+    and ignores keys in the wrong section; a reader that matched `Key=` by prefix let a
+    spaced `StartLimitBurst = 5` straight past `test_there_is_no_burst_to_trip`. The real
+    template has no spaced keys, so this feeds the reader an invented one."""
+
+    UNIT = (
+        "[Unit]\n"
+        "# StartLimitBurst=9 in a comment is not a directive\n"
+        "StartLimitBurst = 5\n"
+        "[Service]\n"
+        "RestartSec=60s\n"
+    )
+
+    def setUp(self):
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory())) / "unit.service"
+        scratch.write_text(self.UNIT)
+        self.enterContext(mock.patch(f"{__name__}.TEMPLATE", scratch))
+
+    def test_a_spaced_key_is_read(self):
+        self.assertEqual(directives("StartLimitBurst"), ["5"])
+
+    def test_a_key_is_read_only_in_its_section(self):
+        self.assertEqual(directives("StartLimitBurst", "Unit"), ["5"])
+        self.assertEqual(directives("StartLimitBurst", "Service"), [])
         self.assertEqual(directives("RestartSec", "Service"), ["60s"])
 
 
