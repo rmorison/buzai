@@ -21,9 +21,14 @@ verifies it. No CLA.
 
 ```bash
 make venv        # pinned interpreter, zero third-party deps
-make dev         # installs the pre-commit hooks (hygiene, ruff, secret scan, leak gate)
+make dev         # installs gitleaks + the pre-commit and pre-push hooks (hygiene, ruff, leak gate)
 make test        # full suite must pass
 ```
+
+The hooks run the leak gate with the first `gitleaks` on your `PATH`: keep
+`~/.local/bin`, where `make dev` installs the pinned one, on it, or set `GITLEAKS`.
+Without a private value list you get the committed rules and a one-line note; see
+`docs/dev/PUBLIC-SEED.md`.
 
 - **Conventional Commits** — `feat(trust): …`, `fix(make): …`, `docs: …`.
 - **Stdlib only.** The Python here deliberately has zero third-party runtime
