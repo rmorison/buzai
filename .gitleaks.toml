@@ -110,3 +110,22 @@ id = "card-number-grouped"
 description = "Payment card number written in groups. Personal financial data never belongs in this repository; build test values at run time."
 regex = '''(?m)(?:^|[^0-9A-Za-z-])((?:[0-9]{4}-){3}[0-9]{4}|(?:[0-9]{4} ){3}[0-9]{4}|3[47][0-9]{2}[ -][0-9]{6}[ -][0-9]{5})(?:$|[^0-9A-Za-z-])'''
 secretGroup = 1
+
+# The service account every install creates is named buzai, and the docs give its
+# home as a literal path where readers need it (a command's expected output, a
+# path to check). The name is documented and identifies no person, like the
+# runner and linuxbrew entries in the home-directory rule's allowlist above.
+#
+# This should be scoped to that rule, but gitleaks 8.24.2 silently ignores the
+# [[allowlists]] form and its targetRules key, so it is the legacy global
+# allowlist. It exempts only a finding whose matched text is exactly buzai, with
+# optional trailing dots; only the home-directory rule's match is a bare user
+# name. Value rules are generated into a separate config and never read this
+# file. On the next gitleaks upgrade, move it to [[allowlists]] with
+# targetRules = ["home-directory-path"] if that version supports it.
+[allowlist]
+description = "The buzai service account's home directory"
+regexTarget = "secret"
+regexes = [
+  '''^buzai\.*$''',
+]

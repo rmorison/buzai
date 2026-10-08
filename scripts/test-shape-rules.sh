@@ -1,7 +1,8 @@
 #!/bin/sh
-# Proves each buzai shape rule in .gitleaks.toml (the block after "buzai
-# additions") fails on a planted value and passes its near misses, before any
-# real scan is trusted. CI runs this from .github/workflows/ci.yml; run it
+# Proves each buzai addition to .gitleaks.toml (the block after "buzai
+# additions") before any real scan is trusted: each shape rule fails on a planted
+# value and passes its near misses, and the service account allowlist exempts
+# only that account. CI runs this from .github/workflows/ci.yml; run it
 # locally with the pinned gitleaks on PATH, or with GITLEAKS set to its path.
 # scripts/test-leak-gate.sh, copied from engineering-standards, proves the
 # upstream rules and the wrapper; this script covers only buzai's additions.
@@ -155,6 +156,15 @@ clean "card shape inside a longer digit run" "1$C1-$C2-$C3-$C4"
 clean "card shape inside a hyphenated token" "$C1-$C2-$C3-$C4-$C1"
 clean "unseparated sixteen digits" "$C1$C2$C3$C4"
 clean "4-6-5 grouping without a 34 or 37 prefix" "4012 $X2 $X3"
+
+# --- the buzai service account allowlist ----------------------------------------
+# The service account's home passes the home-directory rule; any other user
+# directory, a lookalike included, is still refused.
+H=/home
+clean "service account home" "the key goes in $H/buzai/.ssh/authorized_keys"
+clean "service account home at a sentence end" "it lives in $H/buzai."
+leak home-directory-path "an invented user is still refused" "zqperson" "notes in $H/zqperson/x"
+leak home-directory-path "a lookalike of the service account is refused" "buzaix" "$H/buzaix/.ssh"
 
 echo "Shape rule fixtures: $passed passed, $failed failed."
 [ "$failed" -eq 0 ]
