@@ -35,10 +35,10 @@ the next writer queue, bounded by `LOCK_TIMEOUT_SECONDS`.
 
 The credential scan
 -------------------
-`scripts/publish_gate.py` is the wrong tool twice over: on a deployment its pattern file
-is absent so it matches almost nothing, and on a workstation its private patterns
-enumerate the hostnames and handles a legitimate personal hub is *supposed* to contain,
-so it would refuse valid commits. This scanner therefore looks for credential **shapes**
+The repository's leak gate (`scripts/leak-gate.sh`) is the wrong tool twice over: it is a
+developer hook that a deployment does not run, and on a workstation its private value
+list enumerates the hostnames and handles a legitimate personal hub is *supposed* to
+contain, so it would refuse valid commits. This scanner therefore looks for credential **shapes**
 only — private-key headers, known token prefixes, `Authorization:` values, secret-shaped
 assignments, and high-entropy opaque strings — and never for PII. It runs over the lines
 this operation *added*, so pre-existing content cannot make every future write refuse.

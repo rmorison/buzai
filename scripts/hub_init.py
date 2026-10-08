@@ -180,7 +180,7 @@ class InitResult:
 #
 # Every invocation targets the repo explicitly with `-C` (never an inherited cwd) and
 # a nonzero returncode is a value, not an exception — the two rules the existing call
-# sites in secrets_preflight.py and publish_gate.py already follow.
+# sites in secrets_preflight.py already follow.
 
 
 def git(

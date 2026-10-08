@@ -414,7 +414,7 @@ class TestCredentialScan(unittest.TestCase):
 """
 
     def test_legitimate_hub_content_is_not_flagged(self):
-        # the whole reason publish_gate's PII patterns are not reused: hostnames,
+        # the whole reason the leak gate's value list is not reused: hostnames,
         # handles, emails and account numbers are what a personal hub is FOR
         self.assertEqual(scan_text(self.LEGITIMATE), [])
 
