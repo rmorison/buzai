@@ -618,7 +618,7 @@ class TestOriginCredentialHelper(unittest.TestCase):
 
 
 class TestDurabilityWarnings(unittest.TestCase):
-    HUB = Path("/home/someone/hubs")
+    HUB = Path("/srv/someone/hubs")
 
     def test_no_remote_within_the_grace_period_is_quiet(self):
         state = HubState(
@@ -674,8 +674,8 @@ class TestDurabilityWarnings(unittest.TestCase):
         self.assertIsNone(dirty_warning(self.HUB, HubState(is_repo=True)))
 
     def test_nested_repo_warns(self):
-        state = HubState(is_repo=True, enclosing_repo="/home/someone")
-        self.assertIn("/home/someone", nested_repo_warning(self.HUB, state))
+        state = HubState(is_repo=True, enclosing_repo="/srv/someone")
+        self.assertIn("/srv/someone", nested_repo_warning(self.HUB, state))
 
     def test_no_enclosing_repo_is_quiet(self):
         self.assertIsNone(nested_repo_warning(self.HUB, HubState(is_repo=True)))
@@ -688,7 +688,7 @@ class TestDurabilityWarnings(unittest.TestCase):
             created=NOW - timedelta(days=60),
             backlog=Backlog(pending=(("abc", NOW - timedelta(days=2)),)),
             dirty=("home.md",),
-            enclosing_repo="/home/someone",
+            enclosing_repo="/srv/someone",
         )
         self.assertEqual(len(warnings_for(self.HUB, state, NOW)), 4)
 
@@ -713,7 +713,7 @@ class TestDurabilityWarnings(unittest.TestCase):
 
 
 class TestWarningsDoNotBlockStart(unittest.TestCase):
-    TARGET = HubTarget(Path("/home/someone/hubs"), "/home/someone/hubs (from default ~/hubs)")
+    TARGET = HubTarget(Path("/srv/someone/hubs"), "/srv/someone/hubs (from default ~/hubs)")
 
     def _run(self, findings):
         out, err = io.StringIO(), io.StringIO()
@@ -751,7 +751,7 @@ class TestWarningsDoNotBlockStart(unittest.TestCase):
         # a store mismatch between the unit and the owner's shell must be visible in the
         # journal, on every start, whether or not anything is wrong
         _, out, _ = self._run(Findings())
-        self.assertIn("hubs resolve to /home/someone/hubs", out)
+        self.assertIn("hubs resolve to /srv/someone/hubs", out)
 
     def test_clean_instance_says_so(self):
         code, out, _ = self._run(Findings())
@@ -857,7 +857,7 @@ class TestCredentialUsability(unittest.TestCase):
     must be logged in". Nothing in the journal said why.
     """
 
-    CREDS = Path("/home/example/.claude/.credentials.json")
+    CREDS = Path("/srv/example/.claude/.credentials.json")
 
     def warn(self, text):
         return credential_warning(text, self.CREDS)

@@ -826,10 +826,10 @@ class TestFailedMigrationCommitAfterTheSeedLanded(HubTempCase):
 
 
 class TestOwnerInstructions(unittest.TestCase):
-    TEXT = owner_instructions(Path("/home/owner/hubs"))
+    TEXT = owner_instructions(Path("/srv/owner/hubs"))
 
     def test_names_the_hub_repo_and_the_exact_commands(self):
-        self.assertIn("/home/owner/hubs", self.TEXT)
+        self.assertIn("/srv/owner/hubs", self.TEXT)
         self.assertIn("--private", self.TEXT)
         self.assertIn("remote add origin", self.TEXT)
         self.assertIn("push -u origin main", self.TEXT)

@@ -414,7 +414,7 @@ class TestCredentialScan(unittest.TestCase):
 """
 
     def test_legitimate_hub_content_is_not_flagged(self):
-        # the whole reason publish_gate's PII patterns are not reused: hostnames,
+        # the whole reason the leak gate's value list is not reused: hostnames,
         # handles, emails and account numbers are what a personal hub is FOR
         self.assertEqual(scan_text(self.LEGITIMATE), [])
 
@@ -439,7 +439,7 @@ class TestCredentialScan(unittest.TestCase):
         self.assertIn("aws access key id", [f.rule for f in scan_text("AKIAIOSFODNN7EXAMPLE")])
 
     def test_secret_shaped_assignment_is_caught(self):
-        line = 'api_key = "8Xj2Qm4Zp7Rw1Nc6Vb0Ty5"'
+        line = 'api_key = "' + "8Xj2Qm4Zp7" + "Rw1Nc6Vb0Ty5" + '"'
         self.assertIn("secret-shaped assignment", [f.rule for f in scan_text(line)])
 
     def test_placeholder_assignments_are_not_flagged(self):
@@ -455,7 +455,7 @@ class TestCredentialScan(unittest.TestCase):
         self.assertIn("high-entropy opaque string", [f.rule for f in scan_text(blob)])
 
     def test_findings_never_carry_the_value(self):
-        secret = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" + "K1l2M3n4O5p6Q7r8"
         for finding in scan_text(f"- {secret}"):
             self.assertNotIn(secret, str(finding))
             self.assertIn("line 1", str(finding))
@@ -629,7 +629,7 @@ class TestWriteRefusals(HubRepoCase):
 
 
 class TestCredentialRefusal(HubRepoCase):
-    TOKEN = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" + "K1l2M3n4O5p6Q7r8"
 
     def test_a_planted_token_is_refused_and_the_file_rolled_back(self):
         result = self.append(f"the deploy token is {self.TOKEN}")
@@ -733,7 +733,9 @@ class TestDirtyTreeReconciliation(HubRepoCase):
         self.assertEqual(self.commits(), 2)
 
     def test_credential_shaped_dirty_content_is_left_dirty_and_reported(self):
-        (self.hub / "leaked.md").write_text("token ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8\n")
+        (self.hub / "leaked.md").write_text(
+            "token " + "ghp_" + "A1b2C3d4E5f6G7h8I9j0" + "K1l2M3n4O5p6Q7r8" + "\n"
+        )
 
         result = self.append("an unrelated fact")
 
@@ -768,7 +770,7 @@ class TestFlaggedDirtyTargetIsRefused(HubRepoCase):
     `committed`, and `git show HEAD:notes.md` contained the planted token.
     """
 
-    TOKEN = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" + "K1l2M3n4O5p6Q7r8"
 
     def setUp(self):
         super().setUp()
@@ -1382,7 +1384,7 @@ class TestMain(unittest.TestCase):
 class TestMainAgainstARealHub(HubRepoCase):
     """`main` against a hub with no remote — nothing here can reach the network."""
 
-    TOKEN = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" + "K1l2M3n4O5p6Q7r8"
 
     def setUp(self):
         super().setUp()

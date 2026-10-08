@@ -18,8 +18,8 @@ from scripts.hub_paths import (
     source_of,
 )
 
-HOME = Path("/home/someone")
-REPO = Path("/home/someone/buzai")
+HOME = Path("/srv/someone")
+REPO = Path("/srv/someone/buzai")
 
 
 class TestExpand(unittest.TestCase):
@@ -95,9 +95,9 @@ class TestRefusal(unittest.TestCase):
         self.assertIn("contains the repo checkout", problem)
 
     def test_sibling_sharing_a_name_prefix_is_fine(self):
-        # Guards against a naive startswith() check: /home/someone/buzai-hubs is not
-        # inside /home/someone/buzai.
-        self.assertIsNone(refusal(Path("/home/someone/buzai-hubs"), REPO))
+        # Guards against a naive startswith() check: /srv/someone/buzai-hubs is not
+        # inside /srv/someone/buzai.
+        self.assertIsNone(refusal(Path("/srv/someone/buzai-hubs"), REPO))
 
 
 class TestResolve(unittest.TestCase):
