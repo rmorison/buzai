@@ -88,13 +88,18 @@ The costs we accept:
   and up to two push attempts per cycle against the hub host. Every step is time-bounded. The old 10s cadence without a limit would have run
   the chain six times as often, and under the start limit it stopped after five tries.
   The pushes use the hub's own credential, not the login, so they can run during a login
-  outage. Nobody has checked on a host whether they finish when the server exits within
-  seconds. The journal records each push's outcome, so read that rather than assuming a
-  backlog is draining or stuck.
+  outage, and they finish even when the server exits within seconds. Checked on systemd
+  249 with a transient scratch unit (#26): the main process failed at +2s, the
+  `ExecStartPost` command kept running and completed at +8s, and only then did the unit
+  go to `failed`. The pushes are bounded by their own timeouts and by `TimeoutStartSec`,
+  not by the server's lifetime. The journal records each push's outcome, so read that
+  rather than assuming a backlog is draining or stuck.
 - **A cycle is longer than 60s.** `RestartSec` counts from the end of a failed attempt,
   so each cycle is 60s plus the start checks. Those take seconds on a good day and longer
-  when the hub remote is slow or unreachable. Nobody has measured how long; the hard
-  ceiling is `TimeoutStartSec` (600s). "60 an hour" is a ceiling.
+  when the hub remote is slow or unreachable. Not measured; by the code's own timeouts an
+  unreachable remote with a backlog costs about 100s (two privacy checks of at most 50s,
+  itemized in the unit's `TimeoutStartSec` comment), and the hard ceiling is
+  `TimeoutStartSec` (600s). "60 an hour" is a ceiling.
   Recovery after a renewal is a minute plus however long those checks take.
 - **A one-off crash also waits 60s.** A healthy server that exits once is back after a
   minute, not 10s. A backoff that starts short and grows (`RestartSteps`,

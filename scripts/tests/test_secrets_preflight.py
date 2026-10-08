@@ -159,9 +159,10 @@ class TestSecretsPreflight(unittest.TestCase):
 # --- characterization: the pre-U6 contract, pinned ---------------------------------
 #
 # This script is the systemd `ExecStartPre`, so a regression here does not fail a test
-# in CI, it leaves the service `failed` (StartLimitBurst=5) until someone logs in. These
-# tests pin the exact behavior the perms/tracked checks had BEFORE the structural checks
-# were added, so extending the script cannot quietly change what it already refused.
+# in CI, it keeps the service off the air, retrying every minute, until someone fixes
+# it. These tests pin the exact behavior the perms/tracked checks had BEFORE the
+# structural checks were added, so extending the script cannot quietly change what it
+# already refused.
 
 
 class TestPermProblemsCharacterization(unittest.TestCase):
@@ -721,8 +722,8 @@ class TestWarningsDoNotBlockStart(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_warnings_alone_exit_zero(self):
-        # StartLimitBurst=5: a fatal durability check would leave the unit `failed` until
-        # a human logs in, turning degraded knowledge into a total assistant outage
+        # A fatal durability check would fail every retry until a human fixes it,
+        # turning degraded knowledge into a total assistant outage
         code, out, err = self._run(Findings(warnings=("nothing has been pushed off-box",)))
         self.assertEqual(code, 0)
         self.assertIn("WARN: nothing has been pushed off-box", err)
@@ -1002,9 +1003,10 @@ class TestAssessComposition(AssessCompositionCase):
         """PLANT: the nine-day outage's exact on-disk shape.
 
         A logged-out instance already fails at ExecStart; making this fatal would only
-        add a second way to die, and with StartLimitBurst=5 the fatal path is the one
-        that stops systemd retrying at all. The value is that the journal names the cause
-        instead of leaving an operator to infer it from a restart loop.
+        add a second way to die, and if the check ever misread a working file, a fatal
+        would keep a healthy assistant off the air until someone fixed it. The value is
+        that the journal names the cause instead of leaving an operator to infer it from a
+        restart loop.
         """
         self.creds.write_text(
             json.dumps({"claudeAiOauth": {"accessToken": "", "refreshToken": ""}})
@@ -1021,8 +1023,8 @@ class TestAssessComposition(AssessCompositionCase):
 
     def test_a_durability_warning_composed_through_assess_still_exits_zero(self):
         # PLANT: a real hub repo with commits, no remote, and a marker old enough to
-        # clear the grace period. Warning, never fatal — StartLimitBurst=5 would turn
-        # "knowledge is not backed up" into "the assistant is gone".
+        # clear the grace period. Warning, never fatal — a fatal would turn "knowledge is
+        # not backed up" into "the assistant is down until someone fixes it".
         hub = make_repo(self.home / "hubs")
         (hub / "home.md").write_text("# Home\n")
         marker = hub / ".buzai" / "remote-expected"
@@ -1115,7 +1117,7 @@ class TestAssessComposition(AssessCompositionCase):
 
         The preflight is right to block — the content IS a leak — but `make hub-init`
         used to report "exists" and stop, so nothing could clear it and
-        `StartLimitBurst=5` left the unit failed. This drives both halves.
+        every retried start failed the same way. This drives both halves.
         """
         hub = make_repo(self.home / "hubs")
         (hub / "README.md").write_text("# Hub store\n")
@@ -1140,7 +1142,7 @@ class TestAssessComposition(AssessCompositionCase):
 class TestTimeoutsDegradeInTheDirectionTheCheckDemands(unittest.TestCase):
     """PLANT: a git that never returns, on the `ExecStartPre` path.
 
-    Unbounded, this is a hung service start, and five of those leave the unit `failed`.
+    Unbounded, this is a hung start on every retry, keeping the assistant off the air.
     Bounded, what matters is the direction each check degrades in: a leak check that
     cannot answer must NOT pass, and a durability check that cannot answer must warn
     rather than take the assistant down with it.
@@ -1229,7 +1231,7 @@ class TestANaiveStoredTimestampCannotBlockStart(AssessCompositionCase):
     inside WARNING-path checks (`stale_remote_warning`, `backlog_warning`) that
     `ExecStartPre` runs on every service start. Naive minus aware raises `TypeError`,
     which nothing on that path catches: the preflight died, `ExecStartPre` failed, and
-    with `StartLimitBurst=5` the unit was left permanently `failed` — a *durability*
+    every retry failed the same way, keeping the assistant off the air — a *durability*
     condition, which cannot leak anything, taking the whole assistant offline. That is
     the exact inversion of the fatal/warning split this module exists to enforce.
 
@@ -1310,7 +1312,7 @@ class TestAnUnexpectedDurabilityFailureDegradesToAWarning(AssessCompositionCase)
     hung git, an unparseable marker — already degrades correctly and has its own test;
     this is the backstop for the *unanticipated* one, which is what a naive stored
     timestamp was until it was found. `ExecStartPre` failure blocks service start and
-    `StartLimitBurst=5` makes five of them permanent, so no bug on the durability path
+    every retry fails the same way, so no bug on the durability path
     may be able to reach that outcome: nothing there can leak, so nothing there is worth
     ending the assistant over.
 

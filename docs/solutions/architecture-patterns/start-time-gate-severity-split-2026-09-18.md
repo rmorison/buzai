@@ -18,7 +18,7 @@ applies_when:
 tags:
   - systemd
   - fail-closed
-  - start-limit
+  - restart
   - preflight
   - always-on
   - observability
@@ -33,13 +33,14 @@ start on a preflight: `ExecStartPre` runs a script that refuses to start the ser
 unsafe layout. The instinct when adding a check is to make it fail — that is what a gate
 is for.
 
-That instinct is wrong for half the checks, and the reason is `StartLimitBurst`. With
-`StartLimitBurst=5` and `StartLimitIntervalSec=300`, five failed starts inside five
-minutes make systemd stop trying **permanently**. A precondition that is merely *absent*
-— no hub store yet, nothing backed up yet, no remote attached yet — is a condition that
-will not resolve on its own between retries. Make it fatal and the gate converts "your
-knowledge is not backed up" into "the assistant is gone, and will not come back on its
-own". The safety mechanism becomes the outage.
+That instinct is wrong for half the checks, because a failed start keeps the assistant
+off the air. systemd retries every minute, and every retry runs the same gate. A
+precondition that is merely *absent* — no hub store yet, nothing backed up yet, no
+remote attached yet — is a condition that will not resolve on its own between retries.
+Make it fatal and the gate converts "your knowledge is not backed up" into "the
+assistant is down until someone fixes it". The safety mechanism becomes the outage.
+(When this was written the unit also had `StartLimitBurst=5`, which stopped the retries
+for good after five failures; #5 removed it.)
 
 The mirror-image mistake is quieter. Three of this service's start-path scripts printed
 `FAIL:` for a state every fresh instance passes through — no hub store between `make
@@ -86,9 +87,9 @@ a durable cache. Point health checks at that, not at log text.
 This is the same failure family as a fail-closed safety gate that bricks the box: a
 control that degrades into a liveness failure. But it has a nastier property. A gate that
 denies a tool call fails loudly and immediately, in front of the person who asked. A gate
-that fails *at start* fails when nobody is watching, and `StartLimitBurst` makes the
-failure permanent rather than transient. The assistant is simply gone, and the next signal
-is a human noticing days later.
+that fails *at start* fails when nobody is watching, and fails again on every retry for
+as long as the condition lasts. The assistant is off the air, and the next signal is a
+human noticing days later.
 
 The observability half matters for the same reason. An always-on service is one you are
 not watching; the journal is the only account of whether its start-time guarantees held.
@@ -97,8 +98,9 @@ that silently stopped running.
 
 ## When to Apply
 
-- Any `ExecStartPre`/`ExecStartPost` gate on a unit with `Restart=always` — check the
-  `StartLimitBurst` interaction **before** choosing an exit code.
+- Any `ExecStartPre`/`ExecStartPost` gate on a unit with `Restart=always` — a fatal exit
+  fails every retry until the condition clears, so weigh that outage **before** choosing
+  an exit code.
 - Any precondition that a fresh install passes through on its way to being configured.
 - Any script that is run both by a unit and by a human; decide whether leniency is a
   property of the code or of the caller.
@@ -114,8 +116,9 @@ having to trust it:
 # scripts/secrets_preflight.py
 def report(target: HubTarget, findings: Findings) -> int:
     """Print the verdict and return the exit code. 1 only for leak conditions."""
-    # Warnings are durability conditions and exit 0 by design. With StartLimitBurst=5,
-    # failing here would turn "knowledge is not backed up" into "the assistant is gone".
+    # Warnings are durability conditions and exit 0 by design. A fatal fails every retry
+    # until the condition clears, so failing here would turn "knowledge is not backed up"
+    # into "the assistant is down until someone fixes it".
     for warning in findings.warnings:
         print(f"secrets-preflight WARN: {warning}", file=sys.stderr)
     if findings.blocks_start:

@@ -181,8 +181,9 @@ resolved and then splits its findings two ways:
   fatal too: on the leak side, "cannot tell" never reads as "clean".
 - **`WARN:` — durability conditions exit 0 and never block start.** A hub store with no
   remote past its grace period, unpushed commits, a dirty hub working tree, a git repo
-  nested above the hub directory. With `StartLimitBurst=5` above, failing on those would
-  turn "knowledge is not backed up" into "the assistant is gone".
+  nested above the hub directory. A failed start is retried every minute, so failing on
+  those would turn "knowledge is not backed up" into "the assistant is down until
+  someone fixes it".
 
 It passes cleanly when there are simply no local secrets and no hub store yet.
 

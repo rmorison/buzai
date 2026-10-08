@@ -416,7 +416,9 @@ make doctor     # aggregate: prereqs + venv + secrets-preflight + liveness, in o
 When you need to dig deeper, the manual self-diagnosis steps (carried from real
 operation):
 
-1. Unit active? `systemctl --user is-active claude-remote`
+1. Unit active? `systemctl --user is-active claude-remote` — `activating` means starts
+   are failing in a loop (the unit retries every minute and never settles in `failed`);
+   read the journal (step 6).
 2. Relay socket established? `ss -tnp | grep <pid>` → `ESTAB …:443`
 3. Token expiries in the future? (check `~/.claude/.credentials.json`)
 4. Model resolves to an available model?

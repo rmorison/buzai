@@ -92,9 +92,13 @@ ExecStartPre=-%h/buzai-assistant/.venv/bin/python %h/buzai-assistant/scripts/hub
 # every one of them is network-facing. systemd's 90s default would kill a start whose
 # probes are merely slow — and killing it stops the ExecStart server that is already
 # running and serving, which is precisely backwards. Each command is internally bounded,
-# so this only has to exceed their sum on a bad-but-real day (an unreachable remote is
-# roughly two minutes of timeouts); a generous value costs nothing because the assistant
-# is live throughout, while a tight one takes a working assistant down.
+# so this only has to exceed their sum on a bad-but-real day. By the code's own timeouts
+# (not measured): one privacy check is at most 50s (10s alias resolution, 20s anonymous
+# probe, 20s authenticated probe). An unreachable remote with a push backlog pays for two,
+# about 100s, because the check above evicts the cached verdict and `--retry-push` probes
+# again. A reachable but slow remote can instead spend two 60s pushes. A generous value
+# costs nothing because the assistant is live throughout, while a tight one takes a
+# working assistant down.
 TimeoutStartSec=600s
 
 # Long-lived remote-control SERVER (sessions attach on demand). Do NOT use

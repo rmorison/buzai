@@ -975,8 +975,8 @@ def read_backlog(path: Path) -> Backlog:
     (`Backlog.oldest_age_seconds`, read by `secrets_preflight.backlog_warning` on the
     systemd `ExecStartPre` path), and mixing naive with aware raises `TypeError` — which
     is not among the exceptions a *durability* check's callers handle. It would escape
-    `ExecStartPre` and, with `StartLimitBurst=5`, leave the unit `failed`: a stray
-    timestamp would end the assistant.
+    `ExecStartPre` on every retry: a stray timestamp would keep the assistant off the air
+    until someone fixed it.
 
     Dropping rather than fataling is the same trade the rest of this reader makes.
     Understating the backlog by one commit is corrected by the next write or by

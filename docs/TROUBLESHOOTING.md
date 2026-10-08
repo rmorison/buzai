@@ -142,7 +142,9 @@ walk the rest (carried from real operation):
    dead rule pattern is exactly the "gate asks for everything" / "legs never apply"
    symptom.
 6. **Restart loop?** `journalctl --user -u claude-remote` — repeated starts mean a crash
-   loop (the unit's start-limit will park it in `failed` rather than churn silently).
+   loop. The unit never gives up: it retries every minute and shows `activating
+   (auto-restart)` in `systemctl --user status`, never `failed`. The journal has the
+   cause.
 7. **Host basics:** load, memory, disk, and the **clock** (skew breaks tokens).
 
 ## Known red herrings — don't chase these

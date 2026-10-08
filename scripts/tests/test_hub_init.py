@@ -427,7 +427,7 @@ class TestResumeInterruptedMigration(HubTempCase):
     This is what `make hub-init` interrupted mid-migration leaves behind, and it used to
     be inescapable: the preflight fataled on the content (correctly — it is a leak) and
     blocked service start, while a re-run saw the repo, reported "exists" and stopped.
-    Five starts later `StartLimitBurst=5` leaves the unit failed for good.
+    Every retried start failed the same way, so the assistant stayed off the air.
     """
 
     def setUp(self):
@@ -872,7 +872,7 @@ class TestMarkerRejectsANaiveTimestamp(unittest.TestCase):
     inside `secrets_preflight.stale_remote_warning`, a WARNING-path check on the systemd
     `ExecStartPre` line, and naive-minus-aware raises `TypeError`. That is not among the
     exceptions `read_marker` catches, so it escaped `ExecStartPre` and blocked service
-    start; with `StartLimitBurst=5` a marker typo ended the assistant.
+    start on every retry; a marker typo kept the assistant off the air.
 
     Verified against the unfixed version: `parse_marker` returned the naive datetime and
     `stale_remote_warning` raised `TypeError: can't subtract offset-naive and
