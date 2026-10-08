@@ -73,9 +73,25 @@ something the others would leave broken.
   job with its own signal. A start limit that tries to do that job does it by causing the
   outage it was meant to report.
 
-The trade-off we accept: a real hot loop, such as a misconfiguration that exits
-immediately, no longer ends in `failed`. It cycles once a minute until it is fixed. That
-is cheap, because the cycle is slow, and it is visible, because the watchdog reports it.
+The costs we accept:
+
+- **A hot loop no longer ends in `failed`.** A real one, such as a misconfiguration that
+  exits immediately or a fatal preflight finding, cycles once a minute until it is fixed.
+  The cycle is slow, so it is cheap. **It is not visible yet:** the watchdog (#4) is
+  deferred and has not been built. Until it is, a unit that cannot start shows
+  `activating (auto-restart)`, not `failed`, so `systemctl --user is-failed` reports
+  nothing. Read `systemctl --user status` and the journal. Removing the start limit
+  removed the only alarm the unit had, and no replacement exists yet.
+- **Every retry runs the whole start chain.** That covers the privacy probe in
+  `ExecStartPre` and, once the server is spawned, the two backlog pushes in
+  `ExecStartPost`. During a long outage that is up to one probe and one push attempt a
+  minute against the hub host. Each one is time-bounded, and the old 10s cadence
+  without a limit would have been six times worse. Under the start limit it stopped
+  after five attempts.
+- **A one-off crash also waits 60s.** A healthy server that exits once is back after a
+  minute, not 10s. A backoff that starts short and grows (`RestartSteps`,
+  `RestartMaxDelaySec`) avoids that, but it needs systemd 254, and the Ubuntu 22.04
+  hosts this targets ship 249. Revisit when the baseline moves.
 
 ## Why this matters
 

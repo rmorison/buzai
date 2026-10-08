@@ -52,26 +52,18 @@ def make_recipe(target: str) -> list[str]:
     return recipe
 
 
-def directives(name: str) -> list[str]:
-    """Every value of `name=` in the unit, in file order, comments excluded."""
-    return [
-        line.split("=", 1)[1].strip()
-        for line in TEMPLATE.read_text().splitlines()
-        if line.strip().startswith(f"{name}=")
-    ]
-
-
-def section_directives(section: str, name: str) -> list[str]:
-    """Every value of `name=` inside `[section]` only, in file order, comments excluded.
+def directives(name: str, section: str | None = None) -> list[str]:
+    """Every value of `name=` in the unit, in file order, comments excluded — or only
+    those inside `[section]`, when given.
 
     systemd ignores a directive in the wrong section (with a warning), so a key that is
-    present but misplaced does nothing — `directives()` alone would not notice."""
+    present but misplaced does nothing; pass `section` wherever placement matters."""
     values, current = [], None
     for raw in TEMPLATE.read_text().splitlines():
         line = raw.strip()
         if line.startswith("[") and line.endswith("]"):
             current = line[1:-1]
-        elif current == section and line.startswith(f"{name}="):
+        elif line.startswith(f"{name}=") and section in (None, current):
             values.append(line.split("=", 1)[1].strip())
     return values
 
@@ -94,8 +86,8 @@ class TestTheUnitNeverGivesUpButRetriesSlowly(unittest.TestCase):
 
     def test_the_start_limit_is_disabled_in_the_unit_section(self):
         # StartLimitIntervalSec belongs to [Unit]; under [Service] systemd ignores it
-        self.assertEqual(section_directives("Unit", "StartLimitIntervalSec"), ["0"])
-        self.assertEqual(section_directives("Service", "StartLimitIntervalSec"), [])
+        self.assertEqual(directives("StartLimitIntervalSec", "Unit"), ["0"])
+        self.assertEqual(directives("StartLimitIntervalSec", "Service"), [])
 
     def test_there_is_no_burst_to_trip(self):
         # with the interval at 0 a burst is inert, but a stray one invites "restoring" the
@@ -103,8 +95,8 @@ class TestTheUnitNeverGivesUpButRetriesSlowly(unittest.TestCase):
         self.assertEqual(directives("StartLimitBurst"), [])
 
     def test_it_restarts_always_and_a_minute_apart(self):
-        self.assertEqual(section_directives("Service", "Restart"), ["always"])
-        self.assertEqual(section_directives("Service", "RestartSec"), ["60s"])
+        self.assertEqual(directives("Restart", "Service"), ["always"])
+        self.assertEqual(directives("RestartSec", "Service"), ["60s"])
 
 
 class TestTheServiceStartGuaranteesAreWired(unittest.TestCase):

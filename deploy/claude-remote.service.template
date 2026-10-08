@@ -15,8 +15,10 @@ Wants=network-online.target
 # once had 5 in 5 min) turns that into a `failed` unit that STAYS failed after the
 # credential is renewed, until someone restarts it by hand: a transient condition becomes
 # a permanent, silent outage. With 0 the unit keeps retrying (at RestartSec below) and
-# recovers on its own the moment the login is good again. Noticing a long outage is the
-# watchdog's job, not this line's. Do not add StartLimitBurst back.
+# recovers on its own the moment the login is good again. Do not add StartLimitBurst back.
+# Noticing a long outage is the watchdog's job (#4), and the watchdog is not built yet.
+# Until it is, a unit that cannot start shows `activating (auto-restart)` in
+# `systemctl --user status`, never `failed`. Read the journal, not `is-failed`.
 StartLimitIntervalSec=0
 
 [Service]
@@ -128,7 +130,10 @@ ExecStartPost=-/bin/sh -c '%h/buzai/.venv/bin/python %h/buzai/scripts/hub_commit
 # A minute between tries, because the unit never gives up (StartLimitIntervalSec=0
 # above): at 10s a login outage is ~360 failed starts an hour, and the journal becomes
 # unreadable exactly when someone needs to read it. 60s is 60 an hour, and recovery after
-# a renewed login is still at most a minute away.
+# a renewed login is still at most a minute away. The cost: a one-off crash of a healthy
+# server is also a minute's outage, not 10s. A backoff that starts short
+# (RestartSteps/RestartMaxDelaySec) would avoid that, but it needs systemd 254 and the
+# hosts SETUP targets ship 249.
 Restart=always
 RestartSec=60s
 StandardOutput=journal
