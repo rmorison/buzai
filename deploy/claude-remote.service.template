@@ -10,11 +10,14 @@ Description=buzai assistant — Claude Code Remote Control
 After=network-online.target
 Wants=network-online.target
 
-# If the server ever hot-loops (e.g. exits immediately on a misconfig instead of sitting
-# active-but-unregistered), surface it as a visible `failed` state rather than silent
-# ~6x/min churn: >5 restarts in 5 min trips the start limit.
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# Never give up. The commonest reason a start fails for minutes on end is an expired or
+# lapsed login, which SETUP treats as an expected steady state. A start limit (this unit
+# once had 5 in 5 min) turns that into a `failed` unit that STAYS failed after the
+# credential is renewed, until someone restarts it by hand: a transient condition becomes
+# a permanent, silent outage. With 0 the unit keeps retrying (at RestartSec below) and
+# recovers on its own the moment the login is good again. Noticing a long outage is the
+# watchdog's job, not this line's. Do not add StartLimitBurst back.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -56,9 +59,10 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # content inside the checkout, a hub deploy key with loose perms or tracked by any repo,
 # a credential helper on the public origin, or a hub path inside the checkout. Durability
 # conditions (no remote, unpushed backlog, dirty hub tree) print WARN and DO NOT block
-# start — with StartLimitBurst=5 above, failing on those would turn "knowledge is not
-# backed up" into "the assistant is gone". Runs under the pinned, self-contained .venv
-# Python (SETUP step 5), NOT the host's system python.
+# start — a failed start keeps the assistant off the air until the check passes, so
+# failing on those would turn "knowledge is not backed up" into "the assistant is gone".
+# Runs under the pinned, self-contained .venv Python (SETUP step 5), NOT the host's
+# system python.
 ExecStartPre=%h/buzai/.venv/bin/python %h/buzai/scripts/secrets_preflight.py
 
 # Re-verify that the hub remote is still PRIVATE, and do it BEFORE anything pushes.
@@ -121,8 +125,12 @@ ExecStart=%h/.local/bin/claude remote-control --name buzai-assistant --spawn=sam
 # it on a box with no store gets a failure rather than a success that drained nothing.
 ExecStartPost=-/bin/sh -c '%h/buzai/.venv/bin/python %h/buzai/scripts/hub_commit.py --retry-push --if-initialized && %h/buzai/.venv/bin/python %h/buzai/scripts/hub_review.py --push-notes --if-initialized'
 
+# A minute between tries, because the unit never gives up (StartLimitIntervalSec=0
+# above): at 10s a login outage is ~360 failed starts an hour, and the journal becomes
+# unreadable exactly when someone needs to read it. 60s is 60 an hour, and recovery after
+# a renewed login is still at most a minute away.
 Restart=always
-RestartSec=10s
+RestartSec=60s
 StandardOutput=journal
 StandardError=journal
 

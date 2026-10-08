@@ -61,6 +61,52 @@ def directives(name: str) -> list[str]:
     ]
 
 
+def section_directives(section: str, name: str) -> list[str]:
+    """Every value of `name=` inside `[section]` only, in file order, comments excluded.
+
+    systemd ignores a directive in the wrong section (with a warning), so a key that is
+    present but misplaced does nothing — `directives()` alone would not notice."""
+    values, current = [], None
+    for raw in TEMPLATE.read_text().splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+        elif current == section and line.startswith(f"{name}="):
+            values.append(line.split("=", 1)[1].strip())
+    return values
+
+
+class TestTheUnitNeverGivesUpButRetriesSlowly(unittest.TestCase):
+    """`StartLimitBurst=5` in a 300s window turned an expired credential — which SETUP
+    calls an expected steady state — into a unit left `failed` for good: five failed
+    starts and systemd stopped trying, and it went on not trying after the credential was
+    renewed, until someone restarted it by hand. A transient condition became a permanent,
+    silent outage.
+
+    Removing the limit alone is the opposite failure: at `RestartSec=10s` a token outage
+    is ~360 failed starts an hour of journal noise. So the unit never gives up, and waits
+    a minute between tries. Noticing a long outage is the watchdog's job (#4), not the
+    start limit's.
+
+    Verified against the unfixed template: all three tests failed — it carried
+    `StartLimitIntervalSec=300`, `StartLimitBurst=5` and `RestartSec=10s`.
+    """
+
+    def test_the_start_limit_is_disabled_in_the_unit_section(self):
+        # StartLimitIntervalSec belongs to [Unit]; under [Service] systemd ignores it
+        self.assertEqual(section_directives("Unit", "StartLimitIntervalSec"), ["0"])
+        self.assertEqual(section_directives("Service", "StartLimitIntervalSec"), [])
+
+    def test_there_is_no_burst_to_trip(self):
+        # with the interval at 0 a burst is inert, but a stray one invites "restoring" the
+        # interval and quietly bringing the give-up back
+        self.assertEqual(directives("StartLimitBurst"), [])
+
+    def test_it_restarts_always_and_a_minute_apart(self):
+        self.assertEqual(section_directives("Service", "Restart"), ["always"])
+        self.assertEqual(section_directives("Service", "RestartSec"), ["60s"])
+
+
 class TestTheServiceStartGuaranteesAreWired(unittest.TestCase):
     def setUp(self):
         self.pre = directives("ExecStartPre")
