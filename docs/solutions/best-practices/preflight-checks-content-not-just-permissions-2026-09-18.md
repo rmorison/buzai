@@ -36,7 +36,8 @@ tokens had been emptied in place — `accessToken` and `refreshToken` were both 
 string. The file was still present. Still 0600. Still untracked. The preflight passed on
 every start, exited 0, and the service then failed at `ExecStart` with *"You must be
 logged in to use Remote Control"*, five times inside five minutes, until `StartLimitBurst`
-stopped systemd retrying.
+stopped systemd retrying. (The unit had `StartLimitBurst=5` then; #5 removed it, and a
+failed start now retries every minute until it passes.)
 
 Every check that existed was green. None of them asked the other question: *does this file
 still work?*
@@ -142,6 +143,6 @@ def test_emptied_credentials_warn_through_assess_and_never_block_start(self):
 
 ## Related
 
-- [A start-time gate needs a severity split](../architecture-patterns/start-time-gate-severity-split-2026-09-18.md) — why this is a warning and not a fatal, and what `StartLimitBurst` does to the alternative.
+- [A start-time gate needs a severity split](../architecture-patterns/start-time-gate-severity-split-2026-09-18.md) — why this is a warning and not a fatal, and what a fatal would cost instead.
 - [Running Claude Code always-on](../architecture-patterns/running-claude-code-always-on.md) — §4 documents the token *lifetime* failure mode (idle ceiling, no headless re-auth); this is the *emptied-in-place* one it did not cover, and §5's "a guard only protects you if it receives inputs that can actually fail it" is the same principle applied to a different input.
 - Origin: the 2026-09-02 outage on a live instance, diagnosed during the fresh-install smoke test of the private-versioned-hubs work.

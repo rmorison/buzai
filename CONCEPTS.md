@@ -24,6 +24,13 @@ The mechanism by which the Claude desktop/mobile apps attach to a running headle
 Claude Code instance. The instance runs a long-lived Remote Control server; the apps
 connect to it through a relay rather than directly.
 
+### Deployment directory
+The checkout a deployed instance runs from, `~/buzai-assistant` by default. The apps'
+environment picker labels each Remote Control server by this directory's name plus the
+host; `--name` names sessions, not the environment. It is kept distinct from the repo's
+name so a deployment and a dev checkout of the repo on one host never share a label.
+*Avoid:* workspace (ambiguous with a Claude Code project).
+
 ### Environment URL
 The relay address the apps reconnect to. A new one is minted on every (re)start of
 the server, so the previous URL is dead after a restart and there is no command that

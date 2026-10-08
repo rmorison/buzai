@@ -14,7 +14,7 @@
 #
 #   USER phase (run inside the service account, after `sudo -u buzai -i`):
 #       curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | bash
-#     Fetches the repo into ~/buzai (git clone, or tarball when git is absent)
+#     Fetches the repo into ~/buzai-assistant (git clone, or tarball when git is absent)
 #     and hands off to `make setup`, which drives the rest and pauses only at
 #     the inherently manual steps (auth login, connector OAuth, consent prime).
 #
@@ -25,7 +25,7 @@
 #   BUZAI_USER=<name>              service account for the root phase   (default: buzai)
 #   BUZAI_REPO=<url>               repo to fetch in the user phase      (default: https://github.com/rmorison/buzai)
 #   BUZAI_REF=<branch>             branch to fetch in the user phase    (default: main)
-#   BUZAI_WORKDIR=<dir>            workspace for the user phase         (default: $HOME/buzai)
+#   BUZAI_WORKDIR=<dir>            workspace for the user phase         (default: $HOME/buzai-assistant)
 #   BUZAI_COPY_SSH_KEYS=0          root phase: don't copy the admin's authorized_keys
 #   BUZAI_ALLOW_ADMIN_INSTALL=1    user phase: allow install into a sudo-capable account
 #
@@ -39,7 +39,12 @@ BUZAI_REPO="${BUZAI_REPO:-https://github.com/rmorison/buzai}"
 # the way an adopter would, and without this the user phase could only ever fetch the
 # default branch — so the one path nobody could rehearse was the published one-liner.
 BUZAI_REF="${BUZAI_REF:-main}"
-BUZAI_WORKDIR="${BUZAI_WORKDIR:-$HOME/buzai}"
+# Not `buzai`: the Remote Control picker labels an environment by its directory's basename,
+# so a deployment named after the repo looks the same as a dev checkout of it (#17).
+# Whether the caller chose the path is remembered, so an install that predates
+# ~/buzai-assistant is only second-guessed when nobody asked for a location.
+BUZAI_WORKDIR_GIVEN="${BUZAI_WORKDIR:+given}"   # empty falls back to the default, so is not a choice
+BUZAI_WORKDIR="${BUZAI_WORKDIR:-$HOME/buzai-assistant}"
 
 say()  { printf '%s\n' "$*"; }
 fail() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -238,7 +243,7 @@ EOF
     say "    curl -fsSL ${BUZAI_REPO}/raw/${BUZAI_REF}/install.sh | BUZAI_REF=${BUZAI_REF} bash"
   fi
   say ""
-  say "(or: git clone ${BUZAI_REPO}.git ~/buzai && cd ~/buzai && make setup)"
+  say "(or: git clone ${BUZAI_REPO}.git ~/buzai-assistant && cd ~/buzai-assistant && make setup)"
 }
 
 # ------------------------------------------------------------------ user phase
@@ -253,6 +258,20 @@ user_phase() {
   if [ -f Makefile ] && [ -d trust ] && [ -d scripts ]; then
     say "   running from a repo checkout — skipping fetch"
     exec make setup
+  fi
+
+  # An install from before #17 lives at ~/buzai, not ~/buzai-assistant. Cloning beside
+  # it would leave two checkouts and a unit still serving the old one, so stop and say
+  # how to move it. Only when the caller named no location and the new one does not
+  # exist yet; nothing moves.
+  local old="$HOME/buzai"   # where installs lived before ~/buzai-assistant
+  if [ -z "$BUZAI_WORKDIR_GIVEN" ] && [ ! -e "$BUZAI_WORKDIR" ] \
+    && [ -f "$old/Makefile" ] && [ -d "$old/trust" ]; then
+    fail "found an existing install at ~/buzai. New installs live at ~/buzai-assistant, so the
+Remote Control picker can tell the deployment from a dev checkout of the repo. Nothing was moved.
+
+  To move it:             docs/SETUP.md, \"Moving an existing install to ~/buzai-assistant\"
+  To keep it where it is: cd $old && make setup"
   fi
 
   # An existing EMPTY dir is fetchable (a failed earlier fetch must not deadlock re-runs);
@@ -293,7 +312,7 @@ user_phase() {
 #   test             -> run every time (cheap)
 #   trust-install    -> hooks present in .claude/settings.json
 #   prime-consent (PAUSE) -> marker .buzai/setup-consent-done (consent has no CLI flag or local artifact)
-#   service-install  -> unit file present
+#   service-install  -> unit file present AND serving this checkout (else refuse)
 #   service-start    -> systemctl --user is-active
 #   liveness         -> the success criterion: PID-scoped relay socket, never just "is-active"
 
@@ -322,6 +341,26 @@ sys.exit(0 if data.get("remoteDialogSeen") is True else 1)
 PYEOF
 }
 
+# The checkout the installed unit serves: its WorkingDirectory, with systemd's `%h`
+# expanded. Usually unexpanded on disk — `make service-install` leaves the template's
+# %h/buzai-assistant alone for a default checkout, and older units read %h/buzai — so
+# the raw value would never equal a real path.
+unit_workdir() {
+  local dir
+  dir="$(sed -n 's/^[[:space:]]*WorkingDirectory[[:space:]]*=[[:space:]]*//p' \
+    "$HOME/.config/systemd/user/claude-remote.service" 2>/dev/null | tail -n 1)"
+  case "$dir" in "%h"/*) dir="$HOME/${dir#%h/}" ;; esac
+  printf '%s\n' "$dir"
+}
+
+# Does the installed unit serve THIS checkout? Both sides physical (`pwd -P`), as make's
+# $(CURDIR) is, so a symlinked home cannot make one checkout look like two.
+unit_serves_this_checkout() {
+  local dir
+  dir="$(unit_workdir)"
+  [ -n "$dir" ] && [ "$(cd "$dir" 2>/dev/null && pwd -P)" = "$(pwd -P)" ]
+}
+
 confirm_or_pause() {
   local marker=".buzai/$1"; shift
   [ -f "$marker" ] && return 0
@@ -335,7 +374,7 @@ confirm_or_pause() {
 }
 
 setup_phase() {
-  [ -f Makefile ] && [ -d trust ] && [ -d scripts ] || fail "run from the repo root (e.g. cd ~/buzai)"
+  [ -f Makefile ] && [ -d trust ] && [ -d scripts ] || fail "run from the repo root (e.g. cd ~/buzai-assistant)"
   # Same footgun as the user phase, reachable directly via `git clone` + `make setup`
   # in a personal admin account — guard this entry point too.
   refuse_admin_account
@@ -421,7 +460,13 @@ Details: docs/SETUP.md §6."
 
   step "8/9 Always-on service"
   if [ -f "$HOME/.config/systemd/user/claude-remote.service" ]; then
-    say "   ok — unit installed"
+    # Present is not enough: after a move, or with two checkouts on the host, the unit
+    # can serve another one. Refuse rather than reinstall: repointing a working service
+    # at a checkout the owner did not mean to deploy is worse than asking.
+    unit_serves_this_checkout || fail "the installed unit serves $(unit_workdir), not this checkout ($(pwd -P)).
+If this checkout is the one to deploy:  make service-install && make service-restart
+Moved from ~/buzai? docs/SETUP.md, \"Moving an existing install to ~/buzai-assistant\""
+    say "   ok — unit installed for this checkout"
   else
     make service-install
   fi

@@ -35,10 +35,11 @@ check. A run interrupted after the repo exists but before the checkout was clean
 a state neither this module nor `secrets_preflight` could leave: the preflight fataled
 on personal content in the checkout — correctly, it IS a leak — and blocked service
 start, while this script saw a repo and returned "exists", so re-running never finished
-the job. With `StartLimitBurst=5` the unit ends `failed` and the assistant is gone until
-someone hand-fixes it. So an existing repo with content still in the checkout *resumes*:
-the same copy -> commit -> remove sequence, on the files that are left. Idempotence is
-unaffected — a complete instance has nothing left to migrate and changes nothing.
+the job. Every retried start fails the same way, and the assistant stays off the air
+until someone hand-fixes it. So an existing repo with content still in the checkout
+*resumes*: the same copy -> commit -> remove sequence, on the files that are left.
+Idempotence is unaffected — a complete instance has nothing left to migrate and changes
+nothing.
 
 Migration is the one-time move of real hub content out of the public checkout. What
 counts as a scaffold is the explicit `SCAFFOLDS` set and nothing else — pointedly
@@ -92,9 +93,9 @@ DEFAULT_BRANCH = "main"
 # Every call here is bounded. `commit_count`, `remotes` and `tracked_paths` are read by
 # `secrets_preflight` on the systemd `ExecStartPre` path, and the targets can be network
 # mounts; git has no timeout of its own, so an unbounded call turns a stalled filesystem
-# into a hung service start — and with `StartLimitBurst=5`, five of those leave the unit
-# `failed` until a human intervenes. Long enough that a large repo on a slow disk still
-# answers, short enough that five attempts are not five stalled minutes.
+# into a hung service start on every retry, keeping the assistant off the air for as long
+# as the stall lasts. Long enough that a large repo on a slow disk still answers, short
+# enough that a stalled mount fails the start rather than hanging it.
 GIT_TIMEOUT_SECONDS = 30.0
 # What `git()` reports when it had to kill git: the shell convention for "timed out".
 TIMEOUT_RETURNCODE = 124
@@ -340,10 +341,10 @@ def parse_marker(text: str) -> datetime:
     only consumers subtract it from an aware `now` — `secrets_preflight.stale_remote_warning`
     on the systemd `ExecStartPre` path — and mixing naive with aware raises `TypeError`,
     which is not what any caller catches. That exception would escape a *durability*
-    check and fail `ExecStartPre`; with `StartLimitBurst=5` the unit ends `failed`, so a
-    marker typo would end the assistant. Rejected here, it is one more `ValueError` the
-    readers already handle as "marker unreadable" -> a warning. This is the rule
-    `hub_remote.read_cache` already applies to its own stored timestamp.
+    check and fail `ExecStartPre` on every retry, so a marker typo would keep the
+    assistant off the air until someone fixed it. Rejected here, it is one more
+    `ValueError` the readers already handle as "marker unreadable" -> a warning. This is
+    the rule `hub_remote.read_cache` already applies to its own stored timestamp.
     """
     for line in text.splitlines():
         line = line.strip()

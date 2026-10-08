@@ -954,9 +954,8 @@ class TestBacklogTimestampsMustCarryAnOffset(HubRepoCase):
     consumer is `Backlog.oldest_age_seconds`, which subtracts it from an aware `now`, and
     `secrets_preflight.backlog_warning` calls that on the systemd `ExecStartPre` line.
     Naive-minus-aware raises `TypeError`, which is not among the exceptions the durability
-    path catches: it escaped `ExecStartPre` and blocked service start, and with
-    `StartLimitBurst=5` that leaves the unit permanently `failed` — a leak-free durability
-    condition taking the whole assistant down.
+    path catches: it escaped `ExecStartPre` and blocked service start on every retry —
+    a leak-free durability condition taking the whole assistant down.
 
     Dropping the entry rather than fataling matches every other malformed state this
     reader handles, and matches `hub_remote.read_cache`'s rule for its own timestamp.

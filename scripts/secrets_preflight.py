@@ -7,10 +7,10 @@ guarantees (R3, R15/R16/R17) become enforceable rather than conventional.
 
 The fatal / warning split — the whole point of this module
 ----------------------------------------------------------
-`ExecStartPre` failure blocks service start, and the unit sets `StartLimitBurst=5`:
-five failed starts in five minutes leave the unit `failed` until a human logs in. So a
-check that fails here does not degrade the assistant, it *ends* it. Which conditions
-earn that is therefore a deliberate decision, not a matter of severity feel:
+`ExecStartPre` failure blocks service start, and the unit retries a failed start every
+minute for as long as the check keeps failing. So a check that fails here does not
+degrade the assistant, it keeps it off the air until the condition is fixed. Which
+conditions earn that is therefore a deliberate decision, not a matter of severity feel:
 
 **FATAL** — leak conditions. Personal state is somewhere it can reach the public repo,
 or the instance has a way to push to it. Refusing to run is strictly better than
@@ -57,9 +57,9 @@ Every git call is bounded, and times out in the direction its check demands
 ---------------------------------------------------------------------------
 `ExecStartPre` runs this on every start, and git has no timeout of its own — while the
 paths involved (`~/.ssh`, the hub store) can be network mounts. An unbounded call is
-therefore a hung start, and `StartLimitBurst=5` turns repeated hung starts into a unit
-that stays `failed`. So every call carries an explicit timeout and every timeout
-degrades the way the split above dictates:
+therefore a hung start, and a start that hangs on every retry keeps the assistant off
+the air for as long as the stall lasts. So every call carries an explicit timeout and
+every timeout degrades the way the split above dictates:
 
   * **leak checks fail closed.** `_git_tracked` returns a reason string instead of
     `False`, and `tracked_paths` raises; both become fatal "unverified rather than
@@ -460,10 +460,10 @@ def credential_warning(text: str | None, creds: Path) -> str | None:
     at `claude remote-control` with "You must be logged in". Nothing said so.
 
     A WARNING, never fatal. A logged-out instance is already going to fail at ExecStart;
-    failing here too would only add a second way to die, and with StartLimitBurst=5 the
-    fatal path is the one that stops systemd retrying at all. The value of this check is
-    that `make doctor` and the journal can name the cause instead of leaving an operator
-    to infer it from a restart loop.
+    failing here too would only add a second way to die, and if this check ever misread a
+    working file, a fatal would keep a healthy assistant off the air until someone fixed
+    it. The value of this check is that `make doctor` and the journal can name the cause
+    instead of leaving an operator to infer it from a restart loop.
 
     Never reports a token's value or length — only that one is missing.
     """
@@ -666,11 +666,12 @@ def durability_report(
     it anticipates — a git that hangs, a marker that will not parse — and every one of
     those has a test. This is the backstop for the failure nobody anticipated: an
     exception type the readers do not catch, raised somewhere on the durability path.
-    `ExecStartPre` failure blocks service start and `StartLimitBurst=5` makes five of
-    those permanent, so the class of bug that reaches here — a `TypeError` from a stored
-    timestamp, an unexpected `AttributeError` in a future reader — would convert
-    "knowledge is not backed up" into "the assistant is gone". That is the exact trade
-    the fatal/warning split exists to refuse, and it must not be reachable by accident.
+    `ExecStartPre` failure blocks service start, and a bug fails every retry the same
+    way, so the class of bug that reaches here — a `TypeError` from a stored timestamp,
+    an unexpected `AttributeError` in a future reader — would convert "knowledge is not
+    backed up" into "the assistant is down until someone fixes the bug". That is the
+    exact trade the fatal/warning split exists to refuse, and it must not be reachable
+    by accident.
 
     The fatal path gets **no** such treatment, and must not: `fatal_problems`,
     `hub_checkout_problems` and `origin_credential_violations` stay outside it, so a leak
@@ -753,8 +754,9 @@ def report(target: HubTarget, findings: Findings) -> int:
     print(f"secrets-preflight: hubs resolve to {target.description}")
     for note in findings.notes:
         print(f"secrets-preflight: {note}", file=sys.stderr)
-    # Warnings are durability conditions and exit 0 by design. With StartLimitBurst=5,
-    # failing here would turn "knowledge is not backed up" into "the assistant is gone".
+    # Warnings are durability conditions and exit 0 by design. A fatal fails every retry
+    # until the condition clears, so failing here would turn "knowledge is not backed up"
+    # into "the assistant is down until someone fixes it".
     for warning in findings.warnings:
         print(f"secrets-preflight WARN: {warning}", file=sys.stderr)
     if findings.blocks_start:

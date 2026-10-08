@@ -33,6 +33,9 @@ make test        # full suite must pass
 - **Fail-closed by default.** Anything touching the trust gate keeps the conservative
   default (unknown → ask); see `docs/SECURITY-MODEL.md` for the model you're preserving.
 - New behavior needs tests (`trust/tests/`, `scripts/tests/` — plain `unittest`).
+- **Never name a dev checkout `buzai-assistant`.** That is the deployment's directory,
+  and the Remote Control picker tells environments apart by directory name; see
+  `CONCEPTS.md`, "Deployment directory".
 
 ## Branches and merging
 

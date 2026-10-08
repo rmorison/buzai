@@ -37,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/rmorison/buzai/main/install.sh | ba
 (No key was copied — password-auth ssh, or you opted out? From your admin
 account on the server: `sudo -u buzai -i`, then the same `curl | bash`.)
 
-That fetches the repo to `~/buzai` and runs **`make setup`**, which probes each
+That fetches the repo to `~/buzai-assistant` and runs **`make setup`**, which probes each
 step, skips what's done, and **pauses only at the three manual steps** — do each,
 then re-run `make setup` (it resumes where you left off):
 
@@ -63,7 +63,7 @@ automatically. ([SETUP.md §7](SETUP.md))
 ## 4. Verify it's really working
 
 ```bash
-# in the buzai account (ssh buzai@<host>), from ~/buzai
+# in the buzai account (ssh buzai@<host>), from ~/buzai-assistant
 make smoke      # preflight for the 8-point check
 ```
 
@@ -74,7 +74,7 @@ trip it on purpose: [SECURITY-MODEL.md](SECURITY-MODEL.md) + [TRY-IT.md](TRY-IT.
 
 ## Coming back later
 
-Every future admin session is just `ssh buzai@<host>` and `cd ~/buzai` — `make
+Every future admin session is just `ssh buzai@<host>` and `cd ~/buzai-assistant` — `make
 help` is the verb index (`make service-status`, `make audit`, `make liveness`, …). Your
 sudo account is only ever needed again for OS-level work on the host itself.
 

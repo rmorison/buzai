@@ -1,8 +1,10 @@
 # buzai assistant — Claude Code Remote Control (--user systemd unit TEMPLATE)
 #
-# Copy to ~/.config/systemd/user/claude-remote.service, edit the paths/name,
-# then:  systemctl --user daemon-reload && systemctl --user enable --now claude-remote
-#        loginctl enable-linger "$USER"     # so it runs without an active login
+# Install with `make service-install`, run from the checkout this unit should serve: it
+# rewrites every checkout path below to point at that checkout. By hand: copy to
+# ~/.config/systemd/user/claude-remote.service and edit the paths/name. Then:
+#   systemctl --user daemon-reload && systemctl --user enable --now claude-remote
+#   loginctl enable-linger "$USER"     # so it runs without an active login
 # See deploy/README.md for the full install + secrets steps.
 
 [Unit]
@@ -32,8 +34,11 @@ KillSignal=SIGINT
 TimeoutStopSec=20s
 SuccessExitStatus=SIGINT
 
-# Where you cloned the template (the assistant's workspace).
-WorkingDirectory=%h/buzai
+# The assistant's workspace: the checkout this unit was installed from. ~/buzai-assistant
+# by default, a name that differs from the repo's on purpose: the Remote Control picker
+# labels an environment by this directory's basename, so a deployment named `buzai` is
+# indistinguishable from a dev checkout of the repo on the same host.
+WorkingDirectory=%h/buzai-assistant
 
 # Secrets live OUTSIDE the repo, mode 0600, beyond any file-write tool's reach.
 # These are for LOCAL MCP connectors only. A managed-connector-only setup (all
@@ -65,7 +70,7 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # failing on those would turn "knowledge is not backed up" into "the assistant is gone".
 # Runs under the pinned, self-contained .venv Python (SETUP step 5), NOT the host's
 # system python.
-ExecStartPre=%h/buzai/.venv/bin/python %h/buzai/scripts/secrets_preflight.py
+ExecStartPre=%h/buzai-assistant/.venv/bin/python %h/buzai-assistant/scripts/secrets_preflight.py
 
 # Re-verify that the hub remote is still PRIVATE, and do it BEFORE anything pushes.
 # The verdict is cached for an hour inside the hub repo, and a repository can be flipped
@@ -81,15 +86,19 @@ ExecStartPre=%h/buzai/.venv/bin/python %h/buzai/scripts/secrets_preflight.py
 # journal keeps `FAIL:` and `WARN` for conditions that are actually wrong instead of
 # printing one at every start before `make hub-init`. Run by hand, a missing store fails.
 # Bounded: every probe carries PROBE_TIMEOUT_SECONDS (20s) and the ssh-alias resolution 10s.
-ExecStartPre=-%h/buzai/.venv/bin/python %h/buzai/scripts/hub_remote.py --if-initialized
+ExecStartPre=-%h/buzai-assistant/.venv/bin/python %h/buzai-assistant/scripts/hub_remote.py --if-initialized
 
 # The start job now spans the preflight, a privacy re-verification and two pushes, and
 # every one of them is network-facing. systemd's 90s default would kill a start whose
 # probes are merely slow — and killing it stops the ExecStart server that is already
 # running and serving, which is precisely backwards. Each command is internally bounded,
-# so this only has to exceed their sum on a bad-but-real day (an unreachable remote is
-# roughly two minutes of timeouts); a generous value costs nothing because the assistant
-# is live throughout, while a tight one takes a working assistant down.
+# so this only has to exceed their sum on a bad-but-real day. By the code's own timeouts
+# (not measured): one privacy check is at most 50s (10s alias resolution, 20s anonymous
+# probe, 20s authenticated probe). An unreachable remote with a push backlog pays for two,
+# about 100s, because the check above evicts the cached verdict and `--retry-push` probes
+# again. A reachable but slow remote can instead spend two 60s pushes. A generous value
+# costs nothing because the assistant is live throughout, while a tight one takes a
+# working assistant down.
 TimeoutStartSec=600s
 
 # Long-lived remote-control SERVER (sessions attach on demand). Do NOT use
@@ -125,7 +134,7 @@ ExecStart=%h/.local/bin/claude remote-control --name buzai-assistant --spawn=sam
 # for the same reason as the privacy refresh: before `make hub-init` there is nothing to
 # drain, which is a note here. `make hub-push` omits it on purpose, so an owner who runs
 # it on a box with no store gets a failure rather than a success that drained nothing.
-ExecStartPost=-/bin/sh -c '%h/buzai/.venv/bin/python %h/buzai/scripts/hub_commit.py --retry-push --if-initialized && %h/buzai/.venv/bin/python %h/buzai/scripts/hub_review.py --push-notes --if-initialized'
+ExecStartPost=-/bin/sh -c '%h/buzai-assistant/.venv/bin/python %h/buzai-assistant/scripts/hub_commit.py --retry-push --if-initialized && %h/buzai-assistant/.venv/bin/python %h/buzai-assistant/scripts/hub_review.py --push-notes --if-initialized'
 
 # A minute between tries, because the unit never gives up (StartLimitIntervalSec=0
 # above): at 10s a login outage is ~360 failed starts an hour, and the journal becomes
