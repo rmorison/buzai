@@ -15,6 +15,8 @@ handoff — and the docs are checked for drift alongside.
 """
 
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -163,6 +165,162 @@ class TestTheDocsDescribeTheSameStep(unittest.TestCase):
         listed = re.findall(r"^(\d+)\. \*\*", self.doc, re.MULTILINE)
         self.assertEqual(listed, sorted(listed, key=int))
         self.assertEqual(len(listed), len(set(listed)), f"duplicate step numbers: {listed}")
+
+
+# The section an owner with an old ~/buzai install is sent to.
+MIGRATION = "Moving an existing install to ~/buzai-assistant"
+
+
+class TestTheUserPhaseInstallsIntoBuzaiAssistant(unittest.TestCase):
+    """Issue #17. The Remote Control picker labels an environment by its working
+    directory's basename, so a deployment at ~/buzai looks the same as a dev checkout of
+    the repo. New installs go to ~/buzai-assistant. A host that already has ~/buzai is
+    stopped and pointed at the migration section; a second clone beside it would leave
+    two checkouts and a unit serving the old one.
+
+    These run the real user phase in a scratch HOME, from a scratch directory that is not
+    a checkout. `git` and `make` are stubs that record their calls, and the admin-account
+    guard is waived through its own documented opt-out, so it stays intact."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        tmp = Path(self._tmp.name)
+        self.home, self.cwd, stubs = tmp / "home", tmp / "cwd", tmp / "stubs"
+        for d in (self.home, self.cwd, stubs):
+            d.mkdir()
+        self.git_log, self.make_log = tmp / "git.log", tmp / "make.log"
+        # the stub clone creates its target (the last argument), as a real one would
+        self._stub(
+            stubs / "git", f'echo "$@" >> "{self.git_log}"; for a; do t="$a"; done; mkdir -p "$t"'
+        )
+        self._stub(stubs / "make", f'echo "$(pwd) $*" >> "{self.make_log}"')
+        self.path = f"{stubs}:/usr/bin:/bin"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _stub(path: Path, body: str):
+        path.write_text(f"#!/bin/sh\n{body}\n")
+        path.chmod(0o755)
+
+    def checkout(self, name: str) -> Path:
+        root = self.home / name
+        (root / "trust").mkdir(parents=True)
+        (root / "Makefile").write_text("")
+        return root
+
+    def user_phase(self, **extra: str) -> subprocess.CompletedProcess:
+        env = {"HOME": str(self.home), "PATH": self.path, "BUZAI_ALLOW_ADMIN_INSTALL": "1", **extra}
+        return subprocess.run(
+            ["bash", str(INSTALL_SH)],
+            cwd=self.cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def logged(self, log: Path) -> str:
+        return log.read_text() if log.exists() else ""
+
+    def test_a_fresh_account_clones_into_buzai_assistant(self):
+        run = self.user_phase()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn(f"{self.home}/buzai-assistant", self.logged(self.git_log))
+        self.assertTrue(self.logged(self.make_log).startswith(f"{self.home}/buzai-assistant setup"))
+
+    def test_an_old_buzai_install_is_stopped_and_pointed_at_the_migration(self):
+        self.checkout("buzai")
+        run = self.user_phase()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn(MIGRATION, run.stderr)
+        self.assertIn("Nothing was moved", run.stderr)
+        self.assertEqual(self.logged(self.git_log), "", "it must not clone beside the old install")
+        self.assertEqual(self.logged(self.make_log), "")
+
+    def test_an_owner_who_names_the_old_path_keeps_it(self):
+        old = self.checkout("buzai")
+        run = self.user_phase(BUZAI_WORKDIR=str(old))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.logged(self.git_log), "")
+        self.assertTrue(self.logged(self.make_log).startswith(f"{old} setup"))
+
+    def test_an_already_migrated_host_continues_in_buzai_assistant(self):
+        self.checkout("buzai")
+        new = self.checkout("buzai-assistant")
+        run = self.user_phase()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(self.logged(self.make_log).startswith(f"{new} setup"))
+
+    def test_the_documented_default_matches(self):
+        documented = "(default: $HOME/buzai-assistant)" in INSTALL_SH.read_text()
+        self.assertTrue(documented, "the BUZAI_WORKDIR usage line names another default")
+
+
+def shell_function(name: str) -> str:
+    """One function's definition, cut from the install.sh text. Sourcing the script
+    would run its entry `case`, so the function is lifted out and run on its own."""
+    match = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", INSTALL_SH.read_text(), re.M | re.S)
+    if match is None:
+        raise AssertionError(f"install.sh defines no {name}()")
+    return match.group(0)
+
+
+class TestSetupNoticesAUnitServingAnotherCheckout(unittest.TestCase):
+    """Issue #17. Setup's service step passed whenever a unit file existed. After a move,
+    or on a host with two checkouts, that unit can serve a different checkout from the
+    one being set up, and setup would report it done. Steps 1-7 need real credentials,
+    so the comparison lives in a helper that is run here on its own.
+
+    The unit on disk usually carries the unsubstituted `%h/...` value: `make
+    service-install` leaves the template's path alone when the checkout is the default,
+    and every legacy unit reads `%h/buzai`. A raw string compare would refuse them all."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name) / "home"
+        self.unit = self.home / ".config" / "systemd" / "user" / "claude-remote.service"
+        self.unit.parent.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def serves(self, working_directory: str, checkout: str) -> bool:
+        self.unit.write_text(f"[Service]\nWorkingDirectory={working_directory}\n")
+        here = self.home / checkout
+        here.mkdir(exist_ok=True)
+        script = shell_function("unit_workdir") + shell_function("unit_serves_this_checkout")
+        run = subprocess.run(
+            ["bash", "-c", f"{script}\nunit_serves_this_checkout"],
+            cwd=here,
+            env={"HOME": str(self.home), "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return run.returncode == 0
+
+    def test_the_default_unsubstituted_unit_serves_buzai_assistant(self):
+        self.assertTrue(self.serves("%h/buzai-assistant", "buzai-assistant"))
+
+    def test_a_legacy_unit_still_serves_its_buzai_checkout(self):
+        # R4: an install that has not migrated keeps passing setup
+        self.assertTrue(self.serves("%h/buzai", "buzai"))
+
+    def test_an_absolute_path_to_this_checkout_serves_it(self):
+        self.assertTrue(self.serves(str(self.home / "elsewhere"), "elsewhere"))
+
+    def test_a_unit_serving_another_checkout_does_not(self):
+        (self.home / "buzai").mkdir()
+        self.assertFalse(self.serves("%h/buzai", "buzai-assistant"))
+
+    def test_setup_refuses_with_the_fix_named(self):
+        text = INSTALL_SH.read_text()
+        step = text[text.index('step "8/9') : text.index('step "9/9')]
+        self.assertIn("unit_serves_this_checkout", step)
+        self.assertIn("make service-install", step)
+        self.assertIn(MIGRATION, step)
 
 
 if __name__ == "__main__":
