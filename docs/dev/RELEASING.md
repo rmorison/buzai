@@ -13,20 +13,26 @@ There is one public repo; releasing is ordinary git plus the gates.
 
 ## Cutting a release / notable milestone
 
+Pick the release commit first, the head of `origin/main`, and note its SHA. Steps 1–3
+run against that commit, and step 4 tags it by SHA, so a merge that lands meanwhile
+can't slip into the release untested.
+
 1. Re-run the full gate with the private pattern file present:
    `.venv/bin/python scripts/publish_gate.py`
 2. `make test && make trust-check` from a fresh clone.
 3. Walk `docs/QUICKSTART.md` verbatim on a clean box (or reset account) when the
    installer or setup flow changed — the clean-box walkthrough is the release test.
-4. Tag the merged commit on an up-to-date `main`, and push the one release tag by
-   name:
-   `git switch main && git pull --ff-only && git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z`.
+4. Tag the release commit by SHA, and push the one release tag by name:
+   `git tag -a vX.Y.Z <sha> -m "…" && git push origin vX.Y.Z`.
    Versions are [semver](https://semver.org) `vX.Y.Z`, never `vX.Y`. Don't use
-   `git push --tags`: pre-commit's pre-push stage hands its hooks only the first ref
-   of a push, so a pre-push check would miss the rest, and `--tags` can also publish
-   stray local tags.
-5. Publish the release notes (outline below) as the GitHub release for the tag:
-   `gh release create vX.Y.Z --notes-file <notes>.md`.
+   `git push --tags`: it can publish stray local tags, and pre-commit's pre-push
+   stage hands its hooks only the first ref of a push. buzai installs no pre-push
+   hook today; naming the one tag keeps any that is added scanning the whole push.
+5. Publish the release notes (outline below) as the GitHub release for the tag,
+   writing the notes file outside the checkout:
+   `gh release create vX.Y.Z --verify-tag --notes-file <path>`.
+   `--verify-tag` fails if the tag didn't reach GitHub, rather than creating one
+   on whatever `main` is there.
 
 ## Release notes
 
