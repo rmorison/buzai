@@ -14,8 +14,9 @@ There is one public repo; releasing is ordinary git plus the gates.
 ## Cutting a release / notable milestone
 
 Pick the release commit first, the head of `origin/main`, and note its SHA. Steps 1–3
-run against that commit, and step 4 tags it by SHA, so a merge that lands meanwhile
-can't slip into the release untested.
+run against that commit: `git checkout <sha>` in every checkout they use, the fresh
+clone and the clean box included. Step 4 tags it by SHA, so a merge that lands
+meanwhile can't slip into the release untested.
 
 1. Re-run the full gate with the private pattern file present:
    `.venv/bin/python scripts/publish_gate.py`
