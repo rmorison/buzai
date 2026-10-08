@@ -43,7 +43,7 @@ BUZAI_REF="${BUZAI_REF:-main}"
 # so a deployment named after the repo looks the same as a dev checkout of it (#17).
 # Whether the caller chose the path is remembered, so an install that predates
 # ~/buzai-assistant is only second-guessed when nobody asked for a location.
-BUZAI_WORKDIR_GIVEN="${BUZAI_WORKDIR+given}"
+BUZAI_WORKDIR_GIVEN="${BUZAI_WORKDIR:+given}"   # empty falls back to the default, so is not a choice
 BUZAI_WORKDIR="${BUZAI_WORKDIR:-$HOME/buzai-assistant}"
 
 say()  { printf '%s\n' "$*"; }
@@ -271,7 +271,7 @@ user_phase() {
 Remote Control picker can tell the deployment from a dev checkout of the repo. Nothing was moved.
 
   To move it:             docs/SETUP.md, \"Moving an existing install to ~/buzai-assistant\"
-  To keep it where it is: re-run with BUZAI_WORKDIR=$old"
+  To keep it where it is: cd $old && make setup"
   fi
 
   # An existing EMPTY dir is fetchable (a failed earlier fetch must not deadlock re-runs);

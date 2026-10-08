@@ -29,7 +29,7 @@ MIGRATION = "Moving an existing install to ~/buzai-assistant"
 # The old workspace, however a doc spells its root: `~`, `$HOME`, systemd's `%h`, or
 # the service account's home. Not `~/buzai-assistant`, not `~/.config/buzai`, not
 # `~/.ssh/buzai-hub`, and not the account name in `ssh buzai@host` or `/home/buzai/.ssh`.
-OLD_WORKSPACE = re.compile(r"(?:~|\$HOME|\$\{HOME\}|%h|/home/buzai)/buzai(?![\w-])")
+OLD_WORKSPACE = re.compile(r"(?:~|\$HOME|\$\{HOME\}|\$\(HOME\)|%h|/home/buzai)/buzai(?![\w-])")
 
 
 def living_docs() -> list[Path]:
@@ -104,6 +104,7 @@ class TestTheGuardMatchesWhatItMeans(unittest.TestCase):
     def test_it_catches_the_old_workspace_however_spelled(self):
         for line in (
             "cd ~/buzai",
+            "WORKDIR ?= $(HOME)/buzai",  # the Makefile's spelling
             "git clone https://example.invalid/buzai.git ~/buzai && cd ~/buzai",
             "tail -n 5 ~/buzai/audit/audit.jsonl",
             "git -C $HOME/buzai pull",

@@ -14,6 +14,7 @@ properties a reader can verify statically — the guard, the symlink refusal, th
 handoff — and the docs are checked for drift alongside.
 """
 
+import os
 import re
 import subprocess
 import tempfile
@@ -180,9 +181,12 @@ class TestTheUserPhaseInstallsIntoBuzaiAssistant(unittest.TestCase):
 
     These run the real user phase in a scratch HOME, from a scratch directory that is not
     a checkout. `git` and `make` are stubs that record their calls, and the admin-account
-    guard is waived through its own documented opt-out, so it stays intact."""
+    guard is waived through its own documented opt-out, so it stays intact. Under root
+    the script would take its root phase instead, which must never run from a test."""
 
     def setUp(self):
+        if os.geteuid() == 0:
+            self.skipTest("install.sh runs its root phase as root; never from a test")
         self._tmp = tempfile.TemporaryDirectory()
         tmp = Path(self._tmp.name)
         self.home, self.cwd, stubs = tmp / "home", tmp / "cwd", tmp / "stubs"
@@ -238,6 +242,22 @@ class TestTheUserPhaseInstallsIntoBuzaiAssistant(unittest.TestCase):
         self.assertIn("Nothing was moved", run.stderr)
         self.assertEqual(self.logged(self.git_log), "", "it must not clone beside the old install")
         self.assertEqual(self.logged(self.make_log), "")
+
+    def test_the_keep_it_remedy_is_a_command_that_works(self):
+        # `BUZAI_WORKDIR=… curl … | bash` sets the variable for curl, not bash, so a hint
+        # phrased as an env var loops the owner straight back into this stop
+        old = self.checkout("buzai")
+        run = self.user_phase()
+        self.assertIn(f"cd {old} && make setup", run.stderr)
+        self.assertNotIn("re-run with BUZAI_WORKDIR", run.stderr)
+
+    def test_an_empty_workdir_is_not_a_chosen_location(self):
+        # an empty value falls back to the default path, so it must not skip the stop
+        self.checkout("buzai")
+        run = self.user_phase(BUZAI_WORKDIR="")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn(MIGRATION, run.stderr)
+        self.assertEqual(self.logged(self.git_log), "")
 
     def test_an_owner_who_names_the_old_path_keeps_it(self):
         old = self.checkout("buzai")
