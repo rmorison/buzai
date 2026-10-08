@@ -59,10 +59,13 @@ def directives(name: str, section: str | None = None, unit: str | None = None) -
     systemd ignores a directive in the wrong section (with a warning), so a key that is
     present but misplaced does nothing; pass `section` wherever placement matters.
     systemd also accepts `Key = value`, so the key is matched with spaces stripped.
-    Line continuations (a trailing backslash) are not joined: the template has none."""
+    Line continuations (a trailing backslash) are not joined: the template has none, and
+    `test_the_template_has_no_line_continuations` holds it to that."""
     values, current = [], None
     for raw in (TEMPLATE.read_text() if unit is None else unit).splitlines():
         line = raw.strip()
+        if line.startswith(("#", ";")):
+            continue
         if line.startswith("[") and line.endswith("]"):
             current = line[1:-1]
             continue
@@ -111,7 +114,7 @@ class TestTheDirectiveReaderReadsKeysAsSystemdDoes(unittest.TestCase):
     `test_there_is_no_burst_to_trip`. The real template has no spaced keys, so these feed
     the reader invented units."""
 
-    UNIT = "[Unit]\nStartLimitBurst = 5\n[Service]\nRestartSec=60s\n"
+    UNIT = "[Unit]\n# StartLimitBurst=9\nStartLimitBurst = 5\n[Service]\nRestartSec=60s\n"
 
     def test_a_spaced_key_is_read(self):
         self.assertEqual(directives("StartLimitBurst", unit=self.UNIT), ["5"])
@@ -127,6 +130,13 @@ class TestTheDirectiveReaderReadsKeysAsSystemdDoes(unittest.TestCase):
             self.assertEqual(
                 directives("StartLimitBurst", unit=f"[Unit]\n{comment}\n"), [], comment
             )
+
+    def test_the_template_has_no_line_continuations(self):
+        # the reader takes one physical line per directive; a wrapped one would be read
+        # truncated, so the template must not wrap
+        for number, line in enumerate(TEMPLATE.read_text().splitlines(), 1):
+            if not line.lstrip().startswith(("#", ";")):
+                self.assertFalse(line.rstrip().endswith("\\"), f"line {number}: {line}")
 
 
 class TestTheServiceStartGuaranteesAreWired(unittest.TestCase):
