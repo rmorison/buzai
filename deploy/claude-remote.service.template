@@ -132,8 +132,8 @@ ExecStartPost=-/bin/sh -c '%h/buzai/.venv/bin/python %h/buzai/scripts/hub_commit
 # unreadable exactly when someone needs to read it. The wait counts from the end of a
 # failed attempt, so a cycle is 60s plus the start checks (bounded by TimeoutStartSec
 # above). A one-off crash also waits the full minute; a short-first backoff needs
-# systemd 254. The costs, in full: docs/solutions/architecture-patterns/
-# never-give-up-but-retry-slowly-2026-10-07.md
+# systemd 254. The costs, in full:
+#   docs/solutions/architecture-patterns/never-give-up-but-retry-slowly-2026-10-07.md
 Restart=always
 RestartSec=60s
 StandardOutput=journal

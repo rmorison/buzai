@@ -93,9 +93,10 @@ The costs we accept:
   seconds. The journal records each push's outcome, so read that rather than assuming a
   backlog is draining or stuck.
 - **A cycle is longer than 60s.** `RestartSec` counts from the end of a failed attempt,
-  so each cycle is 60s plus the start checks. Those take seconds on a good day. Against
-  a slow or unreachable hub remote, the per-step timeouts add up to several minutes, and
-  the only hard ceiling is `TimeoutStartSec` (600s). "60 an hour" is a ceiling.
+  so each cycle is 60s plus the start checks. Those take seconds on a good day. The
+  unit's own estimate for an unreachable hub remote is about two minutes of timeouts.
+  Every step is time-bounded, but nobody has measured the worst case, and the hard
+  ceiling is `TimeoutStartSec` (600s). "60 an hour" is a ceiling.
   Recovery after a renewal is a minute plus however long those checks take.
 - **A one-off crash also waits 60s.** A healthy server that exits once is back after a
   minute, not 10s. A backoff that starts short and grows (`RestartSteps`,

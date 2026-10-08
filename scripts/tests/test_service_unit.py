@@ -18,10 +18,8 @@ Verified against the unfixed template: every test in
 `ExecStartPre=` line and no `ExecStartPost=` line at all.
 """
 
-import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from scripts.hub_commit import build_parser as commit_parser
 from scripts.hub_remote import build_parser as remote_parser
@@ -54,15 +52,16 @@ def make_recipe(target: str) -> list[str]:
     return recipe
 
 
-def directives(name: str, section: str | None = None) -> list[str]:
+def directives(name: str, section: str | None = None, unit: str | None = None) -> list[str]:
     """Every value of `name=` in the unit, in file order, comments excluded — or only
-    those inside `[section]`, when given.
+    those inside `[section]`, when given. `unit` is the unit's text; default, the template.
 
     systemd ignores a directive in the wrong section (with a warning), so a key that is
     present but misplaced does nothing; pass `section` wherever placement matters.
-    systemd also accepts `Key = value`, so the key is matched with spaces stripped."""
+    systemd also accepts `Key = value`, so the key is matched with spaces stripped.
+    Line continuations (a trailing backslash) are not joined: the template has none."""
     values, current = [], None
-    for raw in TEMPLATE.read_text().splitlines():
+    for raw in (TEMPLATE.read_text() if unit is None else unit).splitlines():
         line = raw.strip()
         if line.startswith("[") and line.endswith("]"):
             current = line[1:-1]
@@ -105,32 +104,29 @@ class TestTheUnitNeverGivesUpButRetriesSlowly(unittest.TestCase):
         self.assertEqual(directives("RestartSec", "Service"), ["60s"])
 
 
-class TestTheDirectiveReaderSeesWhatSystemdSees(unittest.TestCase):
-    """The guards above are only as good as `directives()`. systemd accepts `Key = value`
-    and ignores keys in the wrong section; a reader that matched `Key=` by prefix let a
-    spaced `StartLimitBurst = 5` straight past `test_there_is_no_burst_to_trip`. The real
-    template has no spaced keys, so this feeds the reader an invented one."""
+class TestTheDirectiveReaderReadsKeysAsSystemdDoes(unittest.TestCase):
+    """The guards above are only as good as `directives()`, on spacing, sections and
+    comments. systemd accepts `Key = value` and ignores keys in the wrong section; a
+    reader that matched `Key=` by prefix let a spaced `StartLimitBurst = 5` straight past
+    `test_there_is_no_burst_to_trip`. The real template has no spaced keys, so these feed
+    the reader invented units."""
 
-    UNIT = (
-        "[Unit]\n"
-        "# StartLimitBurst=9 in a comment is not a directive\n"
-        "StartLimitBurst = 5\n"
-        "[Service]\n"
-        "RestartSec=60s\n"
-    )
-
-    def setUp(self):
-        scratch = Path(self.enterContext(tempfile.TemporaryDirectory())) / "unit.service"
-        scratch.write_text(self.UNIT)
-        self.enterContext(mock.patch(f"{__name__}.TEMPLATE", scratch))
+    UNIT = "[Unit]\nStartLimitBurst = 5\n[Service]\nRestartSec=60s\n"
 
     def test_a_spaced_key_is_read(self):
-        self.assertEqual(directives("StartLimitBurst"), ["5"])
+        self.assertEqual(directives("StartLimitBurst", unit=self.UNIT), ["5"])
 
     def test_a_key_is_read_only_in_its_section(self):
-        self.assertEqual(directives("StartLimitBurst", "Unit"), ["5"])
-        self.assertEqual(directives("StartLimitBurst", "Service"), [])
-        self.assertEqual(directives("RestartSec", "Service"), ["60s"])
+        self.assertEqual(directives("StartLimitBurst", "Unit", self.UNIT), ["5"])
+        self.assertEqual(directives("StartLimitBurst", "Service", self.UNIT), [])
+        self.assertEqual(directives("RestartSec", "Service", self.UNIT), ["60s"])
+
+    def test_a_commented_key_is_not_read(self):
+        # systemd takes both '#' and ';' as comment markers, spaced or not
+        for comment in ("#StartLimitBurst=5", "# StartLimitBurst = 5", ";StartLimitBurst = 5"):
+            self.assertEqual(
+                directives("StartLimitBurst", unit=f"[Unit]\n{comment}\n"), [], comment
+            )
 
 
 class TestTheServiceStartGuaranteesAreWired(unittest.TestCase):
