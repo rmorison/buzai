@@ -52,13 +52,91 @@ def make_recipe(target: str) -> list[str]:
     return recipe
 
 
-def directives(name: str) -> list[str]:
-    """Every value of `name=` in the unit, in file order, comments excluded."""
-    return [
-        line.split("=", 1)[1].strip()
-        for line in TEMPLATE.read_text().splitlines()
-        if line.strip().startswith(f"{name}=")
-    ]
+def directives(name: str, section: str | None = None, unit: str | None = None) -> list[str]:
+    """Every value of `name=` in the unit, in file order, comments excluded — or only
+    those inside `[section]`, when given. `unit` is the unit's text; default, the template.
+
+    systemd ignores a directive in the wrong section (with a warning), so a key that is
+    present but misplaced does nothing; pass `section` wherever placement matters.
+    systemd also accepts `Key = value`, so the key is matched with spaces stripped.
+    Line continuations (a trailing backslash) are not joined: the template has none, and
+    `test_the_template_has_no_line_continuations` holds it to that."""
+    values, current = [], None
+    for raw in (TEMPLATE.read_text() if unit is None else unit).splitlines():
+        line = raw.strip()
+        if line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            continue
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == name and section in (None, current):
+            values.append(value.strip())
+    return values
+
+
+class TestTheUnitNeverGivesUpButRetriesSlowly(unittest.TestCase):
+    """`StartLimitBurst=5` in a 300s window turned an expired credential — which SETUP
+    calls an expected steady state — into a unit left `failed` for good: five failed
+    starts and systemd stopped trying, and it went on not trying after the credential was
+    renewed, until someone restarted it by hand. A transient condition became a permanent,
+    silent outage.
+
+    Removing the limit alone is the opposite failure: at `RestartSec=10s` a token outage
+    is ~360 failed starts an hour of journal noise. So the unit never gives up, and waits
+    a minute between tries. Noticing a long outage is the watchdog's job (#4), not the
+    start limit's — and the watchdog is not built yet, so until it is nothing alarms on a
+    unit stuck in `activating (auto-restart)`.
+
+    Verified against the unfixed template: all three tests failed — it carried
+    `StartLimitIntervalSec=300`, `StartLimitBurst=5` and `RestartSec=10s`.
+    """
+
+    def test_the_start_limit_is_disabled_in_the_unit_section(self):
+        # StartLimitIntervalSec belongs to [Unit]; under [Service] systemd ignores it
+        self.assertEqual(directives("StartLimitIntervalSec", "Unit"), ["0"])
+        self.assertEqual(directives("StartLimitIntervalSec", "Service"), [])
+
+    def test_there_is_no_burst_to_trip(self):
+        # with the interval at 0 a burst is inert, but a stray one invites "restoring" the
+        # interval and quietly bringing the give-up back
+        self.assertEqual(directives("StartLimitBurst"), [])
+
+    def test_it_restarts_always_and_a_minute_apart(self):
+        self.assertEqual(directives("Restart", "Service"), ["always"])
+        self.assertEqual(directives("RestartSec", "Service"), ["60s"])
+
+
+class TestTheDirectiveReaderReadsKeysAsSystemdDoes(unittest.TestCase):
+    """The guards above are only as good as `directives()`, on spacing, sections and
+    comments. systemd accepts `Key = value` and ignores keys in the wrong section; a
+    reader that matched `Key=` by prefix let a spaced `StartLimitBurst = 5` straight past
+    `test_there_is_no_burst_to_trip`. The real template has no spaced keys, so these feed
+    the reader invented units."""
+
+    UNIT = "[Unit]\n# StartLimitBurst=9\nStartLimitBurst = 5\n[Service]\nRestartSec=60s\n"
+
+    def test_a_spaced_key_is_read(self):
+        self.assertEqual(directives("StartLimitBurst", unit=self.UNIT), ["5"])
+
+    def test_a_key_is_read_only_in_its_section(self):
+        self.assertEqual(directives("StartLimitBurst", "Unit", self.UNIT), ["5"])
+        self.assertEqual(directives("StartLimitBurst", "Service", self.UNIT), [])
+        self.assertEqual(directives("RestartSec", "Service", self.UNIT), ["60s"])
+
+    def test_a_commented_key_is_not_read(self):
+        # systemd takes both '#' and ';' as comment markers, spaced or not
+        for comment in ("#StartLimitBurst=5", "# StartLimitBurst = 5", ";StartLimitBurst = 5"):
+            self.assertEqual(
+                directives("StartLimitBurst", unit=f"[Unit]\n{comment}\n"), [], comment
+            )
+
+    def test_the_template_has_no_line_continuations(self):
+        # the reader takes one physical line per directive; a wrapped one would be read
+        # truncated, so the template must not wrap
+        for number, line in enumerate(TEMPLATE.read_text().splitlines(), 1):
+            if not line.lstrip().startswith(("#", ";")):
+                self.assertFalse(line.rstrip().endswith("\\"), f"line {number}: {line}")
 
 
 class TestTheServiceStartGuaranteesAreWired(unittest.TestCase):
