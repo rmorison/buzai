@@ -34,6 +34,18 @@ make test        # full suite must pass
   default (unknown → ask); see `docs/SECURITY-MODEL.md` for the model you're preserving.
 - New behavior needs tests (`trust/tests/`, `scripts/tests/` — plain `unittest`).
 
+## Branches and merging
+
+- **Branch from an issue.** Every change traces to an issue. Use the branch name
+  GitHub generates from the issue, `{issue}-{slug}` (for example
+  `12-branching-and-release-docs`).
+- **Merge commits, on purpose.** Pull requests land as merge commits, not squashes.
+  The per-commit history is part of the project's engineering trail: each commit
+  records one step and why it was taken. A squash folds the branch into a single
+  commit and that record goes with it.
+- **The operator merges.** Open the PR and get CI green; the operator reviews and
+  merges it.
+
 ## Reporting problems
 
 Bugs and friction → GitHub issues. Security vulnerabilities → **privately**, per
