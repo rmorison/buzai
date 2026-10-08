@@ -57,14 +57,17 @@ def directives(name: str, section: str | None = None) -> list[str]:
     those inside `[section]`, when given.
 
     systemd ignores a directive in the wrong section (with a warning), so a key that is
-    present but misplaced does nothing; pass `section` wherever placement matters."""
+    present but misplaced does nothing; pass `section` wherever placement matters.
+    systemd also accepts `Key = value`, so the key is matched with spaces stripped."""
     values, current = [], None
     for raw in TEMPLATE.read_text().splitlines():
         line = raw.strip()
         if line.startswith("[") and line.endswith("]"):
             current = line[1:-1]
-        elif line.startswith(f"{name}=") and section in (None, current):
-            values.append(line.split("=", 1)[1].strip())
+            continue
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == name and section in (None, current):
+            values.append(value.strip())
     return values
 
 
@@ -78,7 +81,8 @@ class TestTheUnitNeverGivesUpButRetriesSlowly(unittest.TestCase):
     Removing the limit alone is the opposite failure: at `RestartSec=10s` a token outage
     is ~360 failed starts an hour of journal noise. So the unit never gives up, and waits
     a minute between tries. Noticing a long outage is the watchdog's job (#4), not the
-    start limit's.
+    start limit's — and the watchdog is not built yet, so until it is nothing alarms on a
+    unit stuck in `activating (auto-restart)`.
 
     Verified against the unfixed template: all three tests failed — it carried
     `StartLimitIntervalSec=300`, `StartLimitBurst=5` and `RestartSec=10s`.

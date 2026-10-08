@@ -66,8 +66,8 @@ something the others would leave broken.
   later and bring the give-up back.
 - **`RestartSec=60s`.** Removing the limit alone causes the opposite failure. At 10s, a
   login outage logs about 360 failed starts an hour, and the journal is unreadable just
-  when someone needs to read it. At 60s it is 60 an hour, and recovery after a renewal is
-  still at most a minute away.
+  when someone needs to read it. At 60s it is at most 60 an hour, and recovery after a
+  renewal is about a minute away.
 - **The watchdog (#4) is the other half.** Retrying forever means a long outage is
   survived, not noticed. Seeing that the assistant has been down for an hour is a separate
   job with its own signal. A start limit that tries to do that job does it by causing the
@@ -83,15 +83,23 @@ The costs we accept:
   nothing. Read `systemctl --user status` and the journal. Removing the start limit
   removed the only alarm the unit had, and no replacement exists yet.
 - **Every retry runs the whole start chain.** That covers the privacy probe in
-  `ExecStartPre` and, once the server is spawned, the two backlog pushes in
-  `ExecStartPost`. During a long outage that is up to one probe and one push attempt a
-  minute against the hub host. Each one is time-bounded, and the old 10s cadence
-  without a limit would have been six times worse. Under the start limit it stopped
-  after five attempts.
+  `ExecStartPre` and, once the server is spawned, the chained backlog pushes in
+  `ExecStartPost` (commits, then review notes; each re-checks privacy first). During a
+  long outage that is one probe and up to two push attempts per cycle against the hub
+  host. Every step is time-bounded. The old 10s cadence without a limit would have run
+  the chain six times as often, and under the start limit it stopped after five tries.
+  Do not read those attempts as a backlog draining. When the server exits within
+  seconds, as it does with a lapsed login, systemd stops the start job and may cut the
+  pushes short. That was true before this change too. A backlog drains on the first
+  start that stays up.
+- **A cycle is longer than 60s.** `RestartSec` counts from the end of a failed attempt,
+  so each cycle is 60s plus the start checks: seconds on a good day, up to about two
+  minutes when the hub remote is unreachable. "60 an hour" is a ceiling. Recovery after
+  a renewal is about a minute plus those checks.
 - **A one-off crash also waits 60s.** A healthy server that exits once is back after a
   minute, not 10s. A backoff that starts short and grows (`RestartSteps`,
-  `RestartMaxDelaySec`) avoids that, but it needs systemd 254, and the Ubuntu 22.04
-  hosts this targets ship 249. Revisit when the baseline moves.
+  `RestartMaxDelaySec`) avoids that, but it needs systemd 254, and Ubuntu 22.04 ships
+  249. Revisit once the oldest supported host has 254.
 
 ## Why this matters
 
