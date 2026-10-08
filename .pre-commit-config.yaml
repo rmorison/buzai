@@ -1,6 +1,12 @@
-# Local quality + leak gate. Install once per clone: `make dev` (wraps `pre-commit install`).
-# CI runs the identical set (`pre-commit run --all-files`) as the backstop — the hooks on
-# your machine are the primary gate, firing BEFORE anything is world-readable.
+# Local quality + leak gate. Install once per clone: `make dev` (wraps
+# `pre-commit install` for the pre-commit and pre-push hook types). CI runs the
+# same set (`pre-commit run --all-files`) as the backstop; the hooks on your
+# machine are the primary gate, firing BEFORE anything is world-readable.
+# Installing the pre-push hook type would otherwise run every hook at push too. This keeps
+# ruff and the YAML/TOML checks at commit only. A hook whose own manifest names its stages
+# keeps them: trailing-whitespace, end-of-file-fixer and check-added-large-files also run
+# at push, on what the push sends.
+default_stages: [pre-commit]
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -20,18 +26,26 @@ repos:
         args: [--fix]
       - id: ruff-format
 
-  - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.21.2
-    hooks:
-      - id: gitleaks
-
-  # The leak gate (see docs/dev/PUBLIC-SEED.md): generic patterns always; the
-  # private pattern file on the maintainer's machine extends coverage to literal
-  # PII/infra names. Stdlib-only, so plain python3 works everywhere.
+  # The leak gate, from engineering-standards (process/repository-standards.md,
+  # Running It Locally); docs/dev/PUBLIC-SEED.md records how buzai differs. It
+  # runs the committed rules in .gitleaks.toml, plus value rules from the list
+  # declared with `git config leakgate.values`, at commit and at push. It needs
+  # the pinned gitleaks from scripts/install-gitleaks.sh, which `make dev` runs.
+  # Under `pre-commit run --all-files` it checks an empty index, so CI's real
+  # coverage is .github/workflows/leaks.yml.
   - repo: local
     hooks:
-      - id: publish-gate
-        name: publish gate (PII/infra leak check)
-        entry: python3 scripts/publish_gate.py
+      - id: leak-gate
+        name: leak gate
+        entry: sh scripts/leak-gate.sh staged
         language: system
-        types: [text]
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+      - id: leak-gate-pre-push
+        name: leak gate (pre-push)
+        entry: sh scripts/leak-gate.sh pre-push
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

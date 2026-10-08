@@ -172,6 +172,15 @@ prime-consent: ## One-time Remote Control consent — answer "y" (the only promp
 lint: ## [dev] ruff-lint the python sources
 	ruff check trust scripts
 
-dev: ## [dev] Install the pre-commit hooks (hygiene, ruff, secret scan, leak gate)
+# Three steps, unattended, stopping at the first failure: install the pinned gitleaks
+# (scripts/install-gitleaks.sh holds the only version and SHA-256), install both hook
+# types, then run the leak gate once. The framework hides a passing hook's output, so the
+# verbose run is the one place a maintainer sees the coverage line: "value rules skipped"
+# there means no value list is declared for this clone (git config leakgate.values). The
+# hooks find gitleaks on your own PATH later, not this one: keep ~/.local/bin on it, or
+# set GITLEAKS.
+dev: ## [dev] Install gitleaks + the pre-commit and pre-push hooks (hygiene, ruff, leak gate)
 	{ command -v pre-commit >/dev/null || { command -v uv >/dev/null && uv tool install pre-commit; } || pipx install pre-commit; }
-	pre-commit install
+	sh scripts/install-gitleaks.sh
+	pre-commit install --hook-type pre-commit --hook-type pre-push
+	pre-commit run leak-gate --verbose
