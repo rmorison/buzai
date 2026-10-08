@@ -38,13 +38,14 @@ make test        # full suite must pass
 
 - **Branch from an issue.** Every change traces to an issue. Use the branch name
   GitHub generates from the issue, `{issue}-{slug}` (for example
-  `12-branching-and-release-docs`).
+  `12-branching-and-release-docs`). Working from a fork, create the branch by hand
+  with the same name.
 - **Merge commits, on purpose.** Pull requests land as merge commits, not squashes.
   The per-commit history is part of the project's engineering trail: each commit
   records one step and why it was taken. A squash folds the branch into a single
   commit and that record goes with it.
-- **The operator merges.** Open the PR and get CI green; the operator reviews and
-  merges it.
+- **The maintainer merges.** Open the PR and get CI green; the maintainer reviews
+  and merges it.
 
 ## Reporting problems
 

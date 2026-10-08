@@ -4,11 +4,12 @@ There is one public repo; releasing is ordinary git plus the gates.
 
 ## Every change
 
-1. Work on a feature branch; Conventional Commits (`feat(make): …`, `docs: …`).
+1. Branch from an issue as `{issue}-{slug}` (see `CONTRIBUTING.md`, "Branches and
+   merging"); Conventional Commits (`feat(make): …`, `docs: …`).
 2. `pre-commit run --all-files` and `make test` locally (the pre-commit hooks include
    the secret scan and the publish gate — see `docs/dev/PUBLIC-SEED.md` for what the
    gate protects and where its private pattern file lives).
-3. PR → CI green → merge.
+3. PR → CI green → the maintainer merges, as a merge commit.
 
 ## Cutting a release / notable milestone
 
@@ -17,12 +18,15 @@ There is one public repo; releasing is ordinary git plus the gates.
 2. `make test && make trust-check` from a fresh clone.
 3. Walk `docs/QUICKSTART.md` verbatim on a clean box (or reset account) when the
    installer or setup flow changed — the clean-box walkthrough is the release test.
-4. Tag and push the one release tag by name:
-   `git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z`.
+4. Tag the merged commit on an up-to-date `main`, and push the one release tag by
+   name:
+   `git switch main && git pull --ff-only && git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z`.
    Versions are [semver](https://semver.org) `vX.Y.Z`, never `vX.Y`. Don't use
-   `git push --tags`: the pre-push check scans only the first ref of a push, and
-   `--tags` can also publish stray local tags.
-5. Publish release notes for the tag (outline below).
+   `git push --tags`: pre-commit's pre-push stage hands its hooks only the first ref
+   of a push, so a pre-push check would miss the rest, and `--tags` can also publish
+   stray local tags.
+5. Publish the release notes (outline below) as the GitHub release for the tag:
+   `gh release create vX.Y.Z --notes-file <notes>.md`.
 
 ## Release notes
 
