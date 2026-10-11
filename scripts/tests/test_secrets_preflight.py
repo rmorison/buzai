@@ -1626,6 +1626,20 @@ class TestGitCredentialRoutes(AccountCredentialCase):
         )
         self.assertEqual(found, [])
 
+    def test_an_unparseable_origin_with_an_auth_header_is_unverified(self):
+        # Python refuses this netloc (it changes under NFKC); git still sends to it
+        origin = "https://u\uff20@ghe.example.invalid/o"
+        found = extra_header_problems(
+            [("http.https://ghe.example.invalid/.extraheader", f"Authorization: x {CANARY}")],
+            None,
+            self.repo,
+            [origin],
+        )
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("unverified rather than clean", found[0])
+        self.assertNotIn(CANARY, found[0])
+        self.assertNotIn("ghe.example.invalid", found[0])
+
     def test_an_extraheader_for_another_service_or_not_auth_is_clean(self):
         self.config("http.https://registry.example.org/.extraheader", f"Authorization: x {CANARY}")
         self.config("http.extraheader", "X-Trace: on")

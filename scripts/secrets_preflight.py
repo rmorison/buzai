@@ -562,12 +562,15 @@ def extra_header_problems(
         if key.lower().startswith("http.") and key.lower().endswith(".extraheader")
     ]
     targets = []
+    unparsed = False
     for url in origin_urls:
         try:
             if urlsplit(url).scheme.lower() in ("http", "https"):
                 targets.append(url)
         except ValueError:
-            continue  # not a URL git could send a header to
+            # Python refuses some URLs git still uses (a netloc that changes under NFKC,
+            # for one), so this can't be read as "no header reaches it".
+            unparsed = True
     for key, _ in keyed:
         scope = key[len("http.") : -len(".extraheader")]
         host = url_host(scope) if scope else None
@@ -576,6 +579,17 @@ def extra_header_problems(
     if any(not key[len("http.") : -len(".extraheader")] for key, _ in keyed):
         targets.append("https://" + GITHUB_HOST + "/")
     shapes = set()
+    has_auth = any(v.split(":", 1)[0].strip().lower() == "authorization" for _, v in keyed)
+    unverified = (
+        [
+            "cannot tell whether an http.extraHeader Authorization header reaches origin, "
+            "because origin's URL can't be parsed here — treated as unverified rather than "
+            f"clean; check `git -C {repo_root} config --show-origin --name-only "
+            "--get-regexp '^http\\..*extraheader$'` and remove any Authorization header"
+        ]
+        if unparsed and has_auth
+        else []
+    )
     for url in targets:
         for scope, header in headers_sent(keyed, url):
             if header.split(":", 1)[0].strip().lower() == "authorization":
@@ -586,7 +600,7 @@ def extra_header_problems(
         f"`git -C {repo_root} config --show-origin --name-only --get-regexp "
         f"'^http\\..*extraheader$'`) and revoke the token"
         for shape in sorted(shapes)
-    ]
+    ] + unverified
 
 
 def push_route_problems(
