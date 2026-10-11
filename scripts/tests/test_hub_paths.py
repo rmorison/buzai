@@ -257,6 +257,21 @@ class TestMainCheckout(ScratchRepoTestCase):
         with mock.patch("scripts.hub_paths.subprocess.run", return_value=answer):
             self.assertEqual(main_checkout(wt), self.main)
 
+    def test_separate_git_dir_main_is_refused(self):
+        # git 2.34 lists such a main repository by its git dir, which keeps no pointer
+        # back to the working tree: the main checkout can't be found, so refuse.
+        sep = self.root / "sep"
+        sep.mkdir()
+        self.git("init", "-q", "--separate-git-dir", str(self.root / "sep.git"), cwd=sep)
+        (sep / "README").write_text("scratch\n")
+        self.git("add", "README", cwd=sep)
+        self.git("commit", "-q", "-m", "scratch", cwd=sep)
+        wt = sep / ".claude" / "worktrees" / "w"
+        self.git("worktree", "add", "-q", "-b", "w", str(wt), cwd=sep)
+        with self.assertRaises(HubPathError) as ctx:
+            resolve(str(sep / "hubs" / "x"), self.home, wt)
+        self.assertIn("as the main working tree, but it has no .git", str(ctx.exception))
+
     def test_bare_main_repository_is_none(self):
         bare = self.root / "bare.git"
         self.git("clone", "-q", "--bare", str(self.main), str(bare), cwd=self.root)

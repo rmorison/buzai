@@ -159,9 +159,11 @@ def main_checkout(repo_root: Path) -> Path | None:
 
     When `.git` is a file, `git worktree list --porcelain` answers: its first record is
     the main working tree, and carries a `bare` line when there is none. Asking git
-    covers layouts that hand-parsing `.git` and `commondir` gets wrong. Any failure to
-    get that answer is a refusal: from a worktree, an unchecked main checkout is the
-    very leak this module exists to stop. The returned path is symlink-resolved.
+    avoids hand-parsing `.git` and `commondir`. Any failure to get that answer is a
+    refusal: from a worktree, an unchecked main checkout is the very leak this module
+    exists to stop. That includes an answer that names no working tree, as git does
+    for a main repository made with `--separate-git-dir`. The returned path is
+    symlink-resolved.
     """
     marker = repo_root / ".git"
     if not marker.is_file():
@@ -199,7 +201,15 @@ def main_checkout(repo_root: Path) -> Path | None:
     if "bare" in first_record[1:]:
         return None
     main = Path(first_record[0][len("worktree ") :]).resolve()
-    return None if main == repo_root.resolve() else main
+    if main == repo_root.resolve():
+        return None
+    if not (main / ".git").exists():
+        # A main repository made with `--separate-git-dir` is listed by its git dir,
+        # not its working tree, and keeps no pointer back to the tree. The same holds
+        # for a main checkout that has since been deleted. Either way the checkout to
+        # protect is unknown.
+        raise fail(f"git names {main} as the main working tree, but it has no .git")
+    return main
 
 
 def resolve(raw: str | None, home: Path, repo_root: Path) -> HubLocation:
