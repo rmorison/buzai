@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,6 +29,7 @@ from scripts.secrets_preflight import (
     dirty_warning,
     enclosing_repo,
     env_file_problems,
+    extra_header_problems,
     fatal_problems,
     hub_checkout_problems,
     hub_content_problems,
@@ -526,6 +528,14 @@ class TestHubTargetFromAWorktree(unittest.TestCase):
 
     def test_a_hub_outside_both_is_fine(self):
         self.assertIsNone(self.target(str(self.root / "hubs")).problem)
+
+    def test_an_unexpected_error_finding_the_main_checkout_is_fatal_not_a_crash(self):
+        def boom(_):
+            raise PermissionError("denied")
+
+        with mock.patch("scripts.secrets_preflight.main_checkout", boom):
+            target = self.target(str(self.root / "hubs"))
+        self.assertIn("unverified rather than clean", target.problem or "")
 
     def test_a_main_checkout_that_cannot_be_found_is_fatal_not_clean(self):
         (self.worktree / ".git").write_text("gitdir: /nonexistent/worktrees/wt\n")
@@ -1530,6 +1540,21 @@ class TestGitCredentialRoutes(AccountCredentialCase):
     def test_an_authorization_extraheader_for_the_origin_host_is_fatal(self):
         self.config("http.https://example.invalid/.extraheader", f"Authorization: x {CANARY}")
         self.assert_findings(1, "http.<url>.extraHeader")
+
+    def test_an_empty_extraheader_cancels_an_earlier_one(self):
+        # git's own reset idiom: a false fatal here would be an outage
+        found = extra_header_problems(
+            [("http.extraheader", f"Authorization: basic {CANARY}"), ("http.extraheader", "")],
+            None,
+            self.repo,
+        )
+        self.assertEqual(found, [])
+        found = extra_header_problems(
+            [("http.extraheader", ""), ("http.extraheader", f"Authorization: basic {CANARY}")],
+            None,
+            self.repo,
+        )
+        self.assertEqual(len(found), 1, found)
 
     def test_an_extraheader_for_another_service_or_not_auth_is_clean(self):
         self.config("http.https://registry.example.org/.extraheader", f"Authorization: x {CANARY}")

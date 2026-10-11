@@ -339,6 +339,15 @@ def resolve_hub_target(raw: str | None, home: Path, repo_root: Path) -> HubTarge
         main_root = main_checkout(root)
     except HubPathError as e:
         return HubTarget(path, description, str(e))
+    except (OSError, ValueError) as e:
+        # e.g. an unreadable `.git`, or git printing a path that isn't UTF-8: still a
+        # refusal, never a crash that keeps every other check from running
+        return HubTarget(
+            path,
+            description,
+            f"cannot tell whether {root} is a linked worktree whose main checkout holds "
+            f"the hub path — treated as unverified rather than clean: {type(e).__name__}: {e}",
+        )
     return HubTarget(path, description, refusal(path, root, main_root))
 
 
@@ -477,27 +486,33 @@ def extra_header_problems(
     credential, and a false fatal is an outage. The key's URL and the value are never
     printed.
     """
-    found = []
+    # git keeps the headers as a list, and an empty value clears what came before it
+    # (that is how a local config cancels a global one), so entries are read in order.
+    pending: dict[str, str] = {}
     for key, value in entries:
         lowered = key.lower()
         if not lowered.endswith(".extraheader") or not lowered.startswith("http."):
             continue
+        scoped = key[len("http.") : -len(".extraheader")]
+        if not value.strip():
+            if scoped:
+                pending.pop(scoped, None)
+            else:
+                pending.clear()
+            continue
         if value.split(":", 1)[0].strip().lower() != "authorization":
             continue
-        scoped = key[len("http.") : -len(".extraheader")]
         host = url_host(scoped) if scoped else None
         if scoped and (host is None or not is_github_host(host, origin_host)):
             continue
-        shape = "http.<url>.extraHeader" if scoped else "http.extraHeader"
-        if any(shape in f for f in found):
-            continue
-        found.append(
-            f"an {shape} entry sends an Authorization header to GitHub — git adds it to "
-            f"every push with no credential helper configured; remove it (find it with "
-            f"`git -C {repo_root} config --show-origin --name-only --get-regexp "
-            f"'^http\\..*extraheader$'`) and revoke the token"
-        )
-    return found
+        pending[scoped] = "http.<url>.extraHeader" if scoped else "http.extraHeader"
+    return [
+        f"an {shape} entry sends an Authorization header to GitHub — git adds it to "
+        f"every push with no credential helper configured; remove it (find it with "
+        f"`git -C {repo_root} config --show-origin --name-only --get-regexp "
+        f"'^http\\..*extraheader$'`) and revoke the token"
+        for shape in sorted(set(pending.values()))
+    ]
 
 
 def push_route_problems(
