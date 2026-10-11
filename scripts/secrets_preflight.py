@@ -571,8 +571,13 @@ def extra_header_problems(
             # Python refuses some URLs git still uses (a netloc that changes under NFKC,
             # for one), so this can't be read as "no header reaches it".
             unparsed = True
-    for key, _ in keyed:
+    for key, value in keyed:
         scope = key[len("http.") : -len(".extraheader")]
+        if scope and value.split(":", 1)[0].strip().lower() == "authorization":
+            try:
+                urlsplit(scope).port
+            except ValueError:
+                unparsed = True  # same reasoning as for origin: git may still match it
         host = url_host(scope) if scope else None
         if host and is_github_host(host.replace("*", "x"), origin_host):
             targets.append(scope)
@@ -582,8 +587,8 @@ def extra_header_problems(
     has_auth = any(v.split(":", 1)[0].strip().lower() == "authorization" for _, v in keyed)
     unverified = (
         [
-            "cannot tell whether an http.extraHeader Authorization header reaches origin, "
-            "because origin's URL can't be parsed here — treated as unverified rather than "
+            "cannot tell whether an http.extraHeader Authorization header reaches GitHub, "
+            "because a URL it depends on can't be parsed here — treated as unverified rather than "
             f"clean; check `git -C {repo_root} config --show-origin --name-only "
             "--get-regexp '^http\\..*extraheader$'` and remove any Authorization header"
         ]

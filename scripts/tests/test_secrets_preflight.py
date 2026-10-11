@@ -1640,6 +1640,17 @@ class TestGitCredentialRoutes(AccountCredentialCase):
         self.assertNotIn(CANARY, found[0])
         self.assertNotIn("ghe.example.invalid", found[0])
 
+    def test_an_unparseable_scope_with_an_auth_header_is_unverified(self):
+        found = extra_header_problems(
+            [("http.https://u\uff20@github.com/.extraheader", f"Authorization: x {CANARY}")],
+            None,
+            self.repo,
+            ["https://github.com/o/b.git"],
+        )
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("unverified rather than clean", found[0])
+        self.assertNotIn(CANARY, found[0])
+
     def test_an_extraheader_for_another_service_or_not_auth_is_clean(self):
         self.config("http.https://registry.example.org/.extraheader", f"Authorization: x {CANARY}")
         self.config("http.extraheader", "X-Trace: on")
