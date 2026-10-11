@@ -680,9 +680,10 @@ def stale_remote_warning(
 def backlog_warning(state: HubState, now: datetime) -> str | None:
     """Commits that exist locally but never reached the remote. Pure.
 
-    Reported at *any* size: fine-grained tokens expire on a ~30-day default, so a silent
-    push failure is an expected steady state rather than an edge case, and service start
-    is the one moment the operator reliably reads the journal.
+    Reported at *any* size: a deploy key that was removed or rotated, or a network that
+    is down for days, makes a silent push failure an expected steady state rather than
+    an edge case, and service start is the one moment the operator reliably reads the
+    journal.
     """
     if state.backlog.count == 0:
         return None
@@ -691,7 +692,7 @@ def backlog_warning(state: HubState, now: datetime) -> str | None:
     reason = f" — last error: {state.backlog.last_error}" if state.backlog.last_error else ""
     return (
         f"{state.backlog.count} hub commit(s) have not reached the remote{oldest}{reason}; "
-        f"`make hub-push` retries (an expired deploy-key/token is the usual cause)"
+        f"`make hub-push` retries (a removed or rotated hub deploy key is the usual cause)"
     )
 
 

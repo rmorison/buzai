@@ -62,8 +62,8 @@ fix; re-run `make service-install` to re-copy the current template and reload th
 
 You'll see this as a `WARN:` line from `make doctor` / service start, or as the warning
 `make hub-review` leads with. **Nothing is lost** — the commits are durable in the local
-hub repo; they just haven't gone off-box, so a dead disk would take them. **The expected
-cause is an expired deploy key or token** (fine-grained tokens default to 30 days), which
+hub repo; they just haven't gone off-box, so a dead disk would take them. **The usual
+cause is a hub deploy key that was removed or rotated**, or a network that is down, which
 makes silent push failure a steady state rather than an edge case. Drain it:
 
 ```bash
@@ -102,6 +102,33 @@ URL embeds a token (`https://user:TOKEN@host/…`) — use an ssh deploy key
 (`deploy/README.md` step 1). If the preflight reports a credential helper on the **public**
 origin, remove it: `git -C ~/buzai-assistant config --unset-all credential.helper`. That one is
 fatal — it would give this instance push access to the public repo.
+
+## "secrets-preflight FAIL" naming a GitHub credential
+
+The service account holds no GitHub account credential (`deploy/README.md`, "No GitHub
+account credential"), so the preflight refuses to start on each one it finds. It names
+the kind and where it is, never the value. Fix the one it names, then revoke any token it
+held, since it has been on the box:
+
+- **`remote.<name>.url` / `pushurl` embeds a credential** — set the URL again without the
+  `user:token@` part: `git -C ~/buzai-assistant remote set-url <name> <url>`.
+- **pushes to origin are redirected** — remove `remote.origin.pushurl`
+  (`git -C ~/buzai-assistant config --unset-all remote.origin.pushurl`), or the
+  `url.<base>.insteadOf`/`pushInsteadOf` rule that rewrites the origin URL; list them with
+  `git -C ~/buzai-assistant config --show-origin --get-regexp '^url\.'`.
+- **`core.askPass` / `GIT_ASKPASS`** — unset it in the git config it came from, or remove
+  the variable from the unit.
+- **`~/.netrc` entry** — remove the `machine` (or `default`) entry it names.
+- **gh is logged in** — `gh auth logout --hostname <host>`, as the service account.
+- **`GH_TOKEN`, `GITHUB_TOKEN` or `GITHUB_PERSONAL_ACCESS_TOKEN` is set** — remove it from
+  the unit's `Environment=`/`EnvironmentFile=`. Under `make doctor` the preflight reads
+  your shell's environment instead, so unset it there too.
+- **cannot determine … unverified rather than clean** — git or a file read failed, so the
+  check couldn't answer; fix what the line names (usually a timeout or file permissions)
+  and start again.
+
+A `WARN:` line listing **untracked files in the checkout** never blocks start. The
+assistant works in the public checkout, so move scratch files out of it or delete them.
 
 ## "The assistant can't find my hubs" / it's writing to a different store
 

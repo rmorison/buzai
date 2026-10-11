@@ -499,7 +499,11 @@ this is the one command where a wrong flag publishes your knowledge base.
   1. Create an EMPTY repository, visibility PRIVATE. Do not add a README or a
      license — the hub repo already has its own initial commit.
 
-       gh repo create hubs --private          # or use your host's web UI
+     Do this from your host's web UI or from your OWN machine, never as the
+     service account: a `gh` login there is a GitHub account credential, and
+     the service preflight refuses to start while one exists.
+
+       gh repo create hubs --private          # on your own machine, or the web UI
 
   2. Confirm in the web UI that it really is private, then attach and push:
 

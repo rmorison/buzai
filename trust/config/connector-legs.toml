@@ -386,7 +386,10 @@ legs = []
 # match = "mcp__github__create_*"        # issue/PR/comment; also update_*/add_comment
 # legs = ["external_send"]
 # # hard-gate: policy.toml [classes_of]  "mcp__github__merge_*" = "merge",
-# #            "mcp__github__delete_*" = "delete"
+# #            "mcp__github__delete_*" = "delete",
+# #            "mcp__github__create_*" = "publish", "mcp__github__add_comment*" = "publish",
+# #            "mcp__github__update_*" = "publish"
+# #   (posting to GitHub can publish to a public repo, so it always asks, like publish_*)
 # Linear — issues/comments are untrusted; create/update/comment reach others; delete gated.
 # [[rule]]
 # match = "mcp__linear__*"
