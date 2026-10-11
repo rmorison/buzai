@@ -21,7 +21,12 @@ running:
   * a real `.env` sits under `deploy/env/` (R17);
   * the resolved hub path is inside — or contains — the checkout (R3);
   * the hub push credential is not 0600, or is tracked by *any* git repo (R15);
-  * a credential helper is configured for the **public** origin (R4/R3).
+  * a credential helper is configured for the **public** origin (R4/R3);
+  * any other GitHub account credential (#29): a remote URL with a token in it, pushes
+    to origin redirected by `pushurl` or a URL rewrite, an `http.extraHeader` carrying
+    an Authorization header for GitHub, `core.askPass` or `GIT_ASKPASS`,
+    a `~/.netrc` entry or a `gh` login for GitHub or the origin's host, or `GH_TOKEN`,
+    `GITHUB_TOKEN` or `GITHUB_PERSONAL_ACCESS_TOKEN` in the service environment.
 
 **WARNING** — durability conditions. Knowledge is being recorded but is not (yet)
 safely off-box. Nothing is leaking, and the assistant still works:
@@ -33,7 +38,9 @@ safely off-box. Nothing is leaking, and the assistant still works:
     a nested repo whose content the outer repo could swallow. That outer repo is the
     owner's own and of unknown visibility, so it is not proof of a leak the way the
     public checkout is; and failing here would take down every instance whose home
-    directory is version-controlled.
+    directory is version-controlled;
+  * untracked, non-ignored files in the public checkout, which is the assistant's working
+    directory: each is one `git add -A` from a commit, but not yet a leak (#29).
 
 Making any of those fatal converts degraded knowledge into a total assistant outage,
 which is the trade this design explicitly refuses. That refusal is enforced rather than
@@ -93,6 +100,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -101,6 +109,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -123,12 +132,23 @@ from scripts.hub_init import (  # noqa: E402
     remotes,
     tracked_paths,
 )
-from scripts.hub_paths import ENV_VAR, HubPathError, expand, refusal, source_of  # noqa: E402
+from scripts.hub_paths import (  # noqa: E402
+    ENV_VAR,
+    HubPathError,
+    expand,
+    main_checkout,
+    refusal,
+    source_of,
+)
 from scripts.hub_remote import (  # noqa: E402
     LOCAL_ENV,
+    SCP_LIKE,
+    GitResult,
     GitRunner,
+    config_url,
     default_git_runner,
     origin_credential_violations,
+    url_credential_problem,
 )
 
 SECRETS_DIR = Path.home() / ".config" / "buzai" / "secrets"
@@ -304,12 +324,31 @@ def resolve_hub_target(raw: str | None, home: Path, repo_root: Path) -> HubTarge
     The resolver's own entry point raises, which would abort the preflight before the
     secrets and credential checks ran. Here a bad hub path is one finding among several,
     and the resolved path is printed either way so a mismatch is visible in the journal.
+
+    Run from a linked worktree, the main checkout it belongs to is public too, so the
+    hub path is refused inside either one. A main checkout that can't be found is a
+    refusal of its own, fatal like the rest: "could not rule it out" is not "clean".
     """
     try:
         path = expand(raw, home).resolve()
     except HubPathError as e:
         return HubTarget(None, f"unresolvable ({e})", str(e))
-    return HubTarget(path, f"{path} (from {source_of(raw)})", refusal(path, repo_root.resolve()))
+    description = f"{path} (from {source_of(raw)})"
+    root = repo_root.resolve()
+    try:
+        main_root = main_checkout(root)
+    except HubPathError as e:
+        return HubTarget(path, description, str(e))
+    except (OSError, ValueError) as e:
+        # e.g. an unreadable `.git`, or git printing a path that isn't UTF-8: still a
+        # refusal, never a crash that keeps every other check from running
+        return HubTarget(
+            path,
+            description,
+            f"cannot tell whether {root} is a linked worktree whose main checkout holds "
+            f"the hub path — treated as unverified rather than clean: {type(e).__name__}: {e}",
+        )
+    return HubTarget(path, description, refusal(path, root, main_root))
 
 
 def fatal_problems(
@@ -322,12 +361,15 @@ def fatal_problems(
     hub_path_problem: str | None,
     origin_violations: Sequence[str],
     is_tracked: Callable[[Path], bool | str],
+    account_violations: Sequence[str] = (),
 ) -> list[str]:
     """Every leak condition, in one pure function. Blocks service start.
 
     `hub_credentials` goes through the same perms + tracked pair as the secrets files:
     a deploy key that can write the private hub repo is a secret like any other, and a
     dotfiles repo that tracks it publishes push access to the knowledge base.
+    `account_violations` are the GitHub account credentials `account_credential_violations`
+    found (#29); `assess()` always passes them, and a composition test fails if it stops.
     """
     return [
         *problems(secret_files, repo_secrets, creds, is_tracked),
@@ -337,7 +379,433 @@ def fatal_problems(
         *tracked_problems([p for p in hub_credentials if Path(p).exists()], is_tracked),
         *([hub_path_problem] if hub_path_problem else []),
         *origin_violations,
+        *account_violations,
     ]
+
+
+# --- pure: GitHub account credentials (#29) ----------------------------------------
+#
+# The credential-helper check above asks one question. A deployment can still publish
+# to GitHub by routes that need no helper: a token in a remote URL, a push redirected to
+# another URL, a `~/.netrc` entry, a `gh` login, a token in the service environment, or
+# an askpass program. Each needs a credential someone added to the box by hand, and the
+# policy (`deploy/README.md`) is that the service account holds none but the hub deploy
+# key. These deciders judge what the gatherer read, and every message names the KIND of
+# credential and where it is — never a URL's userinfo, a token, or a rewrite's base URL,
+# because these messages go to the journal.
+
+# The environment variables `gh` and the GitHub MCP server read a token from. Presence
+# is the finding; the value is never read into a message.
+TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN")
+
+GITHUB_HOST = "github.com"
+
+# `remote.<name>.url` / `remote.<name>.pushurl`. The name may itself contain dots.
+REMOTE_URL_KEY = re.compile(r"^remote\.(?P<name>.+)\.(?P<key>url|pushurl)$", re.IGNORECASE)
+# `url.<base>.insteadOf` / `url.<base>.pushInsteadOf`. The base is never printed: it can
+# hold a token.
+REWRITE_KEY = re.compile(r"^url\..+\.(?P<kind>pushinsteadof|insteadof)$", re.IGNORECASE)
+
+# Keywords in a `.netrc` that take one value. Skipping that value is what keeps a
+# password that happens to read "machine" from being taken for a host.
+NETRC_VALUED = frozenset({"login", "password", "account", "port"})
+
+
+def is_network_url(url: str) -> bool:
+    """Whether git would reach another machine with this push URL. Pure.
+
+    A push URL that names no network transport (the `no_push` hardening idiom, a local
+    path, `file://`) can't publish anything, so a redirect to it is not a finding. Any
+    other scheme counts as network, not only git's named transports: git also accepts
+    `git+ssh://` and `ssh+git://`, and a `<helper>://` URL hands the push to a remote
+    helper. On a leak check an unknown scheme fails closed.
+    """
+    scheme = urlsplit(url).scheme.lower()
+    if scheme:
+        return scheme != "file"
+    return bool(SCP_LIKE.match(url.strip()))
+
+
+def url_host(url: str) -> str | None:
+    """The host a remote URL names, lower-cased, or None. Pure. Accepts scp-like form."""
+    try:
+        host = urlsplit(config_url(url)).hostname
+    except ValueError:
+        return None
+    return host.lower() if host else None
+
+
+def is_github_host(host: str, origin_host: str | None) -> bool:
+    """A host a GitHub account credential would be for. Pure.
+
+    `github.com` is always in the set, so a missing or local origin can't silence the
+    `.netrc` and `gh` checks; `api.github.com` and other subdomains are in it too, since a
+    token for the API posts without `gh`.
+    """
+    host = host.lower().rstrip(".")
+    return (
+        host == GITHUB_HOST
+        or host.endswith("." + GITHUB_HOST)
+        or (origin_host is not None and host == origin_host)
+    )
+
+
+def remote_url_problems(entries: Iterable[tuple[str, str]], repo_root: Path) -> list[str]:
+    """Remote URLs in the checkout's config that embed a credential. Pure. #29 R2.
+
+    `entries` are `(config key, value)` pairs for every remote's `url` and `pushurl`.
+    Every remote counts, not only origin: a second remote with a token in it pushes this
+    checkout just as well. The value is judged, never printed.
+    """
+    found = []
+    for key, value in entries:
+        match = REMOTE_URL_KEY.match(key)
+        if not match or not url_credential_problem(value):
+            continue
+        name = match.group("name")
+        found.append(
+            f"remote.{name}.{match.group('key').lower()} embeds a credential in its URL — "
+            f"that is a way to push this checkout, and git echoes the URL on failure, so "
+            f"the token would also reach the journal; set the URL again without it "
+            f"(`git -C {repo_root} remote set-url {name} <url without user:token@>`) and "
+            f"revoke the token"
+        )
+    return found
+
+
+def _label_match(pattern: str, host: str) -> bool:
+    """git's urlmatch host rule: same number of labels, each equal or `*`."""
+    pat, got = pattern.split("."), host.split(".")
+    return len(pat) == len(got) and all(p in ("*", g) for p, g in zip(pat, got, strict=True))
+
+
+def header_scope_match(scope: str, url: str) -> tuple[int, int, int] | None:
+    """How specifically an `http.<scope>.*` key matches `url`, or None. Pure.
+
+    Follows git's urlmatch closely enough to order entries: scheme, host (per label,
+    `*` allowed) and port must match, the scope's user (if any) must be the URL's, and
+    the scope's path must be a prefix of the URL's at a `/` boundary. The tuple orders
+    like git's own comparison: host characters matched, then path length, then whether
+    a user was named. An unscoped key matches every URL with the lowest specificity.
+    """
+    if not scope:
+        return (0, 0, 0)
+    try:
+        want, have = urlsplit(scope), urlsplit(url)
+        want_port, have_port = want.port, have.port
+    except ValueError:
+        return None
+    if want.scheme.lower() != have.scheme.lower():
+        return None
+    want_host, have_host = (want.hostname or ""), (have.hostname or "")
+    if not want_host or not _label_match(want_host, have_host):
+        return None
+    defaults = {"http": 80, "https": 443}
+    scheme = have.scheme.lower()
+    if (want_port or defaults.get(scheme)) != (have_port or defaults.get(scheme)):
+        return None
+    if want.username and want.username != have.username:
+        return None
+    prefix = want.path.rstrip("/")
+    path = have.path or "/"
+    if prefix and not (path == prefix or path.startswith(prefix + "/")):
+        return None
+    host_chars = len(want_host.replace("*", ""))
+    return (host_chars, len(prefix), 1 if want.username else 0)
+
+
+def headers_sent(entries: Sequence[tuple[str, str]], url: str) -> list[tuple[str, str]]:
+    """`(scope, header)` pairs git would send to `url` from `http.*.extraHeader`. Pure.
+
+    git reads the entries in config order. An entry that matches the URL less
+    specifically than the best one seen so far is ignored, and an empty value clears
+    the list built so far (how a local config cancels a global header). Checked against
+    git 2.34.1 with a recording proxy, in the review of #35.
+    """
+    best: tuple[int, int, int] | None = None
+    sent: list[tuple[str, str]] = []
+    for key, value in entries:
+        scope = key[len("http.") : -len(".extraheader")]
+        rank = header_scope_match(scope, url)
+        if rank is None or (best is not None and rank < best):
+            continue
+        best = rank
+        if value == "":  # only an exactly empty value resets; git sends " " as a header
+            sent.clear()
+        else:
+            sent.append((scope, value))
+    return sent
+
+
+def extra_header_problems(
+    entries: Iterable[tuple[str, str]],
+    origin_host: str | None,
+    repo_root: Path,
+    origin_urls: Sequence[str] = (),
+) -> list[str]:
+    """`http.extraHeader` entries that send an Authorization header to GitHub. Pure.
+
+    git sends `http.<url>.extraHeader` with every request to a matching URL, and an
+    `Authorization:` header there is a push credential with no helper configured. It is
+    the shape `actions/checkout` persists into a clone, so a checkout copied from CI
+    carries it.
+
+    What counts is what git would actually send: `headers_sent` is asked for each https
+    URL the instance could push to (origin's own URLs, and each scope on a GitHub host
+    or the origin's host, which stands for a direct push there). Only an Authorization
+    header counts: a header for another service is not a GitHub credential, and a false
+    fatal is an outage. The key's URL and the value are never printed.
+    """
+    keyed = [
+        (key, value)
+        for key, value in entries
+        if key.lower().startswith("http.") and key.lower().endswith(".extraheader")
+    ]
+    targets = []
+    unparsed = False
+    for url in origin_urls:
+        try:
+            if urlsplit(url).scheme.lower() in ("http", "https"):
+                targets.append(url)
+        except ValueError:
+            # Python refuses some URLs git still uses (a netloc that changes under NFKC,
+            # for one), so this can't be read as "no header reaches it".
+            unparsed = True
+    for key, value in keyed:
+        scope = key[len("http.") : -len(".extraheader")]
+        if scope and value.split(":", 1)[0].strip().lower() == "authorization":
+            try:
+                urlsplit(scope).port
+            except ValueError:
+                unparsed = True  # same reasoning as for origin: git may still match it
+        host = url_host(scope) if scope else None
+        if host and is_github_host(host.replace("*", "x"), origin_host):
+            targets.append(scope)
+    if any(not key[len("http.") : -len(".extraheader")] for key, _ in keyed):
+        targets.append("https://" + GITHUB_HOST + "/")
+    shapes = set()
+    has_auth = any(v.split(":", 1)[0].strip().lower() == "authorization" for _, v in keyed)
+    unverified = (
+        [
+            "cannot tell whether an http.extraHeader Authorization header reaches GitHub, "
+            "because a URL it depends on can't be parsed here — treated as unverified rather than "
+            f"clean; check `git -C {repo_root} config --show-origin --name-only "
+            "--get-regexp '^http\\..*extraheader$'` and remove any Authorization header"
+        ]
+        if unparsed and has_auth
+        else []
+    )
+    for url in targets:
+        for scope, header in headers_sent(keyed, url):
+            if header.split(":", 1)[0].strip().lower() == "authorization":
+                shapes.add("http.<url>.extraHeader" if scope else "http.extraHeader")
+    return [
+        f"an {shape} entry sends an Authorization header to GitHub — git adds it to "
+        f"every push with no credential helper configured; remove it (find it with "
+        f"`git -C {repo_root} config --show-origin --name-only --get-regexp "
+        f"'^http\\..*extraheader$'`) and revoke the token"
+        for shape in sorted(shapes)
+    ] + unverified
+
+
+def push_route_problems(
+    origin: str,
+    push_urls: Sequence[str],
+    mechanisms: Sequence[str],
+    repo_root: Path,
+    *,
+    origin_key_flagged: bool,
+) -> list[str]:
+    """Pushes to origin that go somewhere `remote.origin.url` doesn't say. Pure. #29 R3.
+
+    `push_urls` is what `git remote get-url --push --all origin` reports, so git has
+    already applied `pushurl`, `pushInsteadOf` and `insteadOf` its own way; only the
+    effect is judged here, not the presence of a rewrite rule. `mechanisms` names what
+    did it, by key shape only. `origin_key_flagged` says R2 already reported a token in
+    origin's own keys, so the same token is not reported twice.
+    """
+    found = []
+    if not origin_key_flagged and any(url_credential_problem(u) for u in push_urls):
+        found.append(
+            "origin's effective push URL embeds a credential after git applies its URL "
+            "rewrites — a `url.<base>.insteadOf` or `pushInsteadOf` rule puts a token into "
+            f"every push to the public repo; find it with `git -C {repo_root} config "
+            "--show-origin --name-only --get-regexp '^url\\.'`, remove it and revoke the "
+            "token"
+        )
+    redirected = [u for u in push_urls if u != origin and is_network_url(u)]
+    if redirected:
+        how = ", ".join(mechanisms) if mechanisms else "a push URL rewrite"
+        found.append(
+            f"pushes to origin are redirected away from remote.origin.url (by {how}) — "
+            f"this instance must have no way to push to the public repo, and a redirect "
+            f"is how one is added without a credential helper; remove it (`git -C "
+            f"{repo_root} config --unset-all remote.origin.pushurl`, or the rewrite rule "
+            f"shown by `git -C {repo_root} config --show-origin --get-regexp '^url\\.'`)"
+        )
+    return found
+
+
+def rewrite_mechanisms(entries: Iterable[tuple[str, str]], origin: str) -> list[str]:
+    """Which redirects apply to origin, named by key shape. Pure.
+
+    `entries` are `(key, value)` pairs for `remote.origin.pushurl` and every
+    `url.<base>.(push)insteadOf`. A rewrite counts only when its value is a prefix of the
+    origin URL, so a rule for an unrelated host is not blamed. The base is never named.
+    """
+    shapes: list[str] = []
+    for key, value in entries:
+        lowered = key.lower()
+        if lowered == "remote.origin.pushurl":
+            shape = "remote.origin.pushurl"
+        else:
+            match = REWRITE_KEY.match(key)
+            if not match or not value or not origin.startswith(value):
+                continue
+            shape = (
+                "a url.<base>.pushInsteadOf rewrite"
+                if match.group("kind").lower() == "pushinsteadof"
+                else "a url.<base>.insteadOf rewrite"
+            )
+        if shape not in shapes:
+            shapes.append(shape)
+    return shapes
+
+
+def netrc_hosts(text: str) -> tuple[set[str], bool]:
+    """(`machine` names, whether a `default` entry exists) in a `.netrc`. Pure. #29 R4.
+
+    Tokenized by hand rather than with the stdlib `netrc` module, which reads every
+    password into memory and whose parse errors can quote the file. Only the token after
+    `machine` is kept. A `macdef` body runs to the next blank line and is skipped, so a
+    macro that mentions a host can't raise a false fatal — which would be an outage.
+    """
+    hosts: set[str] = set()
+    has_default = False
+    expect: str | None = None
+    in_macdef = False
+    for line in text.splitlines():
+        if in_macdef:
+            in_macdef = bool(line.strip())
+            continue
+        if line.lstrip().startswith("#"):
+            continue
+        for token in line.split():
+            if expect == "machine":
+                hosts.add(token.strip("\"'").lower())
+                expect = None
+            elif expect == "value":
+                expect = None
+            elif expect == "macdef":
+                expect = None
+                in_macdef = True
+                break
+            elif token == "machine":
+                expect = "machine"
+            elif token == "default":
+                has_default = True
+            elif token in NETRC_VALUED:
+                expect = "value"
+            elif token == "macdef":
+                expect = "macdef"
+    return hosts, has_default
+
+
+def gh_hosts(text: str) -> set[str]:
+    """The top-level keys of a `gh` `hosts.yml`, lower-cased. Pure. #29 R5.
+
+    Read line by line (column 0, not a comment, quotes stripped, the text before the
+    first `:`), so no YAML dependency is added and no value is read. Newer `gh` keeps the
+    token in the system keyring but still writes the host entry, so the entry is the
+    signal.
+    """
+    hosts = set()
+    for line in text.splitlines():
+        if not line or line[0] in " \t#-" or ":" not in line:
+            continue
+        key = line.split(":", 1)[0].strip().strip("\"'").lower()
+        if key:
+            hosts.add(key)
+    return hosts
+
+
+def netrc_problems(
+    path: Path, hosts: Iterable[str], has_default: bool, origin_host: str | None
+) -> list[str]:
+    """`.netrc` entries that would hand git or an API client a GitHub credential. Pure."""
+    found = [
+        f"{path} has a `machine` entry for {host} — a stored password or token there lets "
+        f"this instance push to or post on GitHub with no credential helper; remove the "
+        f"entry and revoke the token"
+        for host in sorted(h for h in hosts if is_github_host(h, origin_host))
+    ]
+    if has_default:
+        found.append(
+            f"{path} has a `default` entry, which applies to every host including GitHub — "
+            f"remove it; the service account holds no GitHub account credential"
+        )
+    return found
+
+
+def gh_login_problems(path: Path, hosts: Iterable[str], origin_host: str | None) -> list[str]:
+    """`gh` logins that would let this instance post to GitHub. Pure. #29 R5."""
+    return [
+        f"the gh CLI is logged in to {host} ({path}) — that gives this instance "
+        f"`gh issue create`/`comment` on public repos with no credential helper; run "
+        f"`gh auth logout --hostname {host}` as the service account"
+        for host in sorted(h for h in hosts if is_github_host(h, origin_host))
+    ]
+
+
+def token_env_problems(environ: Mapping[str, str]) -> list[str]:
+    """GitHub tokens and askpass programs in the preflight's environment. Pure. #29 R6.
+
+    Presence only. Under systemd this is the service environment, since `ExecStartPre`
+    gets the unit's `Environment=` and `EnvironmentFile=`. `SSH_ASKPASS` is deliberately
+    not checked: some distributions set it system-wide for desktop sessions.
+    """
+    found = [
+        f"{var} is set in the service environment — `gh` and the GitHub MCP server read a "
+        f"token from it and can post publicly; remove it from the unit's Environment= / "
+        f"EnvironmentFile= and revoke the token"
+        for var in TOKEN_VARS
+        if environ.get(var, "").strip()
+    ]
+    if environ.get("GIT_ASKPASS", "").strip():
+        found.append(
+            "GIT_ASKPASS is set in the service environment — git asks that program for a "
+            "push credential with no helper configured, and a headless service account "
+            "has no use for one; remove it from the unit's environment"
+        )
+    return found
+
+
+def askpass_problem(repo_root: Path) -> str:
+    return (
+        f"core.askPass is configured for this checkout — git asks that program for a push "
+        f"credential with no helper configured, and a headless service account has no "
+        f"use for one; remove it with `git -C {repo_root} config --unset core.askPass` "
+        f"(or from the global config it came from)"
+    )
+
+
+def untracked_warning(names: Sequence[str], repo_root: Path) -> str | None:
+    """Untracked, non-ignored files in the checkout, by name. Pure. #29 R8.
+
+    A warning, never fatal: a stray scratch file is not yet a leak, and failing start on
+    one would take the assistant down for a file it may well have written itself. But
+    the assistant's working directory is the public checkout, so each is one
+    `git add -A` from a commit.
+    """
+    if not names:
+        return None
+    shown = ", ".join(names[:5])
+    more = f" and {len(names) - 5} more" if len(names) > 5 else ""
+    return (
+        f"{len(names)} untracked file(s) in the public checkout {repo_root} that "
+        f".gitignore does not cover ({shown}{more}) — each is one `git add -A` from a "
+        f"commit to the public repo; move scratch work out of the checkout, or delete it"
+    )
 
 
 # --- pure: the durability warnings -------------------------------------------------
@@ -376,9 +844,10 @@ def stale_remote_warning(
 def backlog_warning(state: HubState, now: datetime) -> str | None:
     """Commits that exist locally but never reached the remote. Pure.
 
-    Reported at *any* size: fine-grained tokens expire on a ~30-day default, so a silent
-    push failure is an expected steady state rather than an edge case, and service start
-    is the one moment the operator reliably reads the journal.
+    Reported at *any* size: a deploy key that was removed or rotated, or a network that
+    is down for days, makes a silent push failure an expected steady state rather than
+    an edge case, and service start is the one moment the operator reliably reads the
+    journal.
     """
     if state.backlog.count == 0:
         return None
@@ -387,7 +856,7 @@ def backlog_warning(state: HubState, now: datetime) -> str | None:
     reason = f" — last error: {state.backlog.last_error}" if state.backlog.last_error else ""
     return (
         f"{state.backlog.count} hub commit(s) have not reached the remote{oldest}{reason}; "
-        f"`make hub-push` retries (an expired deploy-key/token is the usual cause)"
+        f"`make hub-push` retries (a removed or rotated hub deploy key is the usual cause)"
     )
 
 
@@ -692,6 +1161,203 @@ def durability_report(
         ]
 
 
+def _unverified(what: str, result: GitResult) -> str:
+    """A leak check git could not answer: fatal, never clean. First stderr line only."""
+    lines = result.stderr.strip().splitlines()
+    detail = lines[0] if lines else f"git exited {result.returncode}"
+    return f"cannot determine {what} — treated as unverified rather than clean: {detail}"
+
+
+def _config_pairs(stdout: str) -> list[tuple[str, str]]:
+    """`(key, value)` pairs from `git config -z --get-regexp` output."""
+    pairs = []
+    for entry in stdout.split("\0"):
+        if entry:
+            key, _, value = entry.partition("\n")
+            pairs.append((key, value))
+    return pairs
+
+
+def git_credential_routes(
+    repo_root: Path, runner: GitRunner, timeout: float = GIT_TIMEOUT_SECONDS
+) -> tuple[list[str], str | None]:
+    """(findings, origin host) for the routes git config can open. #29 R2, R3, R6a.
+
+    `git config` exits 1 for "no such key" and anything else for "could not evaluate";
+    as in `origin_credential_violations`, the two are kept apart, because folding them
+    together is how a leak check becomes a silent pass. No origin at all has nothing to
+    redirect; the credential-helper check already reports "this checkout" for it.
+    """
+
+    def git(*args: str) -> GitResult:
+        return runner(["-C", str(repo_root), *args], LOCAL_ENV, timeout)
+
+    found: list[str] = []
+    listed = git("config", "-z", "--get-regexp", r"^remote\..*\.(url|pushurl)$")
+    entries = _config_pairs(listed.stdout) if listed.returncode == 0 else []
+    if listed.returncode not in (0, 1):
+        found.append(
+            _unverified("whether a remote URL in this checkout embeds a credential", listed)
+        )
+    found += remote_url_problems(entries, repo_root)
+    origin_key_flagged = any(
+        (m := REMOTE_URL_KEY.match(key))
+        and m.group("name") == "origin"
+        and url_credential_problem(v)
+        for key, v in entries
+    )
+
+    origin_host = None
+    origin_urls: list[str] = []
+    got = git("config", "--get", "remote.origin.url")
+    if got.returncode == 0 and got.stdout.strip():
+        origin = got.stdout.strip()
+        origin_host = url_host(origin)
+        origin_urls.append(origin)
+        push = git("remote", "get-url", "--push", "--all", "origin")
+        if push.returncode == 0:
+            origin_urls += [u.strip() for u in push.stdout.splitlines() if u.strip()]
+        if push.returncode != 0:
+            found.append(_unverified("where pushes to origin go", push))
+        else:
+            redirects = git(
+                "config",
+                "-z",
+                "--get-regexp",
+                r"^(remote\.origin\.pushurl|url\..*\.(pushinsteadof|insteadof))$",
+            )
+            # Only the NAME of the mechanism depends on this call; the finding itself comes
+            # from git's own answer above, so a failure here leaves it generically named.
+            mechanisms = (
+                rewrite_mechanisms(_config_pairs(redirects.stdout), origin)
+                if redirects.returncode == 0
+                else []
+            )
+            found += push_route_problems(
+                origin,
+                [u.strip() for u in push.stdout.splitlines() if u.strip()],
+                mechanisms,
+                repo_root,
+                origin_key_flagged=origin_key_flagged,
+            )
+    elif got.returncode not in (0, 1):
+        found.append(_unverified("where pushes to origin go", got))
+
+    headers = git("config", "-z", "--get-regexp", r"^http\.(.*\.)?extraheader$")
+    if headers.returncode == 0:
+        found += extra_header_problems(
+            _config_pairs(headers.stdout), origin_host, repo_root, origin_urls
+        )
+    elif headers.returncode != 1:
+        found.append(_unverified("whether an http.extraHeader carries a credential", headers))
+
+    askpass = git("config", "--get", "core.askPass")
+    if askpass.returncode == 0 and askpass.stdout.strip():
+        found.append(askpass_problem(repo_root))
+    elif askpass.returncode not in (0, 1):
+        found.append(_unverified("whether core.askPass is configured", askpass))
+    return found, origin_host
+
+
+def gh_hosts_path(home: Path, environ: Mapping[str, str]) -> Path:
+    """Where `gh` keeps its logins, by gh's own precedence."""
+    if environ.get("GH_CONFIG_DIR"):
+        return Path(environ["GH_CONFIG_DIR"]) / "hosts.yml"
+    if environ.get("XDG_CONFIG_HOME"):
+        return Path(environ["XDG_CONFIG_HOME"]) / "gh" / "hosts.yml"
+    return home / ".config" / "gh" / "hosts.yml"
+
+
+def _read_optional(path: Path) -> tuple[str | None, str | None]:
+    """(text, error). Absent is (None, None): no file there is nothing to find."""
+    try:
+        return path.read_text(errors="replace"), None
+    except (FileNotFoundError, NotADirectoryError):
+        return None, None
+    except OSError as e:
+        # Includes a directory on the way that can't be searched: unverified, not a crash.
+        return None, e.strerror or type(e).__name__
+
+
+def account_file_problems(
+    home: Path, environ: Mapping[str, str], origin_host: str | None
+) -> list[str]:
+    """GitHub credentials in the account's `.netrc` and `gh` login. #29 R4, R5."""
+    found: list[str] = []
+    netrc = home / ".netrc"
+    text, error = _read_optional(netrc)
+    if error:
+        found.append(
+            f"cannot read {netrc} to check it for a GitHub credential — treated as "
+            f"unverified rather than clean: {error}"
+        )
+    elif text is not None:
+        found += netrc_problems(netrc, *netrc_hosts(text), origin_host)
+    hosts_file = gh_hosts_path(home, environ)
+    text, error = _read_optional(hosts_file)
+    if error:
+        found.append(
+            f"cannot read {hosts_file} to check for a gh login — treated as unverified "
+            f"rather than clean: {error}"
+        )
+    elif text is not None:
+        found += gh_login_problems(hosts_file, gh_hosts(text), origin_host)
+    return found
+
+
+def account_credential_violations(
+    repo_root: Path,
+    runner: GitRunner,
+    *,
+    home: Path,
+    environ: Mapping[str, str],
+    timeout: float = GIT_TIMEOUT_SECONDS,
+) -> list[str]:
+    """Every GitHub account credential this instance holds, by kind. FATAL. #29.
+
+    Leak checks, so outside `durability_report`'s catch-all: a check that cannot answer
+    is an unverified finding, never a pass.
+    """
+    found, origin_host = git_credential_routes(repo_root, runner, timeout)
+    return [
+        *found,
+        *account_file_problems(home, environ, origin_host),
+        *token_env_problems(environ),
+    ]
+
+
+def untracked_report(
+    repo_root: Path, runner: GitRunner, timeout: float = GIT_TIMEOUT_SECONDS
+) -> str | None:
+    """The untracked-files warning for the checkout. **Never raises.** #29 R8.
+
+    A warning gatherer, so it holds to the warning half's rule: whatever goes wrong here
+    degrades to a warning, and service start is never blocked by it.
+    """
+    try:
+        listed = runner(
+            [
+                "-C",
+                str(repo_root),
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "--directory",
+                "--no-empty-directory",
+                "-z",
+            ],
+            LOCAL_ENV,
+            timeout,
+        )
+        if listed.returncode != 0:
+            lines = listed.stderr.strip().splitlines()
+            detail = lines[0] if lines else f"git exited {listed.returncode}"
+            return f"cannot list untracked files in the public checkout {repo_root}: {detail}"
+        return untracked_warning([n for n in listed.stdout.split("\0") if n], repo_root)
+    except Exception as e:  # noqa: BLE001 — a warning gatherer must not block start
+        return f"cannot list untracked files in the public checkout {repo_root}: {type(e).__name__}: {e}"
+
+
 def assess(
     now: datetime,
     runner: GitRunner = default_git_runner,
@@ -727,6 +1393,9 @@ def assess(
         hub_path_problem=target.problem,
         origin_violations=origin_credential_violations(repo_root, runner),
         is_tracked=is_tracked,
+        account_violations=account_credential_violations(
+            repo_root, runner, home=home, environ=environ
+        ),
     )
 
     # A refused hub path is not inspected: the warnings describe a store that must not
@@ -737,6 +1406,9 @@ def assess(
     creds_warning = credential_warning(read_credentials(creds), creds)
     if creds_warning:
         warnings.append(creds_warning)
+    stray = untracked_report(repo_root, runner)
+    if stray:
+        warnings.append(stray)
     if not secret_files:
         notes.append(
             f"no local secret files in {secrets_dir} — fine for a managed-connector-only "

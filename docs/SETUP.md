@@ -475,8 +475,12 @@ checkout's copies. Re-running reports the existing store and changes nothing.
 prints these commands rather than running them: this is the one step where a wrong flag
 publishes your knowledge base, so buzai never does it for you.
 
+Create it from your host's web UI or from **your own machine**, never as the service
+account: a `gh` login on the service account is a GitHub account credential, and the
+preflight refuses to start while one exists (see "No GitHub account credential" below).
+
 ```bash
-gh repo create hubs --private          # or your host's web UI — EMPTY repo, no README, no license
+gh repo create hubs --private          # on YOUR machine, or the web UI — EMPTY repo, no README, no license
 # confirm in the web UI that it really is private, then attach and push:
 git -C ~/hubs remote add origin <ssh-url-of-that-private-repo>
 git -C ~/hubs push -u origin main
@@ -487,7 +491,19 @@ Use an **ssh deploy key scoped to that one repository** (write access enabled), 
 `ssh-keyscan` / `~/.ssh/config` recipe. A token embedded in the remote URL is
 **forbidden**, not discouraged: git echoes the remote on failure and the unit sends stderr
 to the journal, so it would be logged in plaintext on exactly the failures this design
-expects routinely. Then prove the destination before anything is pushed:
+expects routinely.
+
+**No GitHub account credential on the service account.** The deploy key is its only
+GitHub credential: no account-wide ssh key, no personal access token, no `~/.netrc`
+entry and no `gh` login — including `gh auth login` with git setup declined,
+`gh auth login --with-token`, and `GH_TOKEN`/`GITHUB_TOKEN` in the unit's environment,
+none of which installs a credential helper but all of which can post publicly. The
+assistant works in a clone of the public repo, so any of these is a way for a mistake to
+publish. The preflight refuses to start on the ones it can see from disk; it can't see an
+account-wide ssh key or a managed claude.ai GitHub connector, so don't add either for this
+account. `deploy/README.md` ("No GitHub account credential") has the full list.
+
+Then prove the destination before anything is pushed:
 
 ```bash
 make hub-remote-check     # anonymous `git ls-remote` — if a stranger can read it, push is refused
@@ -540,8 +556,8 @@ It runs *after* the server is up and cannot fail the unit, so `systemctl --user 
 claude-remote` is a legitimate way to drain a backlog once the network or the deploy key
 is fixed. `journalctl --user -u claude-remote` shows what it did.
 
-If it keeps failing, the deploy key or token has most likely expired (fine-grained tokens
-do, routinely) — see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md). `make doctor` prints a
+If it keeps failing, the hub deploy key has most likely been removed or rotated, or the
+network is down — see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md). `make doctor` prints a
 `WARN:` line for an unpushed backlog, a store with no remote, or a dirty hub tree; those
 are durability conditions and never block service start.
 

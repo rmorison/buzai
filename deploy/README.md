@@ -106,8 +106,30 @@ thing to get wrong.
 and `scripts/hub_remote.py` refuses to push when it sees one. Git echoes the
 remote URL on failure and the unit sends stderr to the journal, so
 `https://user:TOKEN@host/…` would be written to the logs in plaintext on exactly
-the push failures this design expects routinely (fine-grained tokens expire, so
-silent push failure is a steady state, not an edge case).
+the push failures this design expects routinely (a push can fail silently for days,
+so the failure is a steady state, not an edge case). The deploy key is the only
+supported hub credential.
+
+### No GitHub account credential on the service account
+
+The service account holds **no GitHub account credential**. Its only GitHub
+credential is the repo-scoped hub deploy key above. That means none of these:
+
+- an **account-wide ssh key** (`~/.ssh/id_*`, or a key in an agent) registered to a
+  GitHub account;
+- a **personal access token**, anywhere: in a remote URL, in `~/.netrc`, or in the
+  service environment as `GH_TOKEN`, `GITHUB_TOKEN` or `GITHUB_PERSONAL_ACCESS_TOKEN`;
+- a **`gh` login**, including `gh auth login` with git setup declined and
+  `gh auth login --with-token`. Neither installs a credential helper, but both let
+  `gh issue create` and `gh issue comment` post publicly.
+
+The assistant runs in a clone of the **public** repo, so any of these is a way for a
+mistake to publish. Run `gh` and create repositories from your own machine or the web
+UI, never as the service account. The preflight refuses to start on every one of these
+it can see from disk (below). It can't see an account-wide ssh key, which an owner may
+legitimately keep on a shared box, or a managed claude.ai GitHub connector, which lives
+in your Claude account: this rule is the only guard for both, so don't add either for
+this account.
 
 Before anything is pushed, prove the destination is private:
 
@@ -174,14 +196,26 @@ resolved and then splits its findings two ways:
 - **`FAIL:` — leak conditions block start.** Loose perms or a git-tracked secret (as
   before), plus: a real `.env` under `deploy/env/`, personal hub content inside the
   checkout's `hubs/`, a hub path inside or containing the checkout, a hub deploy key
-  that is not 0600 or is tracked, and a credential helper configured for the **public**
-  origin. Personal content in `hubs/` is cleared by `make hub-init` — which **resumes**
+  that is not 0600 or is tracked, a credential helper configured for the **public**
+  origin, and any other GitHub account credential (see "No GitHub account credential"
+  above): a remote URL with a token in it, pushes to origin redirected by
+  `remote.origin.pushurl` or a `url.<base>.insteadOf`/`pushInsteadOf` rewrite,
+  an `http.extraHeader` carrying an Authorization header for GitHub,
+  `core.askPass` or `GIT_ASKPASS`, a `~/.netrc` entry or a `gh` login for GitHub or the
+  origin's host, or `GH_TOKEN`/`GITHUB_TOKEN`/`GITHUB_PERSONAL_ACCESS_TOKEN` in the
+  service environment. Each names the kind of credential and never prints it. The
+  environment checked is the preflight's own: the unit's `Environment=` and
+  `EnvironmentFile=` under systemd, your shell under `make doctor`.
+
+  Personal content in `hubs/` is cleared by `make hub-init` — which **resumes**
   a migration interrupted half-way, so run it even though the hub repo already exists.
   A check that could not answer (git timed out) is reported as *unverified* and is
   fatal too: on the leak side, "cannot tell" never reads as "clean".
 - **`WARN:` — durability conditions exit 0 and never block start.** A hub store with no
   remote past its grace period, unpushed commits, a dirty hub working tree, a git repo
-  nested above the hub directory. A failed start is retried every minute, so failing on
+  nested above the hub directory, and untracked files in the checkout that
+  `.gitignore` doesn't cover (listed by name: each is one `git add -A` from a commit to
+  the public repo). A failed start is retried every minute, so failing on
   those would turn "knowledge is not backed up" into "the assistant is down until
   someone fixes it".
 
