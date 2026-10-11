@@ -4,7 +4,7 @@ This repository is **public**. It is the system directory: machinery, docs, and
 scaffolds. Every piece of personal state is an instantiation of a scaffold into a
 location *outside* this checkout. Nothing personal is ever written in here.
 
-This project runs an agent team (see [Agent Team Workflow](https://github.com/rmorison/engineering-standards/blob/89ba17a/process/agent-team-workflow.md)): the operator starts one lead session with that document, and the lead starts each worker with a handoff.
+This project runs an agent team (see [Agent Team Workflow](https://github.com/rmorison/engineering-standards/blob/68724f4/process/agent-team-workflow.md)): the operator starts one lead session with that document, and the lead starts each worker with a handoff.
 
 ## Where hubs live
 
