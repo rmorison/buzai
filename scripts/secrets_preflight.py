@@ -132,7 +132,14 @@ from scripts.hub_init import (  # noqa: E402
     remotes,
     tracked_paths,
 )
-from scripts.hub_paths import ENV_VAR, HubPathError, expand, refusal, source_of  # noqa: E402
+from scripts.hub_paths import (  # noqa: E402
+    ENV_VAR,
+    HubPathError,
+    expand,
+    main_checkout,
+    refusal,
+    source_of,
+)
 from scripts.hub_remote import (  # noqa: E402
     LOCAL_ENV,
     SCP_LIKE,
@@ -317,12 +324,22 @@ def resolve_hub_target(raw: str | None, home: Path, repo_root: Path) -> HubTarge
     The resolver's own entry point raises, which would abort the preflight before the
     secrets and credential checks ran. Here a bad hub path is one finding among several,
     and the resolved path is printed either way so a mismatch is visible in the journal.
+
+    Run from a linked worktree, the main checkout it belongs to is public too, so the
+    hub path is refused inside either one. A main checkout that can't be found is a
+    refusal of its own, fatal like the rest: "could not rule it out" is not "clean".
     """
     try:
         path = expand(raw, home).resolve()
     except HubPathError as e:
         return HubTarget(None, f"unresolvable ({e})", str(e))
-    return HubTarget(path, f"{path} (from {source_of(raw)})", refusal(path, repo_root.resolve()))
+    description = f"{path} (from {source_of(raw)})"
+    root = repo_root.resolve()
+    try:
+        main_root = main_checkout(root)
+    except HubPathError as e:
+        return HubTarget(path, description, str(e))
+    return HubTarget(path, description, refusal(path, root, main_root))
 
 
 def fatal_problems(

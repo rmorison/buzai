@@ -499,6 +499,41 @@ class TestResolveHubTarget(unittest.TestCase):
 # --- FATAL: the hub push credential (R15) ------------------------------------------
 
 
+class TestHubTargetFromAWorktree(unittest.TestCase):
+    """PLANT: the preflight run from a linked worktree, hub path inside the main checkout.
+
+    The main checkout is a clone of the public repo too, so a hub there is the same leak
+    as one inside the worktree (#22 added the check to `hub_paths`; #29 D7 wires it here).
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+        self.main = make_repo(self.root / "main")
+        (self.main / "README.md").write_text("# main\n")
+        commit_all(self.main)
+        self.worktree = self.root / "wt"
+        git("-C", str(self.main), "worktree", "add", "-q", "-b", "wt", str(self.worktree))
+
+    def target(self, raw: str) -> HubTarget:
+        return resolve_hub_target(raw, self.root / "home", self.worktree)
+
+    def test_a_hub_inside_the_main_checkout_is_fatal(self):
+        target = self.target(str(self.main / "hubs"))
+        self.assertIsNotNone(target.problem)
+        self.assertIn("inside the main checkout", target.problem)
+
+    def test_a_hub_outside_both_is_fine(self):
+        self.assertIsNone(self.target(str(self.root / "hubs")).problem)
+
+    def test_a_main_checkout_that_cannot_be_found_is_fatal_not_clean(self):
+        (self.worktree / ".git").write_text("gitdir: /nonexistent/worktrees/wt\n")
+        target = self.target(str(self.root / "hubs"))
+        self.assertIsNotNone(target.problem)
+        self.assertIn("could not be ruled out", target.problem)
+
+
 class TestHubCredential(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
