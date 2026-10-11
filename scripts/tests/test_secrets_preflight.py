@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import secrets
 import subprocess
 import tempfile
 import time
@@ -11,6 +12,7 @@ from pathlib import Path
 
 from scripts.hub_commit import Backlog
 from scripts.hub_init import initialize
+from scripts.hub_remote import GitResult
 from scripts.hub_remote import default_git_runner as real_git
 from scripts.secrets_preflight import (
     REMOTE_GRACE_SECONDS,
@@ -19,6 +21,7 @@ from scripts.secrets_preflight import (
     HubTarget,
     _git_tracked,
     _repo_secret_candidates,
+    account_credential_violations,
     assess,
     backlog_warning,
     credential_warning,
@@ -1369,6 +1372,350 @@ class TestAnUnexpectedDurabilityFailureDegradesToAWarning(AssessCompositionCase)
         findings = self.findings(is_tracked=lambda p: "git could not say")
         self.assertTrue(findings.blocks_start)
         self.assertTrue(any("unverified rather than clean" in f for f in findings.fatal))
+
+
+# --- FATAL: GitHub account credentials beyond a helper (#29) -----------------------
+#
+# Each test plants ONE route by which a deployment could publish to GitHub without a
+# credential helper, and asserts the finding names the kind of credential and never its
+# value. Canary values are invented and assembled at run time, so no fixture holds a
+# token-shaped literal and a leak of the canary into any message is caught.
+
+CANARY = "canary" + secrets.token_hex(8)
+
+
+def token_url(host: str = "example.invalid", path: str = "b.git") -> str:
+    return f"https://someone:{CANARY}@{host}/{path}"
+
+
+class AccountCredentialCase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+        self.repo = make_repo(self.root / "checkout")
+        git("-C", str(self.repo), "remote", "add", "origin", "https://example.invalid/b.git")
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.environ: dict[str, str] = {}
+
+    def config(self, *args: str) -> None:
+        git("-C", str(self.repo), "config", *args)
+
+    def violations(self, runner=real_git) -> list[str]:
+        return account_credential_violations(
+            self.repo, runner, home=self.home, environ=self.environ
+        )
+
+    def assert_findings(self, count: int, *needles: str) -> list[str]:
+        found = self.violations()
+        self.assertEqual(len(found), count, found)
+        for needle in needles:
+            self.assertTrue(any(needle in f for f in found), (needle, found))
+        for f in found:
+            self.assertNotIn(CANARY, f)
+        return found
+
+
+class TestGitCredentialRoutes(AccountCredentialCase):
+    def test_a_clean_https_origin_has_no_finding(self):
+        self.assertEqual(self.violations(), [])
+
+    def test_a_token_in_the_origin_url_is_one_finding_without_the_token(self):
+        git("-C", str(self.repo), "remote", "set-url", "origin", token_url())
+        self.assert_findings(1, "remote.origin.url embeds a credential")
+
+    def test_a_pushurl_to_another_url_is_a_redirect(self):
+        self.config("remote.origin.pushurl", "ssh://git@other.invalid/b.git")
+        found = self.assert_findings(1, "redirected", "remote.origin.pushurl")
+        self.assertNotIn("other.invalid", found[0])
+
+    def test_a_pushurl_with_a_token_is_both_findings(self):
+        self.config("remote.origin.pushurl", token_url())
+        self.assert_findings(2, "remote.origin.pushurl embeds a credential", "redirected")
+
+    def test_a_push_insteadof_rewrite_names_its_shape_not_its_base(self):
+        self.config("url.ssh://git@other.invalid/.pushInsteadOf", "https://example.invalid/")
+        found = self.assert_findings(1, "a url.<base>.pushInsteadOf rewrite")
+        self.assertNotIn("other.invalid", found[0])
+
+    def test_a_plain_insteadof_rewrite_redirects_pushes_too(self):
+        self.config("url.ssh://git@other.invalid/.insteadOf", "https://example.invalid/")
+        self.assert_findings(1, "a url.<base>.insteadOf rewrite")
+
+    def test_a_rewrite_that_injects_a_token_is_reported_without_it(self):
+        self.config(
+            f"url.https://someone:{CANARY}@example.invalid/.pushInsteadOf",
+            "https://example.invalid/",
+        )
+        self.assert_findings(2, "effective push URL embeds a credential", "redirected")
+
+    def test_a_rewrite_for_an_unrelated_host_is_not_a_finding(self):
+        self.config("url.ssh://git@other.invalid/.pushInsteadOf", "https://unrelated.invalid/")
+        self.assertEqual(self.violations(), [])
+
+    def test_a_pushurl_equal_to_the_url_is_not_a_finding(self):
+        self.config("remote.origin.pushurl", "https://example.invalid/b.git")
+        self.assertEqual(self.violations(), [])
+
+    def test_the_no_push_hardening_idiom_is_not_a_finding(self):
+        self.config("remote.origin.pushurl", "no_push")
+        self.assertEqual(self.violations(), [])
+
+    def test_a_token_in_a_second_remote_is_a_finding(self):
+        git("-C", str(self.repo), "remote", "add", "fork", token_url(path="f.git"))
+        self.assert_findings(1, "remote.fork.url embeds a credential")
+
+    def test_core_askpass_is_a_finding_without_its_value(self):
+        self.config("core.askPass", f"/opt/{CANARY}-askpass")
+        self.assert_findings(1, "core.askPass is configured")
+
+    def test_no_origin_has_nothing_to_redirect(self):
+        git("-C", str(self.repo), "remote", "remove", "origin")
+        self.assertEqual(self.violations(), [])
+
+    def test_a_git_that_cannot_answer_is_unverified_not_clean(self):
+        for result in (
+            GitResult(128, "", "fatal: bad config line 1"),
+            GitResult(124, "", "timed out after 0.3s", timed_out=True),
+        ):
+            with self.subTest(returncode=result.returncode):
+                found = self.violations(runner=lambda args, env, timeout, r=result: r)
+                self.assertTrue(found)
+                self.assertTrue(all("unverified rather than clean" in f for f in found), found)
+
+    def test_a_failing_origin_read_alone_is_still_unverified(self):
+        def runner(args, env, timeout):
+            if "remote.origin.url" in args:
+                return GitResult(128, "", "fatal: cannot read config")
+            return real_git(args, env, timeout)
+
+        found = self.violations(runner=runner)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("where pushes to origin go", found[0])
+
+
+class TestNetrc(AccountCredentialCase):
+    def plant(self, text: str) -> Path:
+        netrc = self.home / ".netrc"
+        netrc.write_text(text)
+        os.chmod(netrc, 0o600)
+        return netrc
+
+    def test_no_netrc_is_clean(self):
+        self.assertEqual(self.violations(), [])
+
+    def test_a_github_machine_entry_is_fatal_without_its_password(self):
+        self.plant(f"machine github.com login someone password {CANARY}\n")
+        self.assert_findings(1, "`machine` entry for github.com")
+
+    def test_the_origin_host_split_across_lines_is_found(self):
+        self.plant(f"machine\nexample.invalid\nlogin someone\npassword {CANARY}\n")
+        self.assert_findings(1, "`machine` entry for example.invalid")
+
+    def test_an_api_subdomain_is_found(self):
+        self.plant(f"machine api.github.com login x password {CANARY}\n")
+        self.assert_findings(1, "api.github.com")
+
+    def test_mixed_case_is_found(self):
+        self.plant(f"machine GitHub.COM login x password {CANARY}\n")
+        self.assert_findings(1, "github.com")
+
+    def test_a_default_entry_is_fatal(self):
+        self.plant(f"default login x password {CANARY}\n")
+        self.assert_findings(1, "`default` entry")
+
+    def test_other_hosts_are_not_findings(self):
+        self.plant(f"machine example.org login x password {CANARY}\nmachine notgithub.com\n")
+        self.assertEqual(self.violations(), [])
+
+    def test_a_password_that_reads_machine_is_not_a_host(self):
+        self.plant("machine example.org login x password machine\n")
+        self.assertEqual(self.violations(), [])
+
+    def test_a_macdef_body_is_skipped(self):
+        self.plant("machine example.org login x\nmacdef init\nmachine github.com\n\n")
+        self.assertEqual(self.violations(), [])
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a 000 file")
+    def test_an_unreadable_netrc_is_unverified(self):
+        os.chmod(self.plant("machine example.org\n"), 0o000)
+        self.assert_findings(1, "unverified rather than clean")
+
+
+class TestGhLogin(AccountCredentialCase):
+    def plant(self, text: str, base: Path | None = None) -> Path:
+        hosts = (base or self.home / ".config" / "gh") / "hosts.yml"
+        hosts.parent.mkdir(parents=True, exist_ok=True)
+        hosts.write_text(text)
+        return hosts
+
+    def logged_in(self, host: str = "github.com") -> str:
+        return f"{host}:\n    oauth_token: {CANARY}\n    user: someone\n    git_protocol: https\n"
+
+    def test_no_hosts_file_is_clean(self):
+        self.assertEqual(self.violations(), [])
+
+    def test_a_github_login_is_fatal_without_its_token(self):
+        self.plant(self.logged_in())
+        self.assert_findings(1, "gh CLI is logged in to github.com", "gh auth logout")
+
+    def test_a_quoted_key_is_found(self):
+        self.plant(self.logged_in('"github.com"'))
+        self.assert_findings(1, "github.com")
+
+    def test_a_nested_key_alone_is_not_a_login(self):
+        self.plant("other.example:\n    github.com: nope\n")
+        self.assertEqual(self.violations(), [])
+
+    def test_gh_config_dir_moves_the_file(self):
+        self.environ["GH_CONFIG_DIR"] = str(self.root / "ghdir")
+        self.plant(self.logged_in(), self.root / "ghdir")
+        self.assert_findings(1, str(self.root / "ghdir"))
+
+    def test_xdg_config_home_moves_the_file(self):
+        self.environ["XDG_CONFIG_HOME"] = str(self.root / "xdg")
+        self.plant(self.logged_in(), self.root / "xdg" / "gh")
+        self.assert_findings(1, str(self.root / "xdg"))
+        self.plant(self.logged_in())  # the default location is no longer read
+        self.assert_findings(1, str(self.root / "xdg"))
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a 000 file")
+    def test_an_unreadable_hosts_file_is_unverified(self):
+        os.chmod(self.plant(self.logged_in()), 0o000)
+        self.assert_findings(1, "unverified rather than clean")
+
+
+class TestTokenEnvironment(AccountCredentialCase):
+    def test_each_token_variable_is_a_finding_by_name_only(self):
+        for var in ("GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN"):
+            with self.subTest(var=var):
+                self.environ.clear()
+                self.environ[var] = CANARY
+                self.assert_findings(1, f"{var} is set")
+
+    def test_two_tokens_are_two_findings(self):
+        self.environ.update(GH_TOKEN=CANARY, GITHUB_TOKEN=CANARY)
+        self.assert_findings(2, "GH_TOKEN", "GITHUB_TOKEN")
+
+    def test_an_empty_token_is_not_a_finding(self):
+        self.environ["GH_TOKEN"] = ""
+        self.assertEqual(self.violations(), [])
+
+    def test_git_askpass_is_a_finding_without_its_value(self):
+        self.environ["GIT_ASKPASS"] = f"/opt/{CANARY}"
+        self.assert_findings(1, "GIT_ASKPASS is set")
+
+    def test_ssh_askpass_is_not_checked(self):
+        self.environ["SSH_ASKPASS"] = "/usr/lib/ssh/x11-ssh-askpass"
+        self.assertEqual(self.violations(), [])
+
+
+class TestAccountCredentialsComposition(AssessCompositionCase):
+    """Each route through `main()` -> `assess()` -> `report()`: fatal, exit 1."""
+
+    def assert_blocks_without_canary(self, needle: str) -> None:
+        self.assert_only_fatal(needle)
+        _, out, err = self.run_main()
+        self.assertNotIn(CANARY, out + err)
+
+    def test_a_token_in_the_origin_url_reaches_the_verdict(self):
+        git("-C", str(self.checkout), "remote", "set-url", "origin", token_url())
+        self.assert_blocks_without_canary("remote.origin.url embeds a credential")
+
+    def test_a_push_redirect_reaches_the_verdict(self):
+        git(
+            "-C",
+            str(self.checkout),
+            "config",
+            "remote.origin.pushurl",
+            "ssh://git@other.invalid/b.git",
+        )
+        self.assert_blocks_without_canary("redirected")
+
+    def test_core_askpass_reaches_the_verdict(self):
+        git("-C", str(self.checkout), "config", "core.askPass", f"/opt/{CANARY}")
+        self.assert_blocks_without_canary("core.askPass")
+
+    def test_a_netrc_entry_reaches_the_verdict(self):
+        (self.home / ".netrc").write_text(f"machine github.com login x password {CANARY}\n")
+        self.assert_blocks_without_canary("`machine` entry for github.com")
+
+    def test_a_gh_login_reaches_the_verdict(self):
+        hosts = self.home / ".config" / "gh" / "hosts.yml"
+        hosts.parent.mkdir(parents=True)
+        hosts.write_text(f"github.com:\n    oauth_token: {CANARY}\n")
+        self.assert_blocks_without_canary("gh CLI is logged in")
+
+    def test_a_token_in_the_environment_reaches_the_verdict(self):
+        self.environ["GH_TOKEN"] = CANARY
+        self.assert_blocks_without_canary("GH_TOKEN is set")
+
+    def test_every_route_at_once_is_reported_and_no_value_is_printed(self):
+        git("-C", str(self.checkout), "remote", "set-url", "origin", token_url())
+        git("-C", str(self.checkout), "config", "remote.origin.pushurl", token_url(path="p.git"))
+        git("-C", str(self.checkout), "remote", "add", "fork", token_url(path="f.git"))
+        git("-C", str(self.checkout), "config", "core.askPass", f"/opt/{CANARY}")
+        (self.home / ".netrc").write_text(f"machine github.com login x password {CANARY}\n")
+        hosts = self.home / ".config" / "gh" / "hosts.yml"
+        hosts.parent.mkdir(parents=True)
+        hosts.write_text(f"github.com:\n    oauth_token: {CANARY}\n")
+        self.environ.update(GH_TOKEN=CANARY, GIT_ASKPASS=f"/opt/{CANARY}")
+        findings = self.findings()
+        # origin url, origin pushurl, fork url, redirect, askPass, netrc, gh, GH_TOKEN,
+        # GIT_ASKPASS
+        self.assertEqual(len(findings.fatal), 9, findings.fatal)
+        code, out, err = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertNotIn(CANARY, out + err)
+
+
+class TestUntrackedFilesWarning(AssessCompositionCase):
+    def test_an_untracked_scratch_file_warns_by_name_and_does_not_block(self):
+        (self.checkout / "scratch-notes.txt").write_text("draft\n")
+        findings = self.findings()
+        self.assertEqual(findings.fatal, ())
+        warns = [w for w in findings.warnings if "untracked file(s)" in w]
+        self.assertEqual(len(warns), 1, findings.warnings)
+        self.assertIn("scratch-notes.txt", warns[0])
+        code, _, err = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("secrets-preflight WARN:", err)
+
+    def test_an_ignored_file_is_not_listed(self):
+        (self.checkout / ".gitignore").write_text("*.log\n")
+        commit_all(self.checkout, "ignore logs")
+        (self.checkout / "run.log").write_text("noise\n")
+        self.assertFalse(any("untracked" in w for w in self.findings().warnings))
+
+    def test_many_files_list_five_and_a_count(self):
+        for i in range(7):
+            (self.checkout / f"stray-{i}.txt").write_text("x\n")
+        warns = [w for w in self.findings().warnings if "untracked" in w]
+        self.assertEqual(len(warns), 1, warns)
+        self.assertIn("7 untracked file(s)", warns[0])
+        self.assertIn("and 2 more", warns[0])
+        self.assertNotIn("stray-6.txt", warns[0])
+
+    def test_a_listing_failure_warns_and_does_not_block(self):
+        def runner(args, env, timeout):
+            if "--others" in args:
+                return GitResult(128, "", "fatal: index file corrupt")
+            return real_git(args, env, timeout)
+
+        code, out, err = self.run_main(runner=runner)
+        self.assertEqual(code, 0, err)
+        self.assertIn("cannot list untracked files", err)
+
+    def test_a_listing_that_raises_still_does_not_block(self):
+        def runner(args, env, timeout):
+            if "--others" in args:
+                raise RuntimeError("the lister blew up")
+            return real_git(args, env, timeout)
+
+        code, _, err = self.run_main(runner=runner)
+        self.assertEqual(code, 0, err)
+        self.assertIn("RuntimeError", err)
 
 
 if __name__ == "__main__":
