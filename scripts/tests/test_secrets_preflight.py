@@ -30,6 +30,7 @@ from scripts.secrets_preflight import (
     enclosing_repo,
     env_file_problems,
     extra_header_problems,
+    header_scope_match,
     fatal_problems,
     hub_checkout_problems,
     hub_content_problems,
@@ -1605,6 +1606,25 @@ class TestGitCredentialRoutes(AccountCredentialCase):
         )
         found = self.assert_findings(1, "http.<url>.extraHeader")
         self.assertNotIn("an http.extraHeader entry", found[0])
+
+    def test_a_whitespace_value_is_a_header_not_a_reset(self):
+        found = extra_header_problems(
+            [("http.extraheader", f"Authorization: basic {CANARY}"), ("http.extraheader", " ")],
+            None,
+            self.repo,
+        )
+        self.assertEqual(len(found), 1, found)
+
+    def test_ports_match_the_way_git_matches_them(self):
+        self.assertIsNone(header_scope_match("https://github.com/", "https://github.com:8443/o"))
+        self.assertIsNotNone(header_scope_match("https://github.com:443/", "https://github.com/o"))
+        self.assertIsNotNone(header_scope_match("https://github.com/", "https://github.com/o"))
+
+    def test_a_malformed_origin_url_does_not_crash_the_header_check(self):
+        found = extra_header_problems(
+            [("http.extraheader", "X-Trace: on")], None, self.repo, ["https://[::1/x"]
+        )
+        self.assertEqual(found, [])
 
     def test_an_extraheader_for_another_service_or_not_auth_is_clean(self):
         self.config("http.https://registry.example.org/.extraheader", f"Authorization: x {CANARY}")

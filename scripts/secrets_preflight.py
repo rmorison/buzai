@@ -500,7 +500,9 @@ def header_scope_match(scope: str, url: str) -> tuple[int, int, int] | None:
     want_host, have_host = (want.hostname or ""), (have.hostname or "")
     if not want_host or not _label_match(want_host, have_host):
         return None
-    if want_port is not None and want_port != have_port:
+    defaults = {"http": 80, "https": 443}
+    scheme = have.scheme.lower()
+    if (want_port or defaults.get(scheme)) != (have_port or defaults.get(scheme)):
         return None
     if want.username and want.username != have.username:
         return None
@@ -528,7 +530,7 @@ def headers_sent(entries: Sequence[tuple[str, str]], url: str) -> list[tuple[str
         if rank is None or (best is not None and rank < best):
             continue
         best = rank
-        if not value.strip():
+        if value == "":  # only an exactly empty value resets; git sends " " as a header
             sent.clear()
         else:
             sent.append((scope, value))
@@ -559,7 +561,13 @@ def extra_header_problems(
         for key, value in entries
         if key.lower().startswith("http.") and key.lower().endswith(".extraheader")
     ]
-    targets = [u for u in origin_urls if urlsplit(u).scheme.lower() in ("http", "https")]
+    targets = []
+    for url in origin_urls:
+        try:
+            if urlsplit(url).scheme.lower() in ("http", "https"):
+                targets.append(url)
+        except ValueError:
+            continue  # not a URL git could send a header to
     for key, _ in keyed:
         scope = key[len("http.") : -len(".extraheader")]
         host = url_host(scope) if scope else None
