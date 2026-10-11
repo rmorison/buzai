@@ -253,8 +253,14 @@ class TestMainCheckout(ScratchRepoTestCase):
         link = self.root / "main-link"
         link.symlink_to(self.main)
         listing = f"worktree {link}\nHEAD 0\nbranch refs/heads/main\n\n"
-        answer = subprocess.CompletedProcess([], 0, stdout=listing, stderr="")
-        with mock.patch("scripts.hub_paths.subprocess.run", return_value=answer):
+        real_run = subprocess.run
+
+        def run(cmd, *args, **kwargs):
+            if "worktree" in cmd and "list" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout=listing, stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with mock.patch("scripts.hub_paths.subprocess.run", side_effect=run):
             self.assertEqual(main_checkout(wt), self.main)
 
     def test_separate_git_dir_main_is_refused(self):
@@ -268,9 +274,66 @@ class TestMainCheckout(ScratchRepoTestCase):
         self.git("commit", "-q", "-m", "scratch", cwd=sep)
         wt = sep / ".claude" / "worktrees" / "w"
         self.git("worktree", "add", "-q", "-b", "w", str(wt), cwd=sep)
+        # Refused whichever way git answers: on 2.34 the lookup can't be checked, and
+        # a git that names the real tree refuses it as inside the main checkout.
         with self.assertRaises(HubPathError) as ctx:
             resolve(str(sep / "hubs" / "x"), self.home, wt)
-        self.assertIn("as the main working tree, but it has no .git", str(ctx.exception))
+        self.assertRegex(str(ctx.exception), r"could not be found|inside the main checkout")
+
+    def test_stray_dot_git_inside_a_separate_git_dir_does_not_pass(self):
+        # git names the git dir; a `.git` entry that merely exists there must not make
+        # it count as the main working tree.
+        sep = self.root / "sep"
+        sep.mkdir()
+        sep_git = self.root / "sep.git"
+        self.git("init", "-q", "--separate-git-dir", str(sep_git), cwd=sep)
+        (sep / "README").write_text("scratch\n")
+        self.git("add", "README", cwd=sep)
+        self.git("commit", "-q", "-m", "scratch", cwd=sep)
+        (sep_git / ".git").mkdir()
+        wt = sep / ".claude" / "worktrees" / "w"
+        self.git("worktree", "add", "-q", "-b", "w", str(wt), cwd=sep)
+        with self.assertRaises(HubPathError):
+            resolve(str(sep / "hubs" / "x"), self.home, wt)
+
+    def test_core_worktree_names_the_main_checkout(self):
+        # The git dir sits at store/.git, the tree elsewhere: git lists `store`, and
+        # only core.worktree knows the real tree.
+        store = self.root / "store"
+        tree = self.root / "tree"
+        store.mkdir()
+        tree.mkdir()
+        self.git("init", "-q", cwd=store)
+        self.git("config", "core.worktree", str(tree), cwd=store)
+        (tree / "README").write_text("scratch\n")
+        self.git("add", "README", cwd=store)
+        self.git("commit", "-q", "-m", "scratch", cwd=store)
+        wt = tree / ".claude" / "worktrees" / "w"
+        self.git("worktree", "add", "-q", "-b", "w", str(wt), cwd=store)
+        self.assertEqual(main_checkout(wt), tree)
+        with self.assertRaises(HubPathError) as ctx:
+            resolve(str(tree / "hubs" / "x"), self.home, wt)
+        self.assertIn(f"inside the main checkout ({tree})", str(ctx.exception))
+
+    def test_worktree_of_a_submodule_finds_the_submodule_checkout(self):
+        sup = self.root / "sup"
+        sup.mkdir()
+        self.git("init", "-q", cwd=sup)
+        self.git(
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            str(self.main),
+            "sub",
+            cwd=sup,
+        )
+        sub = sup / "sub"
+        wt = sub / ".claude" / "worktrees" / "w"
+        self.git("worktree", "add", "-q", "-b", "w", str(wt), cwd=sub)
+        self.assertEqual(main_checkout(wt), sub)
+        self.assertEqual(resolve(None, self.home, wt).path, self.home / "hubs")
 
     def test_bare_main_repository_is_none(self):
         bare = self.root / "bare.git"

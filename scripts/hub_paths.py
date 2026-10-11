@@ -150,6 +150,25 @@ def _scrubbed_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
 
 
+def _points_back(tree: Path, common_dir: Path) -> bool:
+    """True when `tree/.git` leads to `common_dir`: the tree really is that repo's.
+
+    `.git` is either the git dir itself or a file reading `gitdir: <path>`, relative to
+    the tree when not absolute. Anything else (missing, unreadable) is False.
+    """
+    marker = tree / ".git"
+    try:
+        if marker.is_dir():
+            return marker.resolve() == common_dir
+        if marker.is_file():
+            first = marker.read_text().splitlines()[0]
+            if first.startswith("gitdir: "):
+                return (tree / first[len("gitdir: ") :].strip()).resolve() == common_dir
+    except (OSError, IndexError, UnicodeDecodeError):
+        pass
+    return False
+
+
 def main_checkout(repo_root: Path) -> Path | None:
     """The main checkout `repo_root` is a linked worktree of, or None. Raises `HubPathError`.
 
@@ -157,12 +176,18 @@ def main_checkout(repo_root: Path) -> Path | None:
     (a normal clone — no git command runs), there is no `.git` at all, the main
     repository is bare, or the main checkout is `repo_root` itself.
 
-    When `.git` is a file, `git worktree list --porcelain` answers: its first record is
-    the main working tree, and carries a `bare` line when there is none. Asking git
-    avoids hand-parsing `.git` and `commondir`. Any failure to get that answer is a
-    refusal: from a worktree, an unchecked main checkout is the very leak this module
-    exists to stop. That includes an answer that names no working tree, as git does
-    for a main repository made with `--separate-git-dir`. The returned path is
+    When `.git` is a file, git answers. `git worktree list --porcelain` names the main
+    working tree in its first record, or marks it `bare` when there is none. But git
+    2.34 builds that name from the shared git dir, so it is only trusted when checked:
+
+      * if the shared git dir sets `core.worktree` (submodules do, and so does a repo
+        whose tree was moved away from its git dir), that is the main working tree;
+      * otherwise the named tree counts only if its `.git` leads back to the shared
+        git dir. A repo made with `--separate-git-dir` fails this, since git names the
+        git dir, which keeps no pointer to the tree.
+
+    Any failure to get a checked answer is a refusal: from a worktree, an unchecked
+    main checkout is the very leak this module exists to stop. The returned path is
     symlink-resolved.
     """
     marker = repo_root / ".git"
@@ -176,40 +201,49 @@ def main_checkout(repo_root: Path) -> Path | None:
             f"could not be ruled out"
         )
 
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
-            capture_output=True,
-            text=True,
-            env=_scrubbed_env(),
-            timeout=GIT_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except FileNotFoundError:
-        raise fail("git is not installed or not on PATH") from None
-    except subprocess.TimeoutExpired:
-        raise fail(f"git did not answer within {GIT_TIMEOUT_SECONDS}s") from None
-    except OSError as e:
-        raise fail(f"git could not be run: {e}") from None
-    if result.returncode != 0:
-        detail = (result.stderr.strip().splitlines() or ["no output"])[0]
-        raise fail(f"git worktree list exited {result.returncode}: {detail}")
+    def git(*args: str, ok: tuple[int, ...] = (0,)) -> tuple[int, str]:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_root), *args],
+                capture_output=True,
+                text=True,
+                env=_scrubbed_env(),
+                timeout=GIT_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except FileNotFoundError:
+            raise fail("git is not installed or not on PATH") from None
+        except subprocess.TimeoutExpired:
+            raise fail(f"git did not answer within {GIT_TIMEOUT_SECONDS}s") from None
+        except OSError as e:
+            raise fail(f"git could not be run: {e}") from None
+        if result.returncode not in ok:
+            detail = (result.stderr.strip().splitlines() or ["no output"])[0]
+            raise fail(f"git {args[0]} {args[1]} exited {result.returncode}: {detail}")
+        return result.returncode, result.stdout
 
-    first_record = result.stdout.split("\n\n", 1)[0].splitlines()
+    _, listing = git("worktree", "list", "--porcelain")
+    first_record = listing.split("\n\n", 1)[0].splitlines()
     if not first_record or not first_record[0].startswith("worktree "):
         raise fail("git worktree list printed no worktree record")
     if "bare" in first_record[1:]:
         return None
-    main = Path(first_record[0][len("worktree ") :]).resolve()
-    if main == repo_root.resolve():
-        return None
-    if not (main / ".git").exists():
-        # A main repository made with `--separate-git-dir` is listed by its git dir,
-        # not its working tree, and keeps no pointer back to the tree. The same holds
-        # for a main checkout that has since been deleted. Either way the checkout to
-        # protect is unknown.
-        raise fail(f"git names {main} as the main working tree, but it has no .git")
-    return main
+
+    _, common = git("rev-parse", "--git-common-dir")
+    common_dir = (repo_root / common.strip()).resolve()
+    rc, configured = git(
+        "config", "--file", str(common_dir / "config"), "--get", "core.worktree", ok=(0, 1)
+    )
+    if rc == 0 and configured.strip():
+        main = (common_dir / configured.strip()).resolve()
+    else:
+        main = Path(first_record[0][len("worktree ") :]).resolve()
+        if not _points_back(main, common_dir):
+            raise fail(
+                f"git names {main} as the main working tree, but its .git does not "
+                f"lead back to the repository's git dir {common_dir}"
+            )
+    return None if main == repo_root.resolve() else main
 
 
 def resolve(raw: str | None, home: Path, repo_root: Path) -> HubLocation:
