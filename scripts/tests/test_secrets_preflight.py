@@ -1470,6 +1470,37 @@ class TestGitCredentialRoutes(AccountCredentialCase):
         self.config("core.askPass", f"/opt/{CANARY}-askpass")
         self.assert_findings(1, "core.askPass is configured")
 
+    def test_an_scp_like_or_ssh_origin_is_clean(self):
+        # a false fatal is an outage: the public origin may be written either way
+        for url in ("git@github.com:owner/buzai.git", "ssh://git@github.com/owner/buzai.git"):
+            with self.subTest(url=url):
+                git("-C", str(self.repo), "remote", "set-url", "origin", url)
+                self.assertEqual(self.violations(), [])
+
+    def test_a_git_plus_ssh_pushurl_is_a_redirect(self):
+        for url in ("git+ssh://git@other.invalid/b.git", "ssh+git://git@other.invalid/b.git"):
+            with self.subTest(url=url):
+                self.config("remote.origin.pushurl", url)
+                self.assert_findings(1, "redirected")
+
+    def test_an_authorization_extraheader_for_github_is_fatal_without_its_value(self):
+        self.config("http.https://github.com/.extraheader", f"AUTHORIZATION: basic {CANARY}")
+        found = self.assert_findings(1, "http.<url>.extraHeader", "Authorization header")
+        self.assertNotIn("https://github.com/", found[0])
+
+    def test_an_unscoped_authorization_extraheader_is_fatal(self):
+        self.config("http.extraheader", f"Authorization: bearer {CANARY}")
+        self.assert_findings(1, "an http.extraHeader entry")
+
+    def test_an_authorization_extraheader_for_the_origin_host_is_fatal(self):
+        self.config("http.https://example.invalid/.extraheader", f"Authorization: x {CANARY}")
+        self.assert_findings(1, "http.<url>.extraHeader")
+
+    def test_an_extraheader_for_another_service_or_not_auth_is_clean(self):
+        self.config("http.https://registry.example.org/.extraheader", f"Authorization: x {CANARY}")
+        self.config("http.extraheader", "X-Trace: on")
+        self.assertEqual(self.violations(), [])
+
     def test_no_origin_has_nothing_to_redirect(self):
         git("-C", str(self.repo), "remote", "remove", "origin")
         self.assertEqual(self.violations(), [])
@@ -1533,6 +1564,10 @@ class TestNetrc(AccountCredentialCase):
         self.plant("machine example.org login x password machine\n")
         self.assertEqual(self.violations(), [])
 
+    def test_a_default_entry_sharing_a_line_is_fatal(self):
+        self.plant(f"machine example.org login x default login y password {CANARY}\n")
+        self.assert_findings(1, "`default` entry")
+
     def test_a_macdef_body_is_skipped(self):
         self.plant("machine example.org login x\nmacdef init\nmachine github.com\n\n")
         self.assertEqual(self.violations(), [])
@@ -1583,6 +1618,13 @@ class TestGhLogin(AccountCredentialCase):
     @unittest.skipIf(os.geteuid() == 0, "root reads a 000 file")
     def test_an_unreadable_hosts_file_is_unverified(self):
         os.chmod(self.plant(self.logged_in()), 0o000)
+        self.assert_findings(1, "unverified rather than clean")
+
+    @unittest.skipIf(os.geteuid() == 0, "root searches a 000 directory")
+    def test_an_unsearchable_config_dir_is_unverified_not_a_crash(self):
+        hosts = self.plant(self.logged_in())
+        os.chmod(hosts.parent, 0o000)
+        self.addCleanup(os.chmod, hosts.parent, 0o755)
         self.assert_findings(1, "unverified rather than clean")
 
 
@@ -1696,6 +1738,18 @@ class TestUntrackedFilesWarning(AssessCompositionCase):
         self.assertIn("7 untracked file(s)", warns[0])
         self.assertIn("and 2 more", warns[0])
         self.assertNotIn("stray-6.txt", warns[0])
+
+    def test_an_untracked_directory_is_one_entry(self):
+        scratch = self.checkout / "scratch"
+        scratch.mkdir()
+        for i in range(3):
+            (scratch / f"part-{i}.txt").write_text("x\n")
+        (self.checkout / "empty-dir").mkdir()
+        warns = [w for w in self.findings().warnings if "untracked" in w]
+        self.assertEqual(len(warns), 1, warns)
+        self.assertIn("1 untracked file(s)", warns[0])
+        self.assertIn("scratch/", warns[0])
+        self.assertNotIn("empty-dir", warns[0])
 
     def test_a_listing_failure_warns_and_does_not_block(self):
         def runner(args, env, timeout):

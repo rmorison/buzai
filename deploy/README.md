@@ -200,11 +200,14 @@ resolved and then splits its findings two ways:
   origin, and any other GitHub account credential (see "No GitHub account credential"
   above): a remote URL with a token in it, pushes to origin redirected by
   `remote.origin.pushurl` or a `url.<base>.insteadOf`/`pushInsteadOf` rewrite,
+  an `http.extraHeader` carrying an Authorization header for GitHub,
   `core.askPass` or `GIT_ASKPASS`, a `~/.netrc` entry or a `gh` login for GitHub or the
   origin's host, or `GH_TOKEN`/`GITHUB_TOKEN`/`GITHUB_PERSONAL_ACCESS_TOKEN` in the
   service environment. Each names the kind of credential and never prints it. The
   environment checked is the preflight's own: the unit's `Environment=` and
-  `EnvironmentFile=` under systemd, your shell under `make doctor`. Personal content in `hubs/` is cleared by `make hub-init` — which **resumes**
+  `EnvironmentFile=` under systemd, your shell under `make doctor`.
+
+  Personal content in `hubs/` is cleared by `make hub-init` — which **resumes**
   a migration interrupted half-way, so run it even though the hub repo already exists.
   A check that could not answer (git timed out) is reported as *unverified* and is
   fatal too: on the leak side, "cannot tell" never reads as "clean".

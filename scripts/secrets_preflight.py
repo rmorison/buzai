@@ -23,7 +23,8 @@ running:
   * the hub push credential is not 0600, or is tracked by *any* git repo (R15);
   * a credential helper is configured for the **public** origin (R4/R3);
   * any other GitHub account credential (#29): a remote URL with a token in it, pushes
-    to origin redirected by `pushurl` or a URL rewrite, `core.askPass` or `GIT_ASKPASS`,
+    to origin redirected by `pushurl` or a URL rewrite, an `http.extraHeader` carrying
+    an Authorization header for GitHub, `core.askPass` or `GIT_ASKPASS`,
     a `~/.netrc` entry or a `gh` login for GitHub or the origin's host, or `GH_TOKEN`,
     `GITHUB_TOKEN` or `GITHUB_PERSONAL_ACCESS_TOKEN` in the service environment.
 
@@ -135,7 +136,6 @@ from scripts.hub_paths import ENV_VAR, HubPathError, expand, refusal, source_of 
 from scripts.hub_remote import (  # noqa: E402
     LOCAL_ENV,
     SCP_LIKE,
-    TRANSPORT_SCHEMES,
     GitResult,
     GitRunner,
     config_url,
@@ -389,10 +389,13 @@ def is_network_url(url: str) -> bool:
     """Whether git would reach another machine with this push URL. Pure.
 
     A push URL that names no network transport (the `no_push` hardening idiom, a local
-    path, `file://`) can't publish anything, so a redirect to it is not a finding.
+    path, `file://`) can't publish anything, so a redirect to it is not a finding. Any
+    other scheme counts as network, not only git's named transports: git also accepts
+    `git+ssh://` and `ssh+git://`, and a `<helper>://` URL hands the push to a remote
+    helper. On a leak check an unknown scheme fails closed.
     """
     scheme = urlsplit(url).scheme.lower()
-    if scheme in TRANSPORT_SCHEMES:
+    if scheme:
         return scheme != "file"
     return bool(SCP_LIKE.match(url.strip()))
 
@@ -440,6 +443,42 @@ def remote_url_problems(entries: Iterable[tuple[str, str]], repo_root: Path) -> 
             f"the token would also reach the journal; set the URL again without it "
             f"(`git -C {repo_root} remote set-url {name} <url without user:token@>`) and "
             f"revoke the token"
+        )
+    return found
+
+
+def extra_header_problems(
+    entries: Iterable[tuple[str, str]], origin_host: str | None, repo_root: Path
+) -> list[str]:
+    """`http.extraHeader` entries that send an Authorization header to GitHub. Pure.
+
+    git sends `http.<url>.extraHeader` with every request to a matching URL, and an
+    `Authorization:` header there is a push credential with no helper configured. It is
+    the shape `actions/checkout` persists into a clone, so a checkout copied from CI
+    carries it. Only an Authorization header counts, and only one scoped to every URL or
+    to a GitHub host or the origin's host: a header for another service is not a GitHub
+    credential, and a false fatal is an outage. The key's URL and the value are never
+    printed.
+    """
+    found = []
+    for key, value in entries:
+        lowered = key.lower()
+        if not lowered.endswith(".extraheader") or not lowered.startswith("http."):
+            continue
+        if value.split(":", 1)[0].strip().lower() != "authorization":
+            continue
+        scoped = key[len("http.") : -len(".extraheader")]
+        host = url_host(scoped) if scoped else None
+        if scoped and (host is None or not is_github_host(host, origin_host)):
+            continue
+        shape = "http.<url>.extraHeader" if scoped else "http.extraHeader"
+        if any(shape in f for f in found):
+            continue
+        found.append(
+            f"an {shape} entry sends an Authorization header to GitHub — git adds it to "
+            f"every push with no credential helper configured; remove it (find it with "
+            f"`git -C {repo_root} config --show-origin --name-only --get-regexp "
+            f"'^http\\..*extraheader$'`) and revoke the token"
         )
     return found
 
@@ -1075,6 +1114,12 @@ def git_credential_routes(
     elif got.returncode not in (0, 1):
         found.append(_unverified("where pushes to origin go", got))
 
+    headers = git("config", "-z", "--get-regexp", r"^http\.(.*\.)?extraheader$")
+    if headers.returncode == 0:
+        found += extra_header_problems(_config_pairs(headers.stdout), origin_host, repo_root)
+    elif headers.returncode != 1:
+        found.append(_unverified("whether an http.extraHeader carries a credential", headers))
+
     askpass = git("config", "--get", "core.askPass")
     if askpass.returncode == 0 and askpass.stdout.strip():
         found.append(askpass_problem(repo_root))
@@ -1094,11 +1139,12 @@ def gh_hosts_path(home: Path, environ: Mapping[str, str]) -> Path:
 
 def _read_optional(path: Path) -> tuple[str | None, str | None]:
     """(text, error). Absent is (None, None): no file there is nothing to find."""
-    if not path.exists():
-        return None, None
     try:
         return path.read_text(errors="replace"), None
+    except (FileNotFoundError, NotADirectoryError):
+        return None, None
     except OSError as e:
+        # Includes a directory on the way that can't be searched: unverified, not a crash.
         return None, e.strerror or type(e).__name__
 
 

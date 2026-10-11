@@ -116,6 +116,9 @@ held, since it has been on the box:
   (`git -C ~/buzai-assistant config --unset-all remote.origin.pushurl`), or the
   `url.<base>.insteadOf`/`pushInsteadOf` rule that rewrites the origin URL; list them with
   `git -C ~/buzai-assistant config --show-origin --get-regexp '^url\.'`.
+- **an `http.extraHeader` sends an Authorization header** (the setting `actions/checkout`
+  leaves in a clone) — find it with `git -C ~/buzai-assistant config --show-origin
+  --name-only --get-regexp '^http\..*extraheader$'` and unset it.
 - **`core.askPass` / `GIT_ASKPASS`** — unset it in the git config it came from, or remove
   the variable from the unit.
 - **`~/.netrc` entry** — remove the `machine` (or `default`) entry it names.
