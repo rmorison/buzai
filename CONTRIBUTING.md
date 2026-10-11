@@ -69,20 +69,24 @@ list, which lives outside every repository and never reaches CI.
 - **A pull request from an outside contributor:** the maintainer runs it. Those
   commits never passed through a value list.
 - **Commits pushed from a maintainer's own machine** already passed the pre-push
-  check that `make dev` installs, so for those this run is a backstop.
+  check that `make dev` installs, on a machine with the hooks installed and a list
+  declared. For those this run is a backstop.
 
 **How.** Run it from the default branch's own checkout, never the pull request's.
 The pull request can edit the gate script and its committed rules, so the branch
-under review must not supply its own rules. With `main` up to date, and `<N>` the
-pull request number:
+under review must not supply its own rules. With `<N>` the pull request number:
 
 ```bash
+git switch main
+git pull --ff-only
 git fetch origin pull/<N>/head:refs/leakgate/pr-<N>
 sh scripts/leak-gate.sh range origin/main..refs/leakgate/pr-<N>
 ```
 
 It exits 0 when clean and 1 on a finding, which it reports by the list's line
-number, never the value. It exits 2 on a usage, list or gitleaks error. Delete the
+number, never the value. It exits 2 on a usage, list or gitleaks error. Read the
+output as well as the exit code: if it says value rules were skipped, the run
+checked only the committed rules and is not a pre-merge check. Delete the
 ref afterwards with `git update-ref -d refs/leakgate/pr-<N>`.
 
 **Setup it assumes.**
@@ -94,8 +98,8 @@ ref afterwards with `git update-ref -d refs/leakgate/pr-<N>`.
   git config --global leakgate.values ~/.config/leakgate/values
   ```
 
-  Without a declaration the run checks only the committed rules and prints a line
-  saying so: that is not a pre-merge check. The list's format and the rule
+  With no declaration, or a clone that opts out with `leakgate.values none`, the
+  run skips the value rules and says so. The list's format and the rule
   categories are in `docs/dev/PUBLIC-SEED.md`. Never write a value into this
   repository, an issue or a pull request.
 - gitleaks is installed by `make dev`, as in "Before you open a PR".
