@@ -473,45 +473,111 @@ def remote_url_problems(entries: Iterable[tuple[str, str]], repo_root: Path) -> 
     return found
 
 
+def _label_match(pattern: str, host: str) -> bool:
+    """git's urlmatch host rule: same number of labels, each equal or `*`."""
+    pat, got = pattern.split("."), host.split(".")
+    return len(pat) == len(got) and all(p in ("*", g) for p, g in zip(pat, got, strict=True))
+
+
+def header_scope_match(scope: str, url: str) -> tuple[int, int, int] | None:
+    """How specifically an `http.<scope>.*` key matches `url`, or None. Pure.
+
+    Follows git's urlmatch closely enough to order entries: scheme, host (per label,
+    `*` allowed) and port must match, the scope's user (if any) must be the URL's, and
+    the scope's path must be a prefix of the URL's at a `/` boundary. The tuple orders
+    like git's own comparison: host characters matched, then path length, then whether
+    a user was named. An unscoped key matches every URL with the lowest specificity.
+    """
+    if not scope:
+        return (0, 0, 0)
+    try:
+        want, have = urlsplit(scope), urlsplit(url)
+        want_port, have_port = want.port, have.port
+    except ValueError:
+        return None
+    if want.scheme.lower() != have.scheme.lower():
+        return None
+    want_host, have_host = (want.hostname or ""), (have.hostname or "")
+    if not want_host or not _label_match(want_host, have_host):
+        return None
+    if want_port is not None and want_port != have_port:
+        return None
+    if want.username and want.username != have.username:
+        return None
+    prefix = want.path.rstrip("/")
+    path = have.path or "/"
+    if prefix and not (path == prefix or path.startswith(prefix + "/")):
+        return None
+    host_chars = len(want_host.replace("*", ""))
+    return (host_chars, len(prefix), 1 if want.username else 0)
+
+
+def headers_sent(entries: Sequence[tuple[str, str]], url: str) -> list[tuple[str, str]]:
+    """`(scope, header)` pairs git would send to `url` from `http.*.extraHeader`. Pure.
+
+    git reads the entries in config order. An entry that matches the URL less
+    specifically than the best one seen so far is ignored, and an empty value clears
+    the list built so far (how a local config cancels a global header). Checked against
+    git 2.34.1 with a recording proxy, in the review of #35.
+    """
+    best: tuple[int, int, int] | None = None
+    sent: list[tuple[str, str]] = []
+    for key, value in entries:
+        scope = key[len("http.") : -len(".extraheader")]
+        rank = header_scope_match(scope, url)
+        if rank is None or (best is not None and rank < best):
+            continue
+        best = rank
+        if not value.strip():
+            sent.clear()
+        else:
+            sent.append((scope, value))
+    return sent
+
+
 def extra_header_problems(
-    entries: Iterable[tuple[str, str]], origin_host: str | None, repo_root: Path
+    entries: Iterable[tuple[str, str]],
+    origin_host: str | None,
+    repo_root: Path,
+    origin_urls: Sequence[str] = (),
 ) -> list[str]:
     """`http.extraHeader` entries that send an Authorization header to GitHub. Pure.
 
     git sends `http.<url>.extraHeader` with every request to a matching URL, and an
     `Authorization:` header there is a push credential with no helper configured. It is
     the shape `actions/checkout` persists into a clone, so a checkout copied from CI
-    carries it. Only an Authorization header counts, and only one scoped to every URL or
-    to a GitHub host or the origin's host: a header for another service is not a GitHub
-    credential, and a false fatal is an outage. The key's URL and the value are never
-    printed.
+    carries it.
+
+    What counts is what git would actually send: `headers_sent` is asked for each https
+    URL the instance could push to (origin's own URLs, and each scope on a GitHub host
+    or the origin's host, which stands for a direct push there). Only an Authorization
+    header counts: a header for another service is not a GitHub credential, and a false
+    fatal is an outage. The key's URL and the value are never printed.
     """
-    # git keeps the headers as a list, and an empty value clears what came before it
-    # (that is how a local config cancels a global one), so entries are read in order.
-    pending: dict[str, str] = {}
-    for key, value in entries:
-        lowered = key.lower()
-        if not lowered.endswith(".extraheader") or not lowered.startswith("http."):
-            continue
-        scoped = key[len("http.") : -len(".extraheader")]
-        if not value.strip():
-            if scoped:
-                pending.pop(scoped, None)
-            else:
-                pending.clear()
-            continue
-        if value.split(":", 1)[0].strip().lower() != "authorization":
-            continue
-        host = url_host(scoped) if scoped else None
-        if scoped and (host is None or not is_github_host(host, origin_host)):
-            continue
-        pending[scoped] = "http.<url>.extraHeader" if scoped else "http.extraHeader"
+    keyed = [
+        (key, value)
+        for key, value in entries
+        if key.lower().startswith("http.") and key.lower().endswith(".extraheader")
+    ]
+    targets = [u for u in origin_urls if urlsplit(u).scheme.lower() in ("http", "https")]
+    for key, _ in keyed:
+        scope = key[len("http.") : -len(".extraheader")]
+        host = url_host(scope) if scope else None
+        if host and is_github_host(host.replace("*", "x"), origin_host):
+            targets.append(scope)
+    if any(not key[len("http.") : -len(".extraheader")] for key, _ in keyed):
+        targets.append("https://" + GITHUB_HOST + "/")
+    shapes = set()
+    for url in targets:
+        for scope, header in headers_sent(keyed, url):
+            if header.split(":", 1)[0].strip().lower() == "authorization":
+                shapes.add("http.<url>.extraHeader" if scope else "http.extraHeader")
     return [
         f"an {shape} entry sends an Authorization header to GitHub — git adds it to "
         f"every push with no credential helper configured; remove it (find it with "
         f"`git -C {repo_root} config --show-origin --name-only --get-regexp "
         f"'^http\\..*extraheader$'`) and revoke the token"
-        for shape in sorted(set(pending.values()))
+        for shape in sorted(shapes)
     ]
 
 
@@ -1115,11 +1181,15 @@ def git_credential_routes(
     )
 
     origin_host = None
+    origin_urls: list[str] = []
     got = git("config", "--get", "remote.origin.url")
     if got.returncode == 0 and got.stdout.strip():
         origin = got.stdout.strip()
         origin_host = url_host(origin)
+        origin_urls.append(origin)
         push = git("remote", "get-url", "--push", "--all", "origin")
+        if push.returncode == 0:
+            origin_urls += [u.strip() for u in push.stdout.splitlines() if u.strip()]
         if push.returncode != 0:
             found.append(_unverified("where pushes to origin go", push))
         else:
@@ -1148,7 +1218,9 @@ def git_credential_routes(
 
     headers = git("config", "-z", "--get-regexp", r"^http\.(.*\.)?extraheader$")
     if headers.returncode == 0:
-        found += extra_header_problems(_config_pairs(headers.stdout), origin_host, repo_root)
+        found += extra_header_problems(
+            _config_pairs(headers.stdout), origin_host, repo_root, origin_urls
+        )
     elif headers.returncode != 1:
         found.append(_unverified("whether an http.extraHeader carries a credential", headers))
 

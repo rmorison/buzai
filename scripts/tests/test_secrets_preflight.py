@@ -1556,6 +1556,56 @@ class TestGitCredentialRoutes(AccountCredentialCase):
         )
         self.assertEqual(len(found), 1, found)
 
+    def test_a_later_unscoped_empty_does_not_cancel_a_scoped_header(self):
+        # git keeps sending the scoped header: the less specific reset is ignored
+        git(
+            "-C",
+            str(self.repo),
+            "config",
+            "--add",
+            "http.https://example.invalid/.extraheader",
+            f"Authorization: basic {CANARY}",
+        )
+        git("-C", str(self.repo), "config", "--add", "http.extraheader", "")
+        self.assert_findings(1, "http.<url>.extraHeader")
+
+    def test_a_later_scoped_empty_cancels_an_unscoped_header(self):
+        # git sends nothing: the more specific reset clears the list, so no false fatal
+        git(
+            "-C",
+            str(self.repo),
+            "config",
+            "--add",
+            "http.extraheader",
+            f"Authorization: basic {CANARY}",
+        )
+        git(
+            "-C", str(self.repo), "config", "--add", "http.https://example.invalid/.extraheader", ""
+        )
+        git("-C", str(self.repo), "config", "--add", "http.https://github.com/.extraheader", "")
+        self.assertEqual(self.violations(), [])
+
+    def test_an_unscoped_header_after_a_scoped_one_is_not_sent(self):
+        git("-C", str(self.repo), "remote", "set-url", "origin", "https://github.com/o/b.git")
+        git(
+            "-C",
+            str(self.repo),
+            "config",
+            "--add",
+            "http.https://github.com/.extraheader",
+            f"Authorization: basic {CANARY}",
+        )
+        git(
+            "-C",
+            str(self.repo),
+            "config",
+            "--add",
+            "http.extraheader",
+            f"Authorization: late {CANARY}",
+        )
+        found = self.assert_findings(1, "http.<url>.extraHeader")
+        self.assertNotIn("an http.extraHeader entry", found[0])
+
     def test_an_extraheader_for_another_service_or_not_auth_is_clean(self):
         self.config("http.https://registry.example.org/.extraheader", f"Authorization: x {CANARY}")
         self.config("http.extraheader", "X-Trace: on")
