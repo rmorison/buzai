@@ -315,6 +315,46 @@ class TestMainCheckout(ScratchRepoTestCase):
             resolve(str(tree / "hubs" / "x"), self.home, wt)
         self.assertIn(f"inside the main checkout ({tree})", str(ctx.exception))
 
+    def make_split_repo(self, *config_args: str) -> tuple[Path, Path]:
+        """A git dir at store/.git whose tree is elsewhere, set by `config_args`."""
+        store = self.root / "store"
+        tree = self.root / "tree"
+        store.mkdir()
+        tree.mkdir()
+        self.git("init", "-q", cwd=store)
+        self.git(*config_args, cwd=store)
+        return store, tree
+
+    def test_core_worktree_in_config_worktree_names_the_main_checkout(self):
+        # Under extensions.worktreeConfig, git-worktree(1) has core.worktree moved to
+        # config.worktree, where git still honours it.
+        store, tree = self.make_split_repo("config", "extensions.worktreeConfig", "true")
+        self.git("config", "--worktree", "core.worktree", str(tree), cwd=store)
+        (tree / "README").write_text("scratch\n")
+        self.git("add", "README", cwd=store)
+        self.git("commit", "-q", "-m", "scratch", cwd=store)
+        wt = tree / ".claude" / "worktrees" / "w"
+        self.git("worktree", "add", "-q", "-b", "w", str(wt), cwd=store)
+        self.assertEqual(main_checkout(wt), tree)
+
+    def test_config_worktree_is_ignored_without_the_extension(self):
+        # git reads config.worktree only under extensions.worktreeConfig; honouring it
+        # otherwise would protect a tree git doesn't use instead of the real one.
+        wt = self.add_worktree(self.root / "outside", "outside")
+        stray = self.main / ".git" / "config.worktree"
+        self.git("config", "--file", str(stray), "core.worktree", str(self.root), cwd=self.root)
+        self.assertEqual(main_checkout(wt), self.main)
+
+    def test_tilde_core_worktree_is_refused(self):
+        # Whether `~` expands there is git's business; guessing could protect the
+        # wrong tree, so refuse.
+        wt = self.add_worktree(self.root / "outside", "outside")
+        config = self.main / ".git" / "config"
+        self.git("config", "--file", str(config), "core.worktree", "~/tree", cwd=self.root)
+        with self.assertRaises(HubPathError) as ctx:
+            main_checkout(wt)
+        self.assertIn("can't be resolved unambiguously", str(ctx.exception))
+
     def test_worktree_of_a_submodule_finds_the_submodule_checkout(self):
         sup = self.root / "sup"
         sup.mkdir()

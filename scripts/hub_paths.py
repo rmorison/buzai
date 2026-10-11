@@ -181,7 +181,9 @@ def main_checkout(repo_root: Path) -> Path | None:
     2.34 builds that name from the shared git dir, so it is only trusted when checked:
 
       * if the shared git dir sets `core.worktree` (submodules do, and so does a repo
-        whose tree was moved away from its git dir), that is the main working tree;
+        whose tree was moved away from its git dir), in `config` or, under
+        `extensions.worktreeConfig`, in `config.worktree`, that is the main working
+        tree;
       * otherwise the named tree counts only if its `.git` leads back to the shared
         git dir. A repo made with `--separate-git-dir` fails this, since git names the
         git dir, which keeps no pointer to the tree.
@@ -231,11 +233,22 @@ def main_checkout(repo_root: Path) -> Path | None:
 
     _, common = git("rev-parse", "--git-common-dir")
     common_dir = (repo_root / common.strip()).resolve()
-    rc, configured = git(
-        "config", "--file", str(common_dir / "config"), "--get", "core.worktree", ok=(0, 1)
-    )
-    if rc == 0 and configured.strip():
-        main = (common_dir / configured.strip()).resolve()
+
+    def config_value(name: str, key: str, *flags: str) -> str | None:
+        rc, out = git("config", "--file", str(common_dir / name), *flags, "--get", key, ok=(0, 1))
+        return out.strip() if rc == 0 and out.strip() else None
+
+    # With extensions.worktreeConfig, git reads config.worktree after config, so a
+    # core.worktree there wins (git-worktree(1) tells users to move it there).
+    configured = None
+    if config_value("config", "extensions.worktreeConfig", "--type=bool") == "true":
+        if (common_dir / "config.worktree").is_file():
+            configured = config_value("config.worktree", "core.worktree")
+    configured = configured or config_value("config", "core.worktree")
+    if configured and configured.startswith("~"):
+        raise fail(f"core.worktree is {configured!r}, which can't be resolved unambiguously")
+    if configured:
+        main = (common_dir / configured).resolve()
     else:
         main = Path(first_record[0][len("worktree ") :]).resolve()
         if not _points_back(main, common_dir):
